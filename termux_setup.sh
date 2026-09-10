@@ -8,7 +8,7 @@ pkg update -y
 pkg install -y python git ffmpeg nodejs deno
 
 echo "[2/4] Installing Python dependencies..."
-python -m pip install --upgrade pip
+# Termux manages pip through its own Python package. Never self-upgrade pip here.
 python -m pip install -r requirements-termux.txt
 
 echo "[3/4] Configuring BOT_TOKEN locally..."
