@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
+import traceback
 from pathlib import Path
 
 
@@ -38,17 +40,25 @@ from telegram.ext import (  # noqa: E402
     filters,
 )
 
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+    stream=sys.stdout,
+)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
 
 
 def main() -> None:
-    if not bot.BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is missing — set it in Render Environment")
-
+    token = (bot.BOT_TOKEN or os.getenv("BOT_TOKEN", "")).strip()
+    if not token:
+        log.error("BOT_TOKEN is missing. Render → Environment → Add BOT_TOKEN")
+        raise SystemExit("BOT_TOKEN is missing")
+    bot.BOT_TOKEN = token
     bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    app = Application.builder().token(bot.BOT_TOKEN).concurrent_updates(True).build()
+
+    app = Application.builder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", bot.cmd_start))
     app.add_handler(CommandHandler("help", bot.cmd_help))
     app.add_handler(CommandHandler("settings", bot.cmd_settings))
@@ -74,4 +84,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise
