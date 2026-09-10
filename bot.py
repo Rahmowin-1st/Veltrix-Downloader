@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Veltrix Downloader — YouTube, Instagram, Pinterest, Snapchat. Fast path."""
+"""Veltrix Downloader — max media from public links."""
 
 from __future__ import annotations
 
@@ -29,9 +29,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MAX_BYTES = 48 * 1024 * 1024
 MAX_PHOTO = 9 * 1024 * 1024
+MAX_FILES = 40
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
 COOKIES = Path(os.getenv("COOKIES_FILE", "cookies.txt"))
+GDL_CONF = Path("gallery-dl.conf")
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("veltrix")
@@ -42,9 +44,21 @@ URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 HOSTS = {
     "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com"),
     "instagram": ("instagram.com", "instagr.am"),
-    "pinterest": ("pinterest.com", "pinterest.co", "pin.it"),
+    "pinterest": ("pinterest.com", "pinterest.co", "pinterest.ru", "pin.it"),
     "snapchat": ("snapchat.com", "snap.com"),
+    "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
+    "x": ("twitter.com", "x.com"),
+    "facebook": ("facebook.com", "fb.watch", "fb.com"),
+    "reddit": ("reddit.com", "redd.it"),
+    "vimeo": ("vimeo.com"),
+    "threads": ("threads.net", "threads.com"),
+    "vk": ("vk.com", "vk.ru", "vkvideo.ru"),
+    "soundcloud": ("soundcloud.com"),
+    "dailymotion": ("dailymotion.com", "dai.ly"),
+    "twitch": ("twitch.tv", "clips.twitch.tv"),
+    "tumblr": ("tumblr.com"),
 }
+IMAGE_SITES = {"instagram", "pinterest", "snapchat", "tumblr", "reddit"}
 DEFAULT_KEY = "720"
 PRESETS = {
     "best": {"label": "Best", "kind": "video", "height": 2160},
@@ -133,7 +147,7 @@ def site_of(url: str) -> str:
     for name, suffixes in HOSTS.items():
         if any(host == s or host.endswith("." + s) for s in suffixes):
             return name
-    return ""
+    return host.split(":")[0] or "web"
 
 
 def format_for(key: str) -> str:
@@ -172,13 +186,14 @@ def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
         "skip_unavailable_fragments": True,
         "merge_output_format": "mp4",
         "geo_bypass": True,
+        "playlistend": MAX_FILES,
         "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
         "format": format_for(key),
     }
     ck = ensure_cookie_file()
     if ck:
         opts["cookiefile"] = str(ck)
-    if HAS_ARIA and site != "youtube":
+    if HAS_ARIA and site not in {"youtube"}:
         opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
         opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
     if spec["kind"] == "audio":
@@ -210,27 +225,27 @@ def download_ytdlp(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
 
 
 def download_gallery(url: str, tmpdir: str) -> list[Path]:
-    if not shutil.which("gallery-dl") and not _has_gallery():
-        return []
     dest = Path(tmpdir) / "gdl"
     dest.mkdir(parents=True, exist_ok=True)
-    cmd = ["gallery-dl", "-d", str(dest), "--no-mtime", "-q", url]
+    cmd = ["python", "-m", "gallery_dl", "-d", str(dest), "--no-mtime", "-q", "--range", f"1-{MAX_FILES}"]
+    if GDL_CONF.exists():
+        cmd.extend(["-c", str(GDL_CONF)])
+    cmd.extend([
+        "-o", "extractor.pinterest.videos=true",
+        "-o", "extractor.pinterest.stories=true",
+        "-o", "extractor.pinterest.sections=true",
+        "-o", "extractor.instagram.videos=true",
+    ])
     ck = ensure_cookie_file()
     if ck:
-        cmd[1:1] = ["--cookies", str(ck)]
+        cmd.extend(["--cookies", str(ck)])
+    cmd.append(url)
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     files = [p for p in dest.rglob("*") if p.is_file() and p.stat().st_size > 0]
     if proc.returncode != 0 and not files:
+        log.warning("gallery-dl: %s", (proc.stderr or "")[-200:])
         return []
     return sorted(files, key=lambda p: p.name)
-
-
-def _has_gallery() -> bool:
-    try:
-        import gallery_dl  # noqa: F401
-        return True
-    except Exception:
-        return False
 
 
 def _new_files(tmpdir: str, before: set[str]) -> list[Path]:
@@ -243,6 +258,16 @@ def _new_files(tmpdir: str, before: set[str]) -> list[Path]:
     return files
 
 
+def merge_unique(base: list[Path], extra: list[Path]) -> list[Path]:
+    seen = {p.name for p in base}
+    out = list(base)
+    for p in extra:
+        if p.name not in seen:
+            out.append(p)
+            seen.add(p.name)
+    return out
+
+
 def grab(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
     files: list[Path] = []
     err = None
@@ -250,19 +275,15 @@ def grab(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
         files = download_ytdlp(url, key, tmpdir, site)
     except Exception as exc:
         err = exc
-        log.warning("yt-dlp failed %s: %s", site, exc)
-    need_images = site in {"instagram", "pinterest", "snapchat"}
-    if need_images and (not files or all(classify(p) == "video" for p in files) is False):
+        log.warning("yt-dlp %s: %s", site, exc)
+    if site in IMAGE_SITES or site in {"pinterest", "snapchat", "instagram"} or not files:
         extra = download_gallery(url, tmpdir)
-        names = {p.name for p in files}
-        for p in extra:
-            if p.name not in names:
-                files.append(p)
+        files = merge_unique(files, extra)
     if not files and err:
         raise err
     if not files:
         raise RuntimeError("no media from this link")
-    return files
+    return files[:MAX_FILES]
 
 
 def _ff(cmd: list[str]) -> None:
@@ -336,8 +357,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Veltrix Downloader\n\n"
         "YouTube · Instagram · Pinterest · Snapchat\n"
-        "Send a link. Download starts immediately at Default.\n"
-        "Tap Default to save a new quality. Tap 1080p/720p/MP3 for this link only.\n\n"
+        "Also TikTok, X, Facebook, Reddit, Vimeo, Threads, VK, SoundCloud…\n"
+        "Pinterest: originals + carousel + video pins.\n"
+        "Snapchat: Spotlight and other public media yt-dlp can see.\n\n"
         f"Now: Default ({PRESETS[key]['label']})",
         reply_markup=action_kb(key),
     )
@@ -345,11 +367,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Public posts work as-is.\n"
-        "Posts you can see while logged in: put cookies.txt on the server or set INSTAGRAM_SESSIONID.\n"
-        "Other people's private snaps / locked accounts cannot be opened without their session.\n"
-        "Carousels: each photo/video is sent separately.\n"
-        "50 MB Bot API cap still applies."
+        "Any public media link is tried (yt-dlp + gallery-dl).\n"
+        "Pinterest carousel/story/video pins: original files, sent one by one.\n"
+        "Snapchat private snaps still need the owner's session.\n"
+        "Login-visible posts: cookies.txt or INSTAGRAM_SESSIONID on Render."
     )
 
 
@@ -363,11 +384,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     url = extract_url(msg.text or "")
     if not url:
-        await msg.reply_text("Send a YouTube, Instagram, Pinterest or Snapchat link.")
-        return
-    site = site_of(url)
-    if not site:
-        await msg.reply_text("Only YouTube, Instagram, Pinterest, Snapchat.")
+        await msg.reply_text("Send a media link.")
         return
     key = user_row(uid)["quality"]
     patch_user(uid, last_url=url)
@@ -423,13 +440,12 @@ async def run_job(msg, context, uid: int, url: str, key: str) -> None:
     async with lock:
         try:
             files = await asyncio.to_thread(grab, url, key, tmpdir, site)
-            title = site
             images = [p for p in files if classify(p) == "image"]
             audios = [p for p in files if classify(p) == "audio"]
             videos = [p for p in files if classify(p) == "video"]
             sent = 0
             if images:
-                sent += await send_images(msg, images, title)
+                sent += await send_images(msg, images, site)
             out_dir = Path(tmpdir) / "out"
             for path in videos:
                 if path.stat().st_size > MAX_BYTES:
@@ -453,7 +469,10 @@ async def run_job(msg, context, uid: int, url: str, key: str) -> None:
                 sent += 1
             if sent == 0:
                 raise RuntimeError("nothing to send")
-            await status.edit_text(f"Sent {sent} · Default ({PRESETS[user_row(uid)['quality']]['label']})", reply_markup=action_kb(user_row(uid)["quality"]))
+            await status.edit_text(
+                f"Sent {sent} · Default ({PRESETS[user_row(uid)['quality']]['label']})",
+                reply_markup=action_kb(user_row(uid)["quality"]),
+            )
         except Exception as exc:
             log.exception("job")
             await status.edit_text(_friendly(str(exc), site), reply_markup=action_kb(key))
@@ -511,7 +530,7 @@ async def album(msg, paths: list[Path], caption: str) -> int:
 def _friendly(reason: str, site: str) -> str:
     r = reason.lower()
     if "403" in r or "login" in r or "private" in r or "cookie" in r:
-        return f"{site}: needs your login. Add cookies.txt or INSTAGRAM_SESSIONID on Render."
+        return f"{site}: needs your login. Add cookies.txt on Render."
     return f"{site}: {reason[:220]}"
 
 

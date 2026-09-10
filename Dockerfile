@@ -3,6 +3,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg aria2 &&
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py .
+COPY bot.py gallery-dl.conf ./
 ENV PYTHONUNBUFFERED=1
 CMD ["python", "bot.py"]
