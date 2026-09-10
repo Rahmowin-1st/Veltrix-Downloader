@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Veltrix Downloader — max media from public links."""
+"""Veltrix Downloader — max media, parallel extractors."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
@@ -29,7 +30,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MAX_BYTES = 48 * 1024 * 1024
 MAX_PHOTO = 9 * 1024 * 1024
-MAX_FILES = 40
+MAX_FILES = 80
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
 COOKIES = Path(os.getenv("COOKIES_FILE", "cookies.txt"))
@@ -39,6 +40,7 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 log = logging.getLogger("veltrix")
 _user_lock = Lock()
 _job_locks: dict[int, asyncio.Lock] = {}
+POOL = ThreadPoolExecutor(max_workers=4)
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 HOSTS = {
@@ -57,8 +59,12 @@ HOSTS = {
     "dailymotion": ("dailymotion.com", "dai.ly"),
     "twitch": ("twitch.tv", "clips.twitch.tv"),
     "tumblr": ("tumblr.com"),
+    "imgur": ("imgur.com"),
+    "streamable": ("streamable.com"),
+    "rumble": ("rumble.com"),
+    "bsky": ("bsky.app"),
 }
-IMAGE_SITES = {"instagram", "pinterest", "snapchat", "tumblr", "reddit"}
+IMAGE_SITES = {"instagram", "pinterest", "snapchat", "tumblr", "reddit", "imgur"}
 DEFAULT_KEY = "720"
 PRESETS = {
     "best": {"label": "Best", "kind": "video", "height": 2160},
@@ -171,14 +177,14 @@ def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "retries": 8,
-        "fragment_retries": 8,
-        "extractor_retries": 3,
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 4,
         "concurrent_fragment_downloads": 16,
         "file_access_retries": 3,
         "socket_timeout": 15,
         "http_chunk_size": 10_485_760,
-        "outtmpl": str(Path(tmpdir) / "%(id)s_%(autonumber)03d.%(ext)s"),
+        "outtmpl": str(Path(tmpdir) / "ytdl" / "%(id)s_%(autonumber)03d.%(ext)s"),
         "restrictfilenames": True,
         "overwrites": True,
         "cachedir": False,
@@ -190,10 +196,11 @@ def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
         "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
         "format": format_for(key),
     }
+    Path(opts["outtmpl"]).parent.mkdir(parents=True, exist_ok=True)
     ck = ensure_cookie_file()
     if ck:
         opts["cookiefile"] = str(ck)
-    if HAS_ARIA and site not in {"youtube"}:
+    if HAS_ARIA and site != "youtube":
         opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
         opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
     if spec["kind"] == "audio":
@@ -204,10 +211,9 @@ def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
 
 def download_ytdlp(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
-    before = {p.name for p in Path(tmpdir).iterdir()}
     opts = ydl_opts(tmpdir, key, site)
     last = None
-    for fmt in (opts["format"], "bv*+ba/b", "best", "bestvideo+bestaudio/best"):
+    for fmt in (opts["format"], "bv*+ba/b", "best"):
         try:
             opts["format"] = fmt
             with YoutubeDL(opts) as ydl:
@@ -216,7 +222,7 @@ def download_ytdlp(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
             break
         except Exception as exc:
             last = exc
-    files = _new_files(tmpdir, before)
+    files = _files_in(Path(tmpdir) / "ytdl")
     if files:
         return files
     if last:
@@ -241,46 +247,50 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
         cmd.extend(["--cookies", str(ck)])
     cmd.append(url)
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    files = [p for p in dest.rglob("*") if p.is_file() and p.stat().st_size > 0]
+    files = _files_in(dest)
     if proc.returncode != 0 and not files:
         log.warning("gallery-dl: %s", (proc.stderr or "")[-200:])
+    return files
+
+
+def _files_in(root: Path) -> list[Path]:
+    if not root.exists():
         return []
-    return sorted(files, key=lambda p: p.name)
-
-
-def _new_files(tmpdir: str, before: set[str]) -> list[Path]:
     skip = {".json", ".vtt", ".srt", ".ass", ".nfo", ".part"}
-    files = [
-        p for p in Path(tmpdir).rglob("*")
-        if p.is_file() and p.suffix.lower() not in skip and p.stat().st_size > 0 and p.name not in before
-    ]
+    files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() not in skip and p.stat().st_size > 0]
     files.sort(key=lambda p: p.name)
     return files
 
 
-def merge_unique(base: list[Path], extra: list[Path]) -> list[Path]:
-    seen = {p.name for p in base}
-    out = list(base)
-    for p in extra:
-        if p.name not in seen:
+def merge_unique(parts: list[list[Path]]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for group in parts:
+        for p in group:
+            key = f"{p.stat().st_size}:{p.suffix.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
             out.append(p)
-            seen.add(p.name)
     return out
 
 
 def grab(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
-    files: list[Path] = []
-    err = None
-    try:
-        files = download_ytdlp(url, key, tmpdir, site)
-    except Exception as exc:
-        err = exc
-        log.warning("yt-dlp %s: %s", site, exc)
-    if site in IMAGE_SITES or site in {"pinterest", "snapchat", "instagram"} or not files:
-        extra = download_gallery(url, tmpdir)
-        files = merge_unique(files, extra)
-    if not files and err:
-        raise err
+    Path(tmpdir).mkdir(parents=True, exist_ok=True)
+    futs = [POOL.submit(download_ytdlp, url, key, tmpdir, site)]
+    if site in IMAGE_SITES or site in {"pinterest", "snapchat", "instagram"} or site not in HOSTS:
+        futs.append(POOL.submit(download_gallery, url, tmpdir))
+    groups: list[list[Path]] = []
+    errors: list[Exception] = []
+    for fut in as_completed(futs):
+        try:
+            groups.append(fut.result())
+        except Exception as exc:
+            errors.append(exc)
+            log.warning("extractor: %s", exc)
+    files = merge_unique(groups)
+    if not files and errors:
+        raise errors[0]
     if not files:
         raise RuntimeError("no media from this link")
     return files[:MAX_FILES]
@@ -325,9 +335,9 @@ def action_kb(key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Default ({lab})", callback_data="open_settings")],
         [
+            InlineKeyboardButton("Best", callback_data="go|best"),
             InlineKeyboardButton("1080p", callback_data="go|1080"),
             InlineKeyboardButton("720p", callback_data="go|720"),
-            InlineKeyboardButton("480p", callback_data="go|480"),
             InlineKeyboardButton("MP3", callback_data="go|mp3"),
         ],
     ])
@@ -337,8 +347,8 @@ def settings_kb(current: str) -> InlineKeyboardMarkup:
     def mark(k: str) -> str:
         return ("• " if k == current else "") + PRESETS[k]["label"]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(mark("1080"), callback_data="set|1080"), InlineKeyboardButton(mark("720"), callback_data="set|720"), InlineKeyboardButton(mark("480"), callback_data="set|480")],
-        [InlineKeyboardButton(mark("360"), callback_data="set|360"), InlineKeyboardButton(mark("best"), callback_data="set|best")],
+        [InlineKeyboardButton(mark("best"), callback_data="set|best"), InlineKeyboardButton(mark("1080"), callback_data="set|1080"), InlineKeyboardButton(mark("720"), callback_data="set|720")],
+        [InlineKeyboardButton(mark("480"), callback_data="set|480"), InlineKeyboardButton(mark("360"), callback_data="set|360")],
         [InlineKeyboardButton(mark("mp3"), callback_data="set|mp3"), InlineKeyboardButton(mark("m4a"), callback_data="set|m4a")],
     ])
 
@@ -356,10 +366,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     key = user_row(update.effective_user.id)["quality"]
     await update.message.reply_text(
         "Veltrix Downloader\n\n"
-        "YouTube · Instagram · Pinterest · Snapchat\n"
-        "Also TikTok, X, Facebook, Reddit, Vimeo, Threads, VK, SoundCloud…\n"
-        "Pinterest: originals + carousel + video pins.\n"
-        "Snapchat: Spotlight and other public media yt-dlp can see.\n\n"
+        "Send any public media link.\n"
+        "Pinterest / Instagram carousels: every file.\n"
+        "Snapchat: public Spotlight and open media.\n\n"
         f"Now: Default ({PRESETS[key]['label']})",
         reply_markup=action_kb(key),
     )
@@ -367,10 +376,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Any public media link is tried (yt-dlp + gallery-dl).\n"
-        "Pinterest carousel/story/video pins: original files, sent one by one.\n"
-        "Snapchat private snaps still need the owner's session.\n"
-        "Login-visible posts: cookies.txt or INSTAGRAM_SESSIONID on Render."
+        "yt-dlp + gallery-dl run together.\n"
+        "Up to 80 files per link.\n"
+        "Private snaps still need the owner's cookies."
     )
 
 
