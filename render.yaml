@@ -1,10 +1,11 @@
 services:
-  - type: worker
+  - type: web
     name: veltrix-downloader
-    runtime: docker
-    plan: starter
+    runtime: python
+    plan: free
     region: frankfurt
-    dockerfilePath: ./Dockerfile
+    buildCommand: pip install -r requirements.txt
+    startCommand: python render_free.py
     envVars:
       - key: BOT_TOKEN
         sync: false
