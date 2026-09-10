@@ -44,6 +44,33 @@ from telegram.ext import (  # noqa: E402
     filters,
 )
 
+
+class SecretRedactionFilter(logging.Filter):
+    """Prevent the Telegram bot token from ever being written to logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        token = bot.BOT_TOKEN
+        if not token:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if token in message:
+            record.msg = message.replace(token, "[REDACTED]")
+            record.args = ()
+        return True
+
+
+# python-telegram-bot uses httpx internally. Successful request logs include the
+# request URL, which contains the bot token, so suppress them and redact as a
+# second line of defense for any warning/error that might still include it.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+_redactor = SecretRedactionFilter()
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_redactor)
+
 log = logging.getLogger("veltrix.render")
 
 
