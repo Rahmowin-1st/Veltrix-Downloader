@@ -1,22 +1,21 @@
 # Veltrix Downloader
 
-Telegram bot that downloads YouTube videos and Shorts in video or audio format.
+Telegram YouTube downloader. Official Bot API upload cap is **50 MB** even if the user has Telegram Premium (Premium is 4 GB for people, not for bots). The bot compresses with ffmpeg and keeps 1080p when the bitrate still fits.
 
-## Setup
+## Run locally
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\\Scripts\\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env
-# put BOT_TOKEN in .env
+export BOT_TOKEN=...
 python bot.py
 ```
 
-Requires `ffmpeg` on PATH for merge / MP3 convert.
+Needs `ffmpeg`.
 
-## Usage
+## Render
 
-Send a YouTube link (video or Shorts). Pick a format. Bot replies `Downloading...` then sends the file.
+Connect this GitHub repo as a **Background Worker** (Docker). Set `BOT_TOKEN` in Render env. Do not commit the token.
 
-Telegram Bot API limit without a local Bot API server is ~50 MB per file.
+## Supabase
+
+Job log table lives on project Veltrix Ultron: `public.veltrix_downloader_jobs`.

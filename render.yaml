@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: veltrix-downloader
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: "10000"
