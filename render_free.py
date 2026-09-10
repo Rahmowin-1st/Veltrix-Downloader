@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import shutil
@@ -29,7 +30,30 @@ def ensure_ffmpeg() -> None:
     os.environ["PATH"] = f"{bindir}:{os.environ.get('PATH', '')}"
 
 
+def materialize_youtube_cookies() -> Path | None:
+    """Create a temporary Netscape cookies file from a Render secret.
+
+    YOUTUBE_COOKIES_B64 is deliberately never logged. The decoded file lives
+    only in /tmp and is permission-restricted. This allows yt-dlp to use a
+    user-authorized YouTube session without committing credentials to GitHub.
+    """
+    raw = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    if not raw:
+        return None
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise SystemExit(f"YOUTUBE_COOKIES_B64 is invalid base64: {exc}") from exc
+    if not data or len(data) > 2 * 1024 * 1024:
+        raise SystemExit("YOUTUBE_COOKIES_B64 is empty or unexpectedly large")
+    path = Path("/tmp/veltrix-youtube-cookies.txt")
+    path.write_bytes(data)
+    path.chmod(0o600)
+    return path
+
+
 ensure_ffmpeg()
+YOUTUBE_COOKIE_FILE = materialize_youtube_cookies()
 
 import bot  # noqa: E402
 from telegram.ext import (  # noqa: E402
@@ -48,6 +72,20 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
+
+
+# Inject the optional YouTube cookie file into every yt-dlp session. It is
+# harmless for non-YouTube extractors and keeps the core downloader portable.
+if YOUTUBE_COOKIE_FILE:
+    _base_ydl_opts = bot.base_ydl_opts
+
+    def _base_ydl_opts_with_cookie(tmpdir: str):
+        opts = _base_ydl_opts(tmpdir)
+        opts["cookiefile"] = str(YOUTUBE_COOKIE_FILE)
+        return opts
+
+    bot.base_ydl_opts = _base_ydl_opts_with_cookie
+    log.info("YouTube authenticated-session support enabled")
 
 
 def main() -> None:
