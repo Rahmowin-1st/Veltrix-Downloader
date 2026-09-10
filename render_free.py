@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Free Render Web Service entrypoint for Veltrix Downloader.
-
-Uses Telegram webhooks so a sleeping free Render service can be woken by
-incoming Telegram requests. Provides an ffmpeg binary via imageio-ffmpeg when
-Render's native Python runtime does not ship one.
-"""
+"""Render Web Service entry for Veltrix Downloader."""
 
 from __future__ import annotations
 
@@ -17,7 +12,6 @@ from pathlib import Path
 def ensure_ffmpeg() -> None:
     if shutil.which("ffmpeg"):
         return
-
     import imageio_ffmpeg
 
     src = Path(imageio_ffmpeg.get_ffmpeg_exe())
@@ -44,60 +38,36 @@ from telegram.ext import (  # noqa: E402
     filters,
 )
 
-
-class SecretRedactionFilter(logging.Filter):
-    """Prevent the Telegram bot token from ever being written to logs."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        token = bot.BOT_TOKEN
-        if not token:
-            return True
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-        if token in message:
-            record.msg = message.replace(token, "[REDACTED]")
-            record.args = ()
-        return True
-
-
-# python-telegram-bot uses httpx internally. Successful request logs include the
-# request URL, which contains the bot token, so suppress them and redact as a
-# second line of defense for any warning/error that might still include it.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-_redactor = SecretRedactionFilter()
-for _handler in logging.getLogger().handlers:
-    _handler.addFilter(_redactor)
-
 log = logging.getLogger("veltrix.render")
 
 
 def main() -> None:
     if not bot.BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is missing")
+        raise SystemExit("BOT_TOKEN is missing — set it in Render Environment")
 
+    bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
     app = Application.builder().token(bot.BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", bot.cmd_start))
     app.add_handler(CommandHandler("help", bot.cmd_help))
-    app.add_handler(CallbackQueryHandler(bot.on_format))
+    app.add_handler(CommandHandler("settings", bot.cmd_settings))
+    app.add_handler(CallbackQueryHandler(bot.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
 
     hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
+    port = int(os.getenv("PORT", "10000"))
     if not hostname:
-        log.info("No Render hostname detected; falling back to polling")
+        log.info("No Render hostname; polling")
         app.run_polling(drop_pending_updates=True)
         return
 
-    port = int(os.getenv("PORT", "10000"))
-    webhook_path = "telegram"
-    webhook_url = f"https://{hostname}/{webhook_path}"
-    log.info("Starting webhook server on :%s -> %s", port, webhook_url)
+    webhook_url = f"https://{hostname}/telegram"
+    log.info("webhook :%s -> %s", port, webhook_url)
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
-        url_path=webhook_path,
+        url_path="telegram",
         webhook_url=webhook_url,
         drop_pending_updates=True,
     )
