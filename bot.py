@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Veltrix Downloader."""
+"""Veltrix Downloader — free Telegram API: split large files."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
@@ -28,6 +28,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 MAX_BYTES = 48 * 1024 * 1024
+MAX_TOTAL = 300 * 1024 * 1024
 MAX_PHOTO = 9 * 1024 * 1024
 MAX_FILES = 40
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -45,15 +46,13 @@ YT_ID_RE = re.compile(r"(?:v=|/shorts/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})")
 HOSTS = {
     "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com"),
     "instagram": ("instagram.com", "instagr.am"),
-    "pinterest": ("pinterest.com", "pinterest.co", "pinterest.ru", "pin.it"),
+    "pinterest": ("pinterest.com", "pinterest.co", "pin.it"),
     "snapchat": ("snapchat.com", "snap.com"),
     "tiktok": ("tiktok.com", "vm.tiktok.com", "vt.tiktok.com"),
     "x": ("twitter.com", "x.com"),
-    "facebook": ("facebook.com", "fb.watch", "fb.com"),
+    "facebook": ("facebook.com", "fb.watch"),
     "reddit": ("reddit.com", "redd.it"),
     "vimeo": ("vimeo.com"),
-    "threads": ("threads.net", "threads.com"),
-    "vk": ("vk.com", "vk.ru"),
     "soundcloud": ("soundcloud.com"),
 }
 IMAGE_SITES = {"instagram", "pinterest", "snapchat", "reddit"}
@@ -169,7 +168,6 @@ def clean_url(url: str) -> str:
     if parts.query:
         q = parse_qs(parts.query)
         keep = {k: v for k, v in q.items() if k in {"v", "list", "t", "p"}}
-        from urllib.parse import urlencode
         query = urlencode({k: v[0] for k, v in keep.items()})
         url = urlunparse((parts.scheme, parts.netloc, parts.path, "", query, ""))
     return url
@@ -188,12 +186,13 @@ def site_of(url: str) -> str:
 def format_for(key: str) -> str:
     if key == "mp3":
         return "bestaudio/ba/b"
+    cap = "[filesize<300M][filesize_approx<300M]"
     if key == "best":
-        return "bv*+ba/b"
+        return f"bv*{cap}+ba/b{cap}/bv*+ba/b"
     h = PRESETS[key]["height"]
     return (
-        f"bv*[height={h}][ext=mp4]+ba[ext=m4a]/bv*[height={h}]+ba/b[height={h}]/"
-        f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
+        f"bv*[height={h}]{cap}+ba/bv*[height={h}]+ba/b[height={h}]/"
+        f"bv*[height<={h}]{cap}+ba/bv*[height<={h}]+ba/b"
     )
 
 
@@ -217,13 +216,10 @@ def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
         "overwrites": True,
         "cachedir": False,
         "ignoreerrors": False,
-        "skip_unavailable_fragments": True,
         "merge_output_format": "mp4",
         "geo_bypass": True,
         "nocheckcertificate": True,
-        "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "tv", "mweb", "web"]}
-        },
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "tv", "mweb", "web"]}},
         "format": format_for(key),
     }
     proxy = os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or ""
@@ -232,9 +228,6 @@ def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
     ck = ensure_cookie_file()
     if ck:
         opts["cookiefile"] = str(ck)
-    if HAS_ARIA and site != "youtube":
-        opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
-        opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
     if spec["kind"] == "audio":
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -256,9 +249,7 @@ def _files_in(root: Path) -> list[Path]:
 def download_ytdlp(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
     opts = ydl_opts(tmpdir, key, site)
     last = None
-    fmts = [opts["format"], "bestaudio/ba/b", "bv*+ba/b", "best"]
-    if key != "mp3":
-        fmts = [opts["format"], "bv*+ba/b", "best", "bestaudio/ba/b"]
+    fmts = [opts["format"], "bv*+ba/b", "best", "bestaudio/ba/b"]
     seen: set[str] = set()
     for fmt in fmts:
         if fmt in seen:
@@ -307,8 +298,16 @@ def grab(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
     if not files and err:
         raise err
     if not files:
-        raise RuntimeError("YouTube blocked this server or the file is empty. Try again, or set PROXY / cookies.txt on Render.")
-    return files[:MAX_FILES]
+        raise RuntimeError("YouTube blocked this server. Free Render IP is filtered.")
+    kept = []
+    for p in files:
+        if p.stat().st_size > MAX_TOTAL:
+            log.warning("skip >300MB %s", p.name)
+            continue
+        kept.append(p)
+    if not kept:
+        raise RuntimeError("File is over 300 MB free cap.")
+    return kept[:MAX_FILES]
 
 
 def _ff(cmd: list[str]) -> None:
@@ -317,31 +316,59 @@ def _ff(cmd: list[str]) -> None:
         raise RuntimeError(proc.stderr[-240:] or "ffmpeg failed")
 
 
-def compress(src: Path, dest_dir: Path, duration: int, want_height: int, kind: str) -> Path:
+def probe_duration(path: Path) -> int:
+    proc = subprocess.run(["ffmpeg", "-i", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    m = re.search(r"Duration: (\d+):(\d+):(\d+)", proc.stderr or "")
+    if not m:
+        return 0
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+
+def split_for_telegram(src: Path, dest_dir: Path) -> list[Path]:
     if src.stat().st_size <= MAX_BYTES:
-        return src
+        return [src]
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dur = max(int(duration or 0), 1)
-    if kind == "audio" or src.suffix.lower() in {".mp3", ".m4a", ".opus", ".ogg", ".webm"}:
-        out = dest_dir / f"{src.stem}.mp3"
-        for br in ("192k", "160k", "128k", "96k", "64k"):
-            _ff(["ffmpeg", "-y", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", br, str(out)])
-            if out.exists() and out.stat().st_size <= MAX_BYTES:
-                return out
-        return out
-    vb = max(int((MAX_BYTES * 8) / dur) - 80_000, 80_000)
-    h = want_height or 720
-    if dur > 600:
-        h = min(h, 360)
-    elif vb < 900_000:
-        h = min(h, 480)
-    out = dest_dir / f"{src.stem}.{h}p.mp4"
-    _ff([
-        "ffmpeg", "-y", "-i", str(src), "-vf", f"scale=-2:{h}",
-        "-c:v", "libx264", "-preset", "ultrafast", "-b:v", str(vb),
-        "-maxrate", str(vb), "-bufsize", str(vb * 2), "-c:a", "aac", "-b:a", "64k",
-        "-movflags", "+faststart", "-pix_fmt", "yuv420p", str(out),
-    ])
+    dur = probe_duration(src) or 1
+    n = max(2, (src.stat().st_size + MAX_BYTES - 1) // MAX_BYTES)
+    seg = max(15, dur // n)
+    pattern = str(dest_dir / f"{src.stem}_p%03d{src.suffix or '.mp4'}")
+    try:
+        _ff([
+            "ffmpeg", "-y", "-i", str(src), "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_time", str(seg), "-reset_timestamps", "1",
+            pattern,
+        ])
+        parts = sorted(p for p in dest_dir.glob(f"{src.stem}_p*{src.suffix or '.mp4'}") if p.stat().st_size > 0)
+        if parts and all(p.stat().st_size <= MAX_BYTES + 2_000_000 for p in parts):
+            return parts
+    except Exception as exc:
+        log.warning("segment failed: %s", exc)
+    return binary_split(src, dest_dir)
+
+
+def binary_split(src: Path, dest_dir: Path) -> list[Path]:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    parts: list[Path] = []
+    with src.open("rb") as fh:
+        i = 1
+        while True:
+            chunk = fh.read(MAX_BYTES)
+            if not chunk:
+                break
+            p = dest_dir / f"{src.stem}.part{i:02d}{src.suffix}"
+            p.write_bytes(chunk)
+            parts.append(p)
+            i += 1
+    return parts
+
+
+def compress_audio(src: Path, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    out = dest_dir / f"{src.stem}.mp3"
+    for br in ("192k", "160k", "128k", "96k", "64k"):
+        _ff(["ffmpeg", "-y", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", br, str(out)])
+        if out.exists() and out.stat().st_size <= MAX_BYTES:
+            return out
     return out if out.exists() else src
 
 
@@ -374,18 +401,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     key = user_row(update.effective_user.id)["quality"]
     await update.message.reply_text(
         "\U0001F680 Veltrix Downloader\n\n"
-        "Link tashla.\n"
-        "\U0001F3AC Media yoki \U0001F3B5 MP3 ni tanla.\n\n"
-        f"\U0001F3A5 Default video: {PRESETS[key]['label']}\n"
-        "/settings — video sifatini o\u2018zgartirish"
+        "Link tashla → Media yoki MP3.\n"
+        f"Default video: {PRESETS[key]['label']}\n"
+        "50 MB dan katta fayl qismlarga bo\u2018linadi (maks 300 MB).\n"
+        "/settings"
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "\U0001F4E1 Link → Media yoki MP3.\n"
-        "Default faqat rasm/video uchun. MP3 default bo\u2018lmaydi.\n"
-        "2 soatlik video 50 MB ga sig\u2018masa — MP3 ol."
+        "Free Telegram limiti 50 MB.\n"
+        "Katta video 300 MB gacha yuklanadi va qismlarda yuboriladi."
     )
 
 
@@ -434,6 +460,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await run_job(q.message, context, uid, url, key, status=q.message)
 
 
+async def send_path(msg, path: Path, caption: str, kind: str) -> int:
+    n = 0
+    parts = [path] if path.stat().st_size <= MAX_BYTES else split_for_telegram(path, path.parent / f"{path.stem}_parts")
+    total = len(parts)
+    for i, part in enumerate(parts, 1):
+        cap = caption if total == 1 else f"{caption}\n\U0001F4E6 {i}/{total}"
+        with part.open("rb") as fh:
+            if kind == "audio" and total == 1:
+                await msg.reply_audio(audio=fh, caption=cap, filename=part.name)
+            elif kind == "video" and total == 1:
+                try:
+                    await msg.reply_video(video=fh, caption=cap, filename=part.name, supports_streaming=True)
+                except TelegramError:
+                    fh.seek(0)
+                    await msg.reply_document(document=fh, caption=cap, filename=part.name)
+            else:
+                await msg.reply_document(document=fh, caption=cap, filename=part.name)
+        n += 1
+    return n
+
+
 async def run_job(msg, context, uid: int, url: str, key: str, status=None) -> None:
     lock = job_lock(uid)
     if lock.locked():
@@ -447,8 +494,7 @@ async def run_job(msg, context, uid: int, url: str, key: str, status=None) -> No
     async def typing() -> None:
         try:
             while True:
-                action = ChatAction.UPLOAD_VOICE if spec["kind"] == "audio" else ChatAction.UPLOAD_DOCUMENT
-                await context.bot.send_chat_action(msg.chat_id, action)
+                await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
                 await asyncio.sleep(3)
         except asyncio.CancelledError:
             return
@@ -463,37 +509,19 @@ async def run_job(msg, context, uid: int, url: str, key: str, status=None) -> No
             videos = [p for p in files if classify(p) == "video"]
             if key == "mp3" and videos and not audios:
                 out_dir = Path(tmpdir) / "out"
-                converted = []
-                for path in videos:
-                    converted.append(await asyncio.to_thread(compress, path, out_dir, 0, 0, "audio"))
-                audios, videos = converted, []
+                audios = [await asyncio.to_thread(compress_audio, p, out_dir) for p in videos]
+                videos = []
             sent = 0
             if images:
                 sent += await send_images(msg, images)
-            out_dir = Path(tmpdir) / "out"
             for path in videos:
-                if path.stat().st_size > MAX_BYTES:
-                    path = await asyncio.to_thread(compress, path, out_dir, 0, spec["height"], "video")
-                if path.stat().st_size > MAX_BYTES:
-                    await msg.reply_text("\u26A0\uFE0F Video 50 MB dan katta. MP3 ni bos.")
-                    continue
-                cap = f"\U0001F3AC {spec['label']} \u00b7 {path.stat().st_size / 1048576:.1f} MB"
-                with path.open("rb") as fh:
-                    try:
-                        await msg.reply_video(video=fh, caption=cap, filename=path.name, supports_streaming=True)
-                    except TelegramError:
-                        fh.seek(0)
-                        await msg.reply_document(document=fh, caption=cap, filename=path.name)
-                sent += 1
+                sent += await send_path(msg, path, f"\U0001F3AC {spec['label']} \u00b7 {path.stat().st_size / 1048576:.1f} MB", "video")
             for path in audios:
                 if path.stat().st_size > MAX_BYTES:
-                    path = await asyncio.to_thread(compress, path, out_dir, 0, 0, "audio")
-                cap = f"\U0001F3B5 MP3 \u00b7 {path.stat().st_size / 1048576:.1f} MB"
-                with path.open("rb") as fh:
-                    await msg.reply_audio(audio=fh, caption=cap, filename=path.name)
-                sent += 1
+                    path = await asyncio.to_thread(compress_audio, path, Path(tmpdir) / "out")
+                sent += await send_path(msg, path, f"\U0001F3B5 MP3 \u00b7 {path.stat().st_size / 1048576:.1f} MB", "audio")
             if sent == 0:
-                raise RuntimeError("file too large or empty")
+                raise RuntimeError("nothing to send")
             try:
                 await status.edit_text(f"\u2705 {sent} ta fayl yuborildi")
             except TelegramError:
