@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Veltrix Downloader — YouTube, Instagram, Pinterest, Snapchat."""
+"""Veltrix Downloader — YouTube, Instagram, Pinterest, Snapchat. Fast path."""
 
 from __future__ import annotations
 
@@ -19,18 +19,10 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.constants import ChatAction, ParseMode
+from telegram.constants import ChatAction
 from telegram.error import TelegramError
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
 
 load_dotenv()
 
@@ -39,30 +31,22 @@ MAX_BYTES = 48 * 1024 * 1024
 MAX_PHOTO = 9 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
-COOKIES = Path("cookies.txt")
+COOKIES = Path(os.getenv("COOKIES_FILE", "cookies.txt"))
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("veltrix")
 _user_lock = Lock()
 _job_locks: dict[int, asyncio.Lock] = {}
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
-
 HOSTS = {
     "youtube": ("youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com"),
     "instagram": ("instagram.com", "instagr.am"),
     "pinterest": ("pinterest.com", "pinterest.co", "pin.it"),
     "snapchat": ("snapchat.com", "snap.com"),
-    "tiktok": ("tiktok.com", "vm.tiktok.com"),
-    "x": ("twitter.com", "x.com"),
 }
-
 DEFAULT_KEY = "720"
-
-PRESETS: dict[str, dict[str, Any]] = {
+PRESETS = {
     "best": {"label": "Best", "kind": "video", "height": 2160},
     "1080": {"label": "1080p", "kind": "video", "height": 1080},
     "720": {"label": "720p", "kind": "video", "height": 720},
@@ -71,21 +55,18 @@ PRESETS: dict[str, dict[str, Any]] = {
     "mp3": {"label": "MP3 320", "kind": "audio", "height": 0},
     "m4a": {"label": "M4A", "kind": "audio", "height": 0},
 }
+HAS_ARIA = bool(shutil.which("aria2c"))
 
 
 def job_lock(uid: int) -> asyncio.Lock:
-    lock = _job_locks.get(uid)
-    if lock is None:
-        lock = asyncio.Lock()
-        _job_locks[uid] = lock
-    return lock
+    if uid not in _job_locks:
+        _job_locks[uid] = asyncio.Lock()
+    return _job_locks[uid]
 
 
 def load_users() -> dict:
-    if not USERS_FILE.exists():
-        return {}
     try:
-        return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        return json.loads(USERS_FILE.read_text(encoding="utf-8")) if USERS_FILE.exists() else {}
     except Exception:
         return {}
 
@@ -97,23 +78,40 @@ def save_users(data: dict) -> None:
     tmp.replace(USERS_FILE)
 
 
-def user_cfg(uid: int) -> dict[str, str]:
+def user_row(uid: int) -> dict:
     with _user_lock:
         users = load_users()
         row = users.get(str(uid)) or {}
-        key = row.get("quality") or DEFAULT_KEY
-        if key not in PRESETS:
-            key = DEFAULT_KEY
-        return {"quality": key}
+        q = row.get("quality") or DEFAULT_KEY
+        if q not in PRESETS:
+            q = DEFAULT_KEY
+        return {"quality": q, "last_url": row.get("last_url") or ""}
 
 
-def set_quality(uid: int, key: str) -> None:
-    if key not in PRESETS:
-        return
+def patch_user(uid: int, **fields: str) -> dict:
     with _user_lock:
         users = load_users()
-        users[str(uid)] = {"quality": key}
+        row = users.get(str(uid)) or {}
+        row.update({k: v for k, v in fields.items() if v is not None})
+        if row.get("quality") not in PRESETS:
+            row["quality"] = DEFAULT_KEY
+        users[str(uid)] = row
         save_users(users)
+        return row
+
+
+def ensure_cookie_file() -> Path | None:
+    if COOKIES.exists() and COOKIES.stat().st_size > 32:
+        return COOKIES
+    sid = os.getenv("INSTAGRAM_SESSIONID", "").strip()
+    if not sid:
+        return None
+    COOKIES.write_text(
+        "# Netscape HTTP Cookie File\n"
+        ".instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t" + sid + "\n",
+        encoding="utf-8",
+    )
+    return COOKIES
 
 
 def extract_url(text: str) -> str | None:
@@ -135,7 +133,7 @@ def site_of(url: str) -> str:
     for name, suffixes in HOSTS.items():
         if any(host == s or host.endswith("." + s) for s in suffixes):
             return name
-    return "web"
+    return ""
 
 
 def format_for(key: str) -> str:
@@ -147,75 +145,54 @@ def format_for(key: str) -> str:
         return "bv*+ba/b"
     h = PRESETS[key]["height"]
     return (
-        f"bv*[height={h}][ext=mp4]+ba[ext=m4a]/"
-        f"bv*[height={h}]+ba/"
-        f"b[height={h}]/"
-        f"bv*[height<={h}][height>={max(h-80, 1)}][ext=mp4]+ba/"
-        f"bv*[height<={h}]+ba/"
-        f"b[height<={h}]/"
-        f"bv*+ba/b"
+        f"bv*[height={h}][ext=mp4]+ba[ext=m4a]/bv*[height={h}]+ba/b[height={h}]/"
+        f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
     )
 
 
-def base_opts(tmpdir: str) -> dict[str, Any]:
+def ydl_opts(tmpdir: str, key: str, site: str) -> dict[str, Any]:
+    spec = PRESETS[key]
     opts: dict[str, Any] = {
-        "noplaylist": False,
+        "noplaylist": site == "youtube",
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "retries": 12,
-        "fragment_retries": 12,
-        "extractor_retries": 5,
-        "concurrent_fragment_downloads": 8,
+        "retries": 8,
+        "fragment_retries": 8,
+        "extractor_retries": 3,
+        "concurrent_fragment_downloads": 16,
+        "file_access_retries": 3,
+        "socket_timeout": 15,
         "http_chunk_size": 10_485_760,
-        "socket_timeout": 25,
-        "outtmpl": str(Path(tmpdir) / "%(id)s_%(autonumber)s.%(ext)s"),
+        "outtmpl": str(Path(tmpdir) / "%(id)s_%(autonumber)03d.%(ext)s"),
         "restrictfilenames": True,
         "overwrites": True,
         "cachedir": False,
-        "ignoreerrors": False,
+        "ignoreerrors": True,
+        "skip_unavailable_fragments": True,
         "merge_output_format": "mp4",
-        "writethumbnail": False,
         "geo_bypass": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web", "ios"]}},
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
+        "format": format_for(key),
     }
-    if COOKIES.exists() and COOKIES.stat().st_size > 32:
-        opts["cookiefile"] = str(COOKIES)
+    ck = ensure_cookie_file()
+    if ck:
+        opts["cookiefile"] = str(ck)
+    if HAS_ARIA and site != "youtube":
+        opts["external_downloader"] = {"http": "aria2c", "https": "aria2c"}
+        opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M", "--file-allocation=none"]}
+    if spec["kind"] == "audio":
+        codec = "mp3" if key == "mp3" else "m4a"
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": codec, "preferredquality": "320" if key == "mp3" else "0"}]
     return opts
 
 
-def probe(url: str) -> dict[str, Any]:
-    opts = base_opts(tempfile.gettempdir())
-    opts["skip_download"] = True
-    opts["extract_flat"] = False
-    last = None
-    for _ in range(3):
-        try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if info:
-                return info
-        except Exception as exc:
-            last = exc
-    raise last or DownloadError("Could not read this link")
-
-
-def download_media(url: str, key: str, tmpdir: str) -> list[Path]:
+def download_ytdlp(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
-    spec = PRESETS[key]
-    opts = base_opts(tmpdir)
-    if spec["kind"] == "audio":
-        opts["format"] = format_for(key)
-        codec = "mp3" if key == "mp3" else "m4a"
-        q = "320" if key == "mp3" else "0"
-        opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": codec, "preferredquality": q}
-        ]
-    else:
-        opts["format"] = format_for(key)
     before = {p.name for p in Path(tmpdir).iterdir()}
+    opts = ydl_opts(tmpdir, key, site)
     last = None
-    for fmt in (opts.get("format"), "bv*+ba/b", "best"):
+    for fmt in (opts["format"], "bv*+ba/b", "best", "bestvideo+bestaudio/best"):
         try:
             opts["format"] = fmt
             with YoutubeDL(opts) as ydl:
@@ -224,73 +201,120 @@ def download_media(url: str, key: str, tmpdir: str) -> list[Path]:
             break
         except Exception as exc:
             last = exc
+    files = _new_files(tmpdir, before)
+    if files:
+        return files
     if last:
         raise last
+    return []
+
+
+def download_gallery(url: str, tmpdir: str) -> list[Path]:
+    if not shutil.which("gallery-dl") and not _has_gallery():
+        return []
+    dest = Path(tmpdir) / "gdl"
+    dest.mkdir(parents=True, exist_ok=True)
+    cmd = ["gallery-dl", "-d", str(dest), "--no-mtime", "-q", url]
+    ck = ensure_cookie_file()
+    if ck:
+        cmd[1:1] = ["--cookies", str(ck)]
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    files = [p for p in dest.rglob("*") if p.is_file() and p.stat().st_size > 0]
+    if proc.returncode != 0 and not files:
+        return []
+    return sorted(files, key=lambda p: p.name)
+
+
+def _has_gallery() -> bool:
+    try:
+        import gallery_dl  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _new_files(tmpdir: str, before: set[str]) -> list[Path]:
+    skip = {".json", ".vtt", ".srt", ".ass", ".nfo", ".part"}
     files = [
-        p for p in Path(tmpdir).iterdir()
-        if p.is_file() and p.name not in before and p.suffix.lower() not in {".json", ".vtt", ".srt"}
+        p for p in Path(tmpdir).rglob("*")
+        if p.is_file() and p.suffix.lower() not in skip and p.stat().st_size > 0 and p.name not in before
     ]
-    if not files:
-        files = [p for p in Path(tmpdir).iterdir() if p.is_file()]
-    files = [p for p in files if p.stat().st_size > 0]
     files.sort(key=lambda p: p.name)
-    if not files:
-        raise FileNotFoundError("Download produced no file")
     return files
 
 
-def _run_ffmpeg(cmd: list[str]) -> None:
+def grab(url: str, key: str, tmpdir: str, site: str) -> list[Path]:
+    files: list[Path] = []
+    err = None
+    try:
+        files = download_ytdlp(url, key, tmpdir, site)
+    except Exception as exc:
+        err = exc
+        log.warning("yt-dlp failed %s: %s", site, exc)
+    need_images = site in {"instagram", "pinterest", "snapchat"}
+    if need_images and (not files or all(classify(p) == "video" for p in files) is False):
+        extra = download_gallery(url, tmpdir)
+        names = {p.name for p in files}
+        for p in extra:
+            if p.name not in names:
+                files.append(p)
+    if not files and err:
+        raise err
+    if not files:
+        raise RuntimeError("no media from this link")
+    return files
+
+
+def _ff(cmd: list[str]) -> None:
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(proc.stderr[-300:] or "ffmpeg failed")
+        raise RuntimeError(proc.stderr[-240:] or "ffmpeg failed")
 
 
-def compress_under_limit(src: Path, dest_dir: Path, duration: int, want_height: int, kind: str) -> Path:
+def compress(src: Path, dest_dir: Path, duration: int, want_height: int, kind: str) -> Path:
     if src.stat().st_size <= MAX_BYTES:
         return src
     dest_dir.mkdir(parents=True, exist_ok=True)
     dur = max(int(duration or 0), 1)
     if kind == "audio" or src.suffix.lower() in {".mp3", ".m4a", ".opus", ".ogg"}:
         out = dest_dir / f"{src.stem}.tg.mp3"
-        for br in ("256k", "192k", "160k", "128k", "96k"):
-            _run_ffmpeg(["ffmpeg", "-y", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", br, str(out)])
+        for br in ("256k", "192k", "128k", "96k"):
+            _ff(["ffmpeg", "-y", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", br, str(out)])
             if out.exists() and out.stat().st_size <= MAX_BYTES:
                 return out
         return out
-    total_bps = int((MAX_BYTES * 8) / dur)
-    video_bps = max(total_bps - 96_000, 120_000)
-    height = want_height or 720
-    if video_bps < 1_200_000 and height > 720:
-        height = 720
-    if video_bps < 700_000 and height > 480:
-        height = 480
-    if video_bps < 350_000:
-        height = 360
-    out = dest_dir / f"{src.stem}.{height}p.mp4"
-    for scale_h, vb in ((height, video_bps), (min(height, 720), int(video_bps * 0.8)), (480, int(video_bps * 0.55)), (360, 180_000)):
-        _run_ffmpeg([
-            "ffmpeg", "-y", "-i", str(src),
-            "-vf", f"scale=-2:{scale_h}",
-            "-c:v", "libx264", "-preset", "veryfast",
-            "-b:v", str(vb), "-maxrate", str(vb), "-bufsize", str(vb * 2),
-            "-c:a", "aac", "-b:a", "96k",
-            "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-            str(out),
-        ])
-        if out.exists() and out.stat().st_size <= MAX_BYTES:
-            return out
-    return out
+    vb = max(int((MAX_BYTES * 8) / dur) - 96_000, 120_000)
+    h = want_height or 720
+    if vb < 1_200_000 and h > 720:
+        h = 720
+    if vb < 700_000 and h > 480:
+        h = 480
+    out = dest_dir / f"{src.stem}.{h}p.mp4"
+    _ff([
+        "ffmpeg", "-y", "-i", str(src), "-vf", f"scale=-2:{h}",
+        "-c:v", "libx264", "-preset", "ultrafast", "-b:v", str(vb),
+        "-maxrate", str(vb), "-bufsize", str(vb * 2), "-c:a", "aac", "-b:a", "96k",
+        "-movflags", "+faststart", "-pix_fmt", "yuv420p", str(out),
+    ])
+    return out if out.exists() else src
 
 
-def default_button(key: str) -> InlineKeyboardMarkup:
-    label = PRESETS.get(key, PRESETS[DEFAULT_KEY])["label"]
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"Default ({label})", callback_data="open_settings")]])
+def action_kb(key: str) -> InlineKeyboardMarkup:
+    lab = PRESETS[key]["label"]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Default ({lab})", callback_data="open_settings")],
+        [
+            InlineKeyboardButton("1080p", callback_data="go|1080"),
+            InlineKeyboardButton("720p", callback_data="go|720"),
+            InlineKeyboardButton("480p", callback_data="go|480"),
+            InlineKeyboardButton("MP3", callback_data="go|mp3"),
+        ],
+    ])
 
 
-def settings_keyboard(current: str) -> InlineKeyboardMarkup:
+def settings_kb(current: str) -> InlineKeyboardMarkup:
     def mark(k: str) -> str:
-        lab = PRESETS[k]["label"]
-        return f"\u2022 {lab}" if k == current else lab
+        return ("• " if k == current else "") + PRESETS[k]["label"]
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(mark("1080"), callback_data="set|1080"), InlineKeyboardButton(mark("720"), callback_data="set|720"), InlineKeyboardButton(mark("480"), callback_data="set|480")],
         [InlineKeyboardButton(mark("360"), callback_data="set|360"), InlineKeyboardButton(mark("best"), callback_data="set|best")],
@@ -300,56 +324,54 @@ def settings_keyboard(current: str) -> InlineKeyboardMarkup:
 
 def classify(path: Path) -> str:
     ext = path.suffix.lower()
-    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
         return "image"
-    if ext in {".mp3", ".m4a", ".opus", ".ogg", ".wav"}:
+    if ext in {".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac"}:
         return "audio"
     return "video"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    key = user_cfg(uid)["quality"]
+    key = user_row(update.effective_user.id)["quality"]
     await update.message.reply_text(
         "Veltrix Downloader\n\n"
-        "Send a link from YouTube, Instagram, Pinterest or Snapchat.\n"
-        "Photos in a post are sent one by one.\n\n"
-        f"Saved quality: Default ({PRESETS[key]['label']})\n"
-        "Tap that button anytime to change it. New links use the saved default.\n\n"
-        "/settings \u2014 change default\n"
-        "/help \u2014 details",
-        reply_markup=default_button(key),
+        "YouTube · Instagram · Pinterest · Snapchat\n"
+        "Send a link. Download starts immediately at Default.\n"
+        "Tap Default to save a new quality. Tap 1080p/720p/MP3 for this link only.\n\n"
+        f"Now: Default ({PRESETS[key]['label']})",
+        reply_markup=action_kb(key),
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "YouTube \u00b7 Instagram \u00b7 Pinterest \u00b7 Snapchat Spotlight\n"
-        "Video defaults to 720p until you change Default.\n"
-        "Audio: MP3 320 or M4A.\n"
-        "Images keep original quality (document if photo would be crushed).\n"
-        "Bot API cap is 50 MB. Private posts need cookies.txt on the server."
+        "Public posts work as-is.\n"
+        "Posts you can see while logged in: put cookies.txt on the server or set INSTAGRAM_SESSIONID.\n"
+        "Other people's private snaps / locked accounts cannot be opened without their session.\n"
+        "Carousels: each photo/video is sent separately.\n"
+        "50 MB Bot API cap still applies."
     )
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    key = user_cfg(update.effective_user.id)["quality"]
-    await update.message.reply_text(
-        f"Default quality is {PRESETS[key]['label']}.\nChoose a new default:",
-        reply_markup=settings_keyboard(key),
-    )
+    key = user_row(update.effective_user.id)["quality"]
+    await update.message.reply_text(f"Default is {PRESETS[key]['label']}", reply_markup=settings_kb(key))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    user = update.effective_user
+    uid = update.effective_user.id
     url = extract_url(msg.text or "")
     if not url:
         await msg.reply_text("Send a YouTube, Instagram, Pinterest or Snapchat link.")
         return
-    key = user_cfg(user.id)["quality"]
-    context.user_data["last_url"] = url
-    await run_job(msg, context, user.id, url, key, status_msg=None)
+    site = site_of(url)
+    if not site:
+        await msg.reply_text("Only YouTube, Instagram, Pinterest, Snapchat.")
+        return
+    key = user_row(uid)["quality"]
+    patch_user(uid, last_url=url)
+    await run_job(msg, context, uid, url, key)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -358,82 +380,63 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = q.data or ""
     uid = q.from_user.id
     if data == "open_settings":
-        key = user_cfg(uid)["quality"]
-        await q.message.reply_text(
-            f"Default is {PRESETS[key]['label']}. Pick a new default:",
-            reply_markup=settings_keyboard(key),
-        )
+        key = user_row(uid)["quality"]
+        await q.message.reply_text(f"Default is {PRESETS[key]['label']}", reply_markup=settings_kb(key))
         return
     if data.startswith("set|"):
         key = data.split("|", 1)[1]
         if key not in PRESETS:
             return
-        set_quality(uid, key)
-        await q.edit_message_text(
-            f"Default saved: {PRESETS[key]['label']}\nNext links use this automatically."
-        )
+        patch_user(uid, quality=key)
+        await q.edit_message_text(f"Default saved: {PRESETS[key]['label']}")
+        return
+    if data.startswith("go|"):
+        key = data.split("|", 1)[1]
+        if key not in PRESETS:
+            return
+        url = user_row(uid).get("last_url") or ""
+        if not url:
+            await q.message.reply_text("Send a link first.")
+            return
+        await run_job(q.message, context, uid, url, key)
 
 
-async def run_job(msg, context, uid: int, url: str, key: str, status_msg) -> None:
+async def run_job(msg, context, uid: int, url: str, key: str) -> None:
     lock = job_lock(uid)
     if lock.locked():
-        await msg.reply_text("A download is already running. Wait for it.")
+        await msg.reply_text("Still sending the previous file…")
         return
     spec = PRESETS[key]
-    site = site_of(url)
-    status = status_msg or await msg.reply_text(
-        f"Downloading...\nDefault ({spec['label']}) \u00b7 {site}",
-        reply_markup=default_button(key),
-    )
+    site = site_of(url) or "web"
+    status = await msg.reply_text(f"Downloading… {spec['label']} · {site}", reply_markup=action_kb(key))
 
     async def typing() -> None:
         try:
             while True:
                 await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
-                await asyncio.sleep(4)
+                await asyncio.sleep(3)
         except asyncio.CancelledError:
             return
 
     task = asyncio.create_task(typing())
-    tmpdir = tempfile.mkdtemp(prefix="veltrix_")
+    tmpdir = tempfile.mkdtemp(prefix="vx_")
     async with lock:
         try:
-            info = await asyncio.to_thread(probe, url)
-            title = (info.get("title") or info.get("fulltitle") or site)[:180]
-            duration = int(info.get("duration") or 0)
-            files = await asyncio.to_thread(download_media, url, key, tmpdir)
+            files = await asyncio.to_thread(grab, url, key, tmpdir, site)
+            title = site
             images = [p for p in files if classify(p) == "image"]
             audios = [p for p in files if classify(p) == "audio"]
             videos = [p for p in files if classify(p) == "video"]
             sent = 0
             if images:
-                await status.edit_text(f"Downloading... sending {len(images)} image(s)")
-                batch: list[Path] = []
-                for img in images:
-                    if img.stat().st_size > MAX_PHOTO:
-                        with img.open("rb") as fh:
-                            await msg.reply_document(document=fh, filename=img.name, caption=title[:200])
-                        sent += 1
-                    else:
-                        batch.append(img)
-                        if len(batch) == 10:
-                            sent += await _send_album(msg, batch, title)
-                            batch = []
-                if len(batch) == 1:
-                    with batch[0].open("rb") as fh:
-                        await msg.reply_photo(photo=fh, caption=title[:200])
-                    sent += 1
-                elif batch:
-                    sent += await _send_album(msg, batch, title)
+                sent += await send_images(msg, images, title)
             out_dir = Path(tmpdir) / "out"
             for path in videos:
                 if path.stat().st_size > MAX_BYTES:
-                    await status.edit_text("Downloading... compressing to fit 50 MB")
-                    path = await asyncio.to_thread(compress_under_limit, path, out_dir, duration, spec["height"], "video")
+                    path = await asyncio.to_thread(compress, path, out_dir, 0, spec["height"], "video")
                 if path.stat().st_size > MAX_BYTES:
-                    await msg.reply_text("File still exceeds 50 MB after compression. Change Default to 480p.")
                     continue
-                cap = f"{title}\n{spec['label']} \u00b7 {path.stat().st_size / 1048576:.1f} MB"
+                cap = f"{spec['label']} · {path.stat().st_size / 1048576:.1f} MB"
                 with path.open("rb") as fh:
                     try:
                         await msg.reply_video(video=fh, caption=cap, filename=path.name, supports_streaming=True)
@@ -443,32 +446,46 @@ async def run_job(msg, context, uid: int, url: str, key: str, status_msg) -> Non
                 sent += 1
             for path in audios:
                 if path.stat().st_size > MAX_BYTES:
-                    path = await asyncio.to_thread(compress_under_limit, path, out_dir, duration, 0, "audio")
-                cap = f"{title}\n{spec['label']} \u00b7 {path.stat().st_size / 1048576:.1f} MB"
+                    path = await asyncio.to_thread(compress, path, out_dir, 0, 0, "audio")
+                cap = f"{spec['label']} · {path.stat().st_size / 1048576:.1f} MB"
                 with path.open("rb") as fh:
-                    await msg.reply_audio(audio=fh, caption=cap, title=title[:64], filename=path.name)
+                    await msg.reply_audio(audio=fh, caption=cap, filename=path.name)
                 sent += 1
             if sent == 0:
-                raise RuntimeError("Nothing could be sent from this link")
-            try:
-                await status.edit_text(f"Sent {sent} file(s) \u00b7 Default ({spec['label']})", reply_markup=default_button(key))
-            except TelegramError:
-                pass
+                raise RuntimeError("nothing to send")
+            await status.edit_text(f"Sent {sent} · Default ({PRESETS[user_row(uid)['quality']]['label']})", reply_markup=action_kb(user_row(uid)["quality"]))
         except Exception as exc:
-            log.exception("job failed")
-            hint = _friendly(str(exc), site)
-            try:
-                await status.edit_text(hint, reply_markup=default_button(key))
-            except TelegramError:
-                await msg.reply_text(hint)
+            log.exception("job")
+            await status.edit_text(_friendly(str(exc), site), reply_markup=action_kb(key))
         finally:
             task.cancel()
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-async def _send_album(msg, paths: list[Path], caption: str) -> int:
-    media = []
-    handles = []
+async def send_images(msg, paths: list[Path], title: str) -> int:
+    sent = 0
+    batch: list[Path] = []
+    for img in paths:
+        if img.stat().st_size > MAX_PHOTO:
+            with img.open("rb") as fh:
+                await msg.reply_document(document=fh, filename=img.name, caption=title[:200])
+            sent += 1
+            continue
+        batch.append(img)
+        if len(batch) == 10:
+            sent += await album(msg, batch, title)
+            batch = []
+    if len(batch) == 1:
+        with batch[0].open("rb") as fh:
+            await msg.reply_photo(photo=fh, caption=title[:200])
+        sent += 1
+    elif batch:
+        sent += await album(msg, batch, title)
+    return sent
+
+
+async def album(msg, paths: list[Path], caption: str) -> int:
+    media, handles = [], []
     try:
         for i, p in enumerate(paths):
             fh = p.open("rb")
@@ -493,13 +510,9 @@ async def _send_album(msg, paths: list[Path], caption: str) -> int:
 
 def _friendly(reason: str, site: str) -> str:
     r = reason.lower()
-    if "403" in r or "forbidden" in r:
-        return f"{site}: source blocked this server IP. Put cookies.txt next to bot.py on Render and redeploy."
-    if "login" in r or "private" in r or "age" in r:
-        return f"{site}: this post is private or login-only. Public links work without cookies."
-    if "unsupported" in r or "no video" in r or "not a valid" in r:
-        return f"{site}: this URL type is not downloadable (closed story / private snap)."
-    return f"{site}: could not finish this one. Try another public link.\n{reason[:240]}"
+    if "403" in r or "login" in r or "private" in r or "cookie" in r:
+        return f"{site}: needs your login. Add cookies.txt or INSTAGRAM_SESSIONID on Render."
+    return f"{site}: {reason[:220]}"
 
 
 def start_health_server() -> None:
@@ -508,7 +521,7 @@ def start_health_server() -> None:
         def do_GET(self):
             self.send_response(200)
             self.end_headers()
-            self.wfile.write(b"Veltrix Downloader OK")
+            self.wfile.write(b"ok")
         def log_message(self, fmt, *args):
             return
     Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever(), daemon=True).start()
@@ -525,7 +538,7 @@ def main() -> None:
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    log.info("Veltrix Downloader started")
+    log.info("started aria=%s", HAS_ARIA)
     app.run_polling(drop_pending_updates=True)
 
 
