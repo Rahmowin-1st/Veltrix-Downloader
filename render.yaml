@@ -3,9 +3,8 @@ services:
     name: veltrix-downloader
     runtime: docker
     plan: starter
+    region: frankfurt
     dockerfilePath: ./Dockerfile
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: PORT
-        value: "10000"
