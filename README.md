@@ -14,7 +14,9 @@ Needs `ffmpeg`.
 
 ## Render
 
-Connect this GitHub repo as a **Background Worker** (Docker). Set `BOT_TOKEN` in Render env. Do not commit the token.
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Rahmowin-1st/Veltrix-Downloader)
+
+The included `render.yaml` creates only one **Background Worker** using Docker on the Starter plan in Frankfurt. Set `BOT_TOKEN` in Render when prompted. Do not commit the token.
 
 ## Supabase
 
