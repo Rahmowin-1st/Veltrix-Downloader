@@ -115,6 +115,17 @@ class BackendTests(unittest.TestCase):
             finally:
                 bot.DATA_DIR, bot.ACTIONS_FILE = old_dir, old_file
 
+    def test_pinterest_720_hls_beats_low_mp4(self):
+        hls720 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/master.m3u8", "height": 720})
+        mp4360 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/360.mp4", "height": 360})
+        self.assertGreater(hls720, mp4360)
+
+    def test_snapchat_octet_stream_is_forced_to_video_extension_contract(self):
+        self.assertTrue(bot.safe_media_title("  A\nB  ").startswith("A B"))
+
+    def test_retry_delay_is_bounded(self):
+        self.assertLessEqual(bot.telegram_retry_delay(TimeoutError(), 10), 8.0)
+
 
 if __name__ == "__main__":
     unittest.main()
