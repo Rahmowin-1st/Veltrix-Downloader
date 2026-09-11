@@ -657,7 +657,7 @@ def _instagram_format_score(fmt: dict[str, Any], kind: str) -> tuple[int, int, i
     elif height == 1080:
         tier = 950
     elif 0 < height < 720:
-        tier = 800 + height
+        tier = 800 + min(height // 10, 90)
     elif height > 1080:
         tier = 700 - min(height - 1080, 600)
     else:
@@ -1029,7 +1029,7 @@ def _pinterest_quality_score(fmt: dict[str, Any]) -> tuple[int, int, int]:
     elif h == 1080:
         tier = 95
     elif 0 < h < 720:
-        tier = 80 + h // 100
+        tier = 80 + min(h // 100, 9)
     elif h > 1080:
         tier = 70
     else:
