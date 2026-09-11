@@ -47,6 +47,9 @@ MAX_CONCURRENT_JOBS = max(1, min(int(os.getenv("MAX_CONCURRENT_JOBS", "1")), 3))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
 ACTIONS_FILE = DATA_DIR / "actions.json"
+CACHE_DIR = DATA_DIR / "cache"
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(2 * 3600)))
+CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -218,11 +221,41 @@ def _save_actions(data: dict[str, dict[str, Any]]) -> None:
     tmp.replace(ACTIONS_FILE)
 
 
-def create_action(uid: int, url: str) -> str:
-    """Bind an inline action to the exact request, not the user's latest URL."""
+def cleanup_media_cache() -> None:
+    now = time.time()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        for path in CACHE_DIR.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                if now - path.stat().st_mtime > CACHE_TTL_SECONDS:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def create_action(uid: int, url: str, source_path: Path | None = None, title: str = "") -> str:
+    """Bind an inline action to the exact request and optionally cache its source."""
     now = int(time.time())
     raw = f"{uid}:{url}:{time.time_ns()}".encode()
     token = hashlib.sha256(raw).hexdigest()[:20]
+    cleanup_media_cache()
+
+    cache_path = ""
+    if source_path is not None:
+        try:
+            if source_path.exists() and 0 < source_path.stat().st_size <= CACHE_MAX_BYTES:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                suffix = source_path.suffix.lower() or ".bin"
+                dest = CACHE_DIR / f"{token}{suffix}"
+                shutil.copy2(source_path, dest)
+                cache_path = str(dest)
+        except OSError as exc:
+            log.info("media cache skipped: %s", str(exc)[:140])
+
     with _action_lock:
         actions = _load_actions()
         cutoff = now - 7 * 24 * 3600
@@ -230,27 +263,52 @@ def create_action(uid: int, url: str) -> str:
             k: v for k, v in actions.items()
             if isinstance(v, dict) and int(v.get("created_at") or 0) >= cutoff
         }
-        actions[token] = {"uid": uid, "url": url, "created_at": now}
+        actions[token] = {
+            "uid": uid,
+            "url": url,
+            "created_at": now,
+            "cache_path": cache_path,
+            "title": safe_media_title(title) if title else "",
+        }
         if len(actions) > 1500:
-            newest = sorted(actions.items(), key=lambda kv: int(kv[1].get("created_at") or 0), reverse=True)[:1200]
+            newest = sorted(
+                actions.items(),
+                key=lambda kv: int(kv[1].get("created_at") or 0),
+                reverse=True,
+            )[:1200]
             actions = dict(newest)
         _save_actions(actions)
     return token
 
 
-def resolve_action(uid: int, token: str) -> str:
+def resolve_action_data(uid: int, token: str) -> dict[str, Any]:
     with _action_lock:
-        row = _load_actions().get(token) or {}
+        row = dict(_load_actions().get(token) or {})
     if int(row.get("uid") or -1) != int(uid):
-        return ""
+        return {}
     if int(row.get("created_at") or 0) < int(time.time()) - 7 * 24 * 3600:
-        return ""
-    return str(row.get("url") or "")
+        return {}
+
+    cache_path = str(row.get("cache_path") or "")
+    if cache_path:
+        path = Path(cache_path)
+        try:
+            if not path.exists() or time.time() - path.stat().st_mtime > CACHE_TTL_SECONDS:
+                row["cache_path"] = ""
+        except OSError:
+            row["cache_path"] = ""
+    return row
 
 
-def mp3_button(uid: int, url: str) -> InlineKeyboardMarkup:
-    token = create_action(uid, url)
+def resolve_action(uid: int, token: str) -> str:
+    return str(resolve_action_data(uid, token).get("url") or "")
+
+
+def mp3_button(uid: int, url: str, source_path: Path | None = None, title: str = "") -> InlineKeyboardMarkup:
+    token = create_action(uid, url, source_path=source_path, title=title)
     return InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MP3", callback_data=f"mp3|{token}")]])
+
+
 
 
 def extract_url(text: str) -> str | None:
@@ -1527,14 +1585,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     token = data.split("|", 1)[1]
-    url = resolve_action(uid, token)
+    action = resolve_action_data(uid, token)
+    url = str(action.get("url") or "")
     if not url:
         await q.answer("This MP3 action expired. Send the media link again.", show_alert=False)
         return
 
     await q.answer()
     status = await q.message.reply_text("⬇️ Converting to MP3…")
-    await run_job(q.message, context, uid, url, "mp3_192", status)
+    cache_path = str(action.get("cache_path") or "")
+    if cache_path and Path(cache_path).exists():
+        await run_cached_audio_job(
+            q.message,
+            context,
+            uid,
+            Path(cache_path),
+            str(action.get("title") or ""),
+            status,
+        )
+    else:
+        await run_job(q.message, context, uid, url, "mp3_192", status)
 
 
 def telegram_retry_delay(exc: Exception, attempt: int) -> float:
@@ -1703,6 +1773,46 @@ async def send_document(msg, path: Path, caption: str) -> int:
     return 1
 
 
+async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str, status) -> None:
+    """Fast MP3 path using the exact video already downloaded for this button."""
+    lock = job_lock(uid)
+    metric_add("jobs_started", 1)
+    if lock.locked():
+        metric_add("queued_jobs", 1)
+        await edit_status(status, "⏳ Queued…")
+
+    tmp = Path(tempfile.mkdtemp(prefix="vx_cache_"))
+    async with lock:
+        if metric_snapshot().get("queued_jobs", 0) > 0:
+            metric_add("queued_jobs", -1)
+        metric_add("active_jobs", 1)
+        try:
+            if not source.exists():
+                raise RuntimeError("Cached media expired.")
+            sent = await send_audio(
+                msg,
+                source,
+                "⚡ Veltrix Downloader · MP3",
+                "mp3_192",
+                tmp,
+                title,
+            )
+            if not sent:
+                raise RuntimeError("MP3 conversion failed.")
+            metric_add("jobs_succeeded", 1)
+            try:
+                await status.delete()
+            except TelegramError:
+                await edit_status(status, "✅ Done")
+        except Exception as exc:
+            metric_add("jobs_failed", 1)
+            log.exception("cached MP3 job failed")
+            await edit_status(status, "❌ MP3 conversion failed. Send the link again.")
+        finally:
+            metric_add("active_jobs", -1)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> None:
     lock = job_lock(uid)
     metric_add("jobs_started", 1)
@@ -1733,11 +1843,10 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
         async with global_sem():
             try:
                 meta = {}
-                if mode in AUDIO_PRESETS:
-                    try:
-                        meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=15)
-                    except Exception:
-                        meta = {}
+                try:
+                    meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=15)
+                except Exception:
+                    meta = {}
                 files = await asyncio.to_thread(grab, url, mode, str(tmp))
                 kinds = [classify(p) for p in files]
                 sent = 0
@@ -1758,10 +1867,6 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                         )
                 else:
                     requested = 2160 if mode == "original" else (720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"]))
-                    video_positions = [i for i, kind in enumerate(kinds) if kind == "video"]
-                    last_video_pos = video_positions[-1] if video_positions else -1
-                    markup = mp3_button(uid, url) if video_positions else None
-
                     for index, (path, kind) in enumerate(zip(files, kinds)):
                         item_caption = caption if sent == 0 else ""
                         if kind == "image":
@@ -1769,13 +1874,19 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                         elif kind == "animation":
                             sent += await send_animation(msg, path, item_caption, tmp)
                         elif kind == "video":
+                            markup = mp3_button(
+                                uid,
+                                url,
+                                source_path=path,
+                                title=str(meta.get("title") or ""),
+                            )
                             sent += await send_video(
                                 msg,
                                 path,
                                 item_caption,
                                 requested,
                                 tmp,
-                                markup if index == last_video_pos else None,
+                                markup,
                             )
                         elif kind == "audio":
                             sent += await send_audio(msg, path, item_caption, "mp3_192", tmp)
@@ -1842,6 +1953,7 @@ def main() -> None:
         raise SystemExit("BOT_TOKEN is missing")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_stale_temp()
+    cleanup_media_cache()
     start_health_server()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
