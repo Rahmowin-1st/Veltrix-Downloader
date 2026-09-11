@@ -14,17 +14,25 @@ trap cleanup TERM INT EXIT
 
 BACKOFF=2
 while true; do
+  START_TS="$(date +%s)"
   python bot.py &
   CHILD_PID=$!
   wait "$CHILD_PID"
   CODE=$?
+  END_TS="$(date +%s)"
+  RUNTIME=$((END_TS - START_TS))
   CHILD_PID=""
 
   if [ "$CODE" -eq 0 ]; then
     exit 0
   fi
 
-  echo "$(date -Iseconds) supervisor: bot exited code=$CODE; restart in ${BACKOFF}s"
+  # A long healthy run means the previous crash storm is over.
+  if [ "$RUNTIME" -ge 120 ]; then
+    BACKOFF=2
+  fi
+
+  echo "$(date -Iseconds) supervisor: bot exited code=$CODE after ${RUNTIME}s; restart in ${BACKOFF}s"
   sleep "$BACKOFF"
   if [ "$BACKOFF" -lt 30 ]; then
     BACKOFF=$((BACKOFF * 2))
