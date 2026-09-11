@@ -1465,113 +1465,103 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    await q.answer()
     data = q.data or ""
     uid = q.from_user.id
-    # New UX exposes only one action after a successful video: MP3.
-    if data != "dl|mp3_192":
+
+    if not data.startswith("mp3|"):
+        await q.answer()
         return
-    mode = "mp3_192"
-    url = user_row(uid).get("last_url") or ""
+
+    token = data.split("|", 1)[1]
+    url = resolve_action(uid, token)
     if not url:
-        await q.edit_message_text("Send the link again.")
+        await q.answer("This MP3 action expired. Send the media link again.", show_alert=False)
         return
+
+    await q.answer()
     status = await q.message.reply_text("⬇️ Converting to MP3…")
-    await run_job(q.message, context, uid, url, mode, status)
+    await run_job(q.message, context, uid, url, "mp3_192", status)
 
 
-async def send_images(msg, paths: list[Path], caption: str) -> int:
-    sent = 0
-    batch: list[Path] = []
-    for image in paths:
-        if image.stat().st_size > MAX_PHOTO_BYTES:
-            with image.open("rb") as fh:
-                await msg.reply_document(document=fh, caption=caption if sent == 0 else None, filename=image.name)
-            sent += 1
-            continue
-        batch.append(image)
-        if len(batch) == 10:
-            sent += await send_album(msg, batch, caption if sent == 0 else "")
-            batch = []
-    if len(batch) == 1:
-        with batch[0].open("rb") as fh:
-            await msg.reply_photo(photo=fh, caption=caption if sent == 0 else None)
-        sent += 1
-    elif batch:
-        sent += await send_album(msg, batch, caption if sent == 0 else "")
-    return sent
+async def send_image(msg, path: Path, caption: str, tmp: Path) -> int:
+    final = await asyncio.to_thread(fit_image, path, tmp / "fit_images")
+    if final.stat().st_size > MAX_PHOTO_BYTES:
+        raise RuntimeError("Photo could not be fitted for Telegram.")
+    with final.open("rb") as fh:
+        await msg.reply_photo(photo=fh, caption=caption or None)
+    return 1
 
 
-async def send_album(msg, paths: list[Path], caption: str) -> int:
-    handles = []
-    try:
-        media = []
-        for index, path in enumerate(paths):
-            fh = path.open("rb")
-            handles.append(fh)
-            media.append(InputMediaPhoto(media=fh, caption=caption if index == 0 and caption else None))
-        await msg.reply_media_group(media=media)
-        return len(paths)
-    finally:
-        for fh in handles:
-            try:
-                fh.close()
-            except Exception:
-                pass
+async def send_animation(msg, path: Path, caption: str, tmp: Path) -> int:
+    final = path
+    if final.stat().st_size > MAX_BYTES or final.suffix.lower() not in {".gif", ".mp4"}:
+        final = await asyncio.to_thread(fit_animation, final, tmp / "fit_animation")
+    if final.stat().st_size > MAX_BYTES:
+        raise RuntimeError("Animation could not be fitted for Telegram.")
+    with final.open("rb") as fh:
+        await msg.reply_animation(animation=fh, caption=caption or None, filename=final.name)
+    return 1
+
+
+async def _send_video_file(msg, path: Path, caption: str, reply_markup=None) -> None:
+    with path.open("rb") as fh:
+        await msg.reply_video(
+            video=fh,
+            caption=caption or None,
+            filename=path.name,
+            supports_streaming=True,
+            reply_markup=reply_markup,
+        )
 
 
 async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, reply_markup=None) -> int:
-    # Preserve source resolution whenever possible. Telegram hosted Bot API has
-    # a per-file cap, so large videos are split before we consider re-encoding.
+    # First try the original file unchanged when it already fits Telegram.
     if path.stat().st_size <= MAX_BYTES:
-        with path.open("rb") as fh:
-            try:
-                await msg.reply_video(video=fh, caption=caption, filename=path.name, supports_streaming=True, reply_markup=reply_markup)
-            except TelegramError:
-                fh.seek(0)
-                await msg.reply_document(document=fh, caption=caption, filename=path.name, reply_markup=reply_markup)
-        return 1
+        try:
+            await _send_video_file(msg, path, caption, reply_markup)
+            return 1
+        except TelegramError as exc:
+            log.info("Telegram rejected source video; normalizing: %s", str(exc)[:140])
+            normalized = await asyncio.to_thread(normalize_video, path, tmp / "normalized", max_height)
+            if normalized.stat().st_size > MAX_BYTES:
+                normalized = await asyncio.to_thread(fit_video, normalized, tmp / "fit_normalized", max_height)
+            if normalized.stat().st_size <= MAX_BYTES:
+                await _send_video_file(msg, normalized, caption, reply_markup)
+                return 1
 
+    # Long files preserve quality by splitting before recompression.
     duration = await asyncio.to_thread(media_duration, path)
-    if duration >= 8 * 60:
-        parts = await asyncio.to_thread(split_video, path, tmp / "parts_original")
+    if path.stat().st_size > MAX_BYTES and duration >= 8 * 60:
+        try:
+            parts = await asyncio.to_thread(split_video, path, tmp / "parts_original")
+        except Exception:
+            parts = []
         if parts and all(p.stat().st_size <= MAX_BYTES for p in parts):
             for index, part in enumerate(parts, 1):
-                with part.open("rb") as fh:
-                    markup = reply_markup if index == len(parts) else None
-                    await msg.reply_video(
-                        video=fh,
-                        caption=f"{caption}\nPart {index}/{len(parts)}",
-                        filename=part.name,
-                        supports_streaming=True,
-                        reply_markup=markup,
-                    )
+                markup = reply_markup if index == len(parts) else None
+                await _send_video_file(
+                    msg,
+                    part,
+                    f"{caption}\nPart {index}/{len(parts)}" if caption else f"Part {index}/{len(parts)}",
+                    markup,
+                )
             return len(parts)
 
     final = await asyncio.to_thread(fit_video, path, tmp / "fit", max_height)
-    if final.stat().st_size <= MAX_BYTES:
-        with final.open("rb") as fh:
-            try:
-                await msg.reply_video(video=fh, caption=caption, filename=final.name, supports_streaming=True, reply_markup=reply_markup)
-            except TelegramError:
-                fh.seek(0)
-                await msg.reply_document(document=fh, caption=caption, filename=final.name, reply_markup=reply_markup)
-        return 1
+    if final.stat().st_size > MAX_BYTES:
+        raise RuntimeError("Video could not be fitted for Telegram.")
 
-    parts = await asyncio.to_thread(split_video, final, tmp / "parts")
-    if not parts or any(p.stat().st_size > MAX_BYTES for p in parts):
-        raise RuntimeError("Could not fit this video under Telegram's hosted bot upload limit.")
-    for index, part in enumerate(parts, 1):
-        with part.open("rb") as fh:
-            markup = reply_markup if index == len(parts) else None
-            await msg.reply_video(
-                video=fh,
-                caption=f"{caption}\nPart {index}/{len(parts)}",
-                filename=part.name,
-                supports_streaming=True,
-                reply_markup=markup,
-            )
-    return len(parts)
+    try:
+        await _send_video_file(msg, final, caption, reply_markup)
+        return 1
+    except TelegramError:
+        normalized = await asyncio.to_thread(normalize_video, final, tmp / "normalized_final", max_height)
+        if normalized.stat().st_size > MAX_BYTES:
+            normalized = await asyncio.to_thread(fit_video, normalized, tmp / "fit_final", max_height)
+        if normalized.stat().st_size > MAX_BYTES:
+            raise RuntimeError("Video could not be fitted for Telegram.")
+        await _send_video_file(msg, normalized, caption, reply_markup)
+        return 1
 
 
 async def send_audio(msg, path: Path, caption: str, mode: str, tmp: Path) -> int:
@@ -1579,21 +1569,35 @@ async def send_audio(msg, path: Path, caption: str, mode: str, tmp: Path) -> int
     final = path
     wanted_ext = ".m4a" if preset["codec"] == "m4a" else ".mp3"
     if final.stat().st_size > MAX_BYTES or final.suffix.lower() != wanted_ext:
-        final = await asyncio.to_thread(fit_audio, final, tmp / "fit_audio", str(preset["codec"]), int(preset["bitrate"]))
+        final = await asyncio.to_thread(
+            fit_audio,
+            final,
+            tmp / "fit_audio",
+            str(preset["codec"]),
+            int(preset["bitrate"]),
+        )
     if final.stat().st_size > MAX_BYTES:
-        raise RuntimeError("Audio is still over Telegram's hosted bot upload limit.")
+        raise RuntimeError("Audio could not be fitted for Telegram.")
     with final.open("rb") as fh:
-        await msg.reply_audio(audio=fh, caption=caption, filename=final.name)
+        await msg.reply_audio(audio=fh, caption=caption or None, filename=final.name)
+    return 1
+
+
+async def send_document(msg, path: Path, caption: str) -> int:
+    if path.stat().st_size > MAX_BYTES:
+        raise RuntimeError("Unsupported media is over Telegram's upload limit.")
+    with path.open("rb") as fh:
+        await msg.reply_document(document=fh, caption=caption or None, filename=path.name)
     return 1
 
 
 async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> None:
     lock = job_lock(uid)
-    if lock.locked():
-        await msg.reply_text("⏳ Your previous download is still running.")
-        return
     if status is None:
         status = await msg.reply_text("⬇️ Downloading…")
+    elif lock.locked():
+        await edit_status(status, "⏳ Queued…")
+
     async def typing() -> None:
         try:
             while True:
@@ -1601,57 +1605,75 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                 await asyncio.sleep(4)
         except asyncio.CancelledError:
             return
+
     typing_task = asyncio.create_task(typing())
     tmp = Path(tempfile.mkdtemp(prefix="vx_"))
     platform = platform_of(url) or "web"
+
     async with lock:
+        await edit_status(status, f"⬇️ Downloading from {PLATFORMS.get(platform, {}).get('label', 'Media')}…")
         async with global_sem():
             try:
                 files = await asyncio.to_thread(grab, url, mode, str(tmp))
-                images = [p for p in files if classify(p) == "image"]
-                videos = [p for p in files if classify(p) == "video"]
-                audios = [p for p in files if classify(p) == "audio"]
+                kinds = [classify(p) for p in files]
                 sent = 0
-                video_sent = False
                 caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
-                mp3_button = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MP3", callback_data="dl|mp3_192")]])
 
                 if mode in AUDIO_PRESETS:
-                    sources = audios or videos
+                    sources = [p for p, kind in zip(files, kinds) if kind in {"audio", "video", "animation"}]
                     if not sources:
                         raise RuntimeError("No audio/video stream was found in this post.")
-                    for source in sources[:3]:
-                        sent += await send_audio(msg, source, caption, mode, tmp)
-                elif mode == "original":
-                    if images:
-                        sent += await send_images(msg, images, caption)
-                    for video in videos:
-                        sent += await send_video(msg, video, caption, 2160, tmp, mp3_button)
-                        video_sent = True
-                    for audio in audios:
-                        sent += await send_audio(msg, audio, caption, "mp3_192", tmp)
+                    for index, source in enumerate(sources):
+                        sent += await send_audio(
+                            msg,
+                            source,
+                            caption if index == 0 else "",
+                            mode,
+                            tmp,
+                        )
                 else:
-                    requested = 720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"])
-                    if images and not videos:
-                        sent += await send_images(msg, images, caption)
-                    for video in videos:
-                        sent += await send_video(msg, video, caption, requested, tmp, mp3_button)
-                        video_sent = True
-                    if not videos and audios:
-                        raise RuntimeError("This media exposes audio only.")
+                    requested = 2160 if mode == "original" else (720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"]))
+                    video_positions = [i for i, kind in enumerate(kinds) if kind == "video"]
+                    last_video_pos = video_positions[-1] if video_positions else -1
+                    markup = mp3_button(uid, url) if video_positions else None
+
+                    for index, (path, kind) in enumerate(zip(files, kinds)):
+                        item_caption = caption if sent == 0 else ""
+                        if kind == "image":
+                            sent += await send_image(msg, path, item_caption, tmp)
+                        elif kind == "animation":
+                            sent += await send_animation(msg, path, item_caption, tmp)
+                        elif kind == "video":
+                            sent += await send_video(
+                                msg,
+                                path,
+                                item_caption,
+                                requested,
+                                tmp,
+                                markup if index == last_video_pos else None,
+                            )
+                        elif kind == "audio":
+                            sent += await send_audio(msg, path, item_caption, "mp3_192", tmp)
+                        else:
+                            # Rare unknown files are kept rather than silently lost.
+                            sent += await send_document(msg, path, item_caption)
+
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned.")
+
                 try:
                     await status.delete()
                 except TelegramError:
                     await edit_status(status, "✅ Done")
+
             except Exception as exc:
                 log.exception("download job failed")
-                safe_message = friendly_error(platform, exc) if platform in PLATFORMS else "Download failed. Please try another link."
-                try:
-                    await edit_status(status, f"❌ {safe_message}")
-                except Exception:
-                    await msg.reply_text("❌ Download failed.")
+                safe_message = (
+                    friendly_error(platform, exc)
+                    if platform in PLATFORMS
+                    else "Download failed. Please try another link."
+                )
+                await edit_status(status, f"❌ {safe_message}")
             finally:
                 typing_task.cancel()
                 shutil.rmtree(tmp, ignore_errors=True)
