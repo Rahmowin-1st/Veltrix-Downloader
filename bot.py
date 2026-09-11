@@ -33,7 +33,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -459,6 +459,148 @@ def og_values(page: str, names: set[str]) -> list[str]:
     return values
 
 
+def _decode_web_url(value: str) -> str:
+    value = html.unescape(value or "")
+    value = value.replace("\\/","/").replace("\\u0026", "&").replace("\\u003d", "=")
+    value = value.replace("\\u002F", "/").replace("\\u002f", "/")
+    return value.strip()
+
+
+def _walk_media_urls(value: Any, key_hint: str = "") -> list[str]:
+    """Extract public media URLs from JSON/Next.js/JSON-LD payloads."""
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            found.extend(_walk_media_urls(child, str(key).lower()))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_walk_media_urls(child, key_hint))
+    elif isinstance(value, str):
+        raw = _decode_web_url(value)
+        key_media = any(x in key_hint for x in (
+            "contenturl", "content_url", "video_url", "videourl",
+            "playbackurl", "playback_url", "mediaurl", "media_url",
+            "thumbnailurl", "thumbnail_url", "imageurl", "image_url",
+        ))
+        path = urlparse(raw).path.lower() if raw.startswith(("http://", "https://")) else ""
+        ext_media = any(path.endswith(ext) for ext in (
+            ".mp4", ".m4v", ".mov", ".webm", ".m3u8",
+            ".jpg", ".jpeg", ".png", ".webp",
+        ))
+        if raw.startswith(("http://", "https://")) and (key_media or ext_media):
+            found.append(raw)
+    return found
+
+
+def page_media_candidates(page: str) -> list[str]:
+    """Parse public HTML for OG, JSON-LD, Next.js and embedded media URLs."""
+    candidates: list[str] = []
+    candidates += og_values(page, {
+        "og:video", "og:video:url", "og:video:secure_url",
+        "twitter:player:stream", "og:image", "og:image:url",
+        "og:image:secure_url", "twitter:image",
+    })
+
+    # Structured script payloads (Instagram embeds, Snapchat Next.js, Pinterest).
+    for match in re.finditer(
+        r"<script[^>]*(?:type=[\"']application/ld\+json[\"']|id=[\"']__NEXT_DATA__[\"'])[^>]*>(.*?)</script>",
+        page,
+        flags=re.I | re.S,
+    ):
+        raw = html.unescape(match.group(1)).strip()
+        try:
+            candidates += _walk_media_urls(json.loads(raw))
+        except Exception:
+            pass
+
+    # Common serialized media keys used by social pages.
+    for match in re.finditer(
+        r"[\"'](?:video_url|videoUrl|contentUrl|content_url|playbackUrl|playback_url|thumbnailUrl|thumbnail_url)[\"']\s*:\s*[\"']([^\"']+)",
+        page,
+        flags=re.I,
+    ):
+        candidates.append(_decode_web_url(match.group(1)))
+
+    # Last public-page fallback: direct media URLs embedded in JS.
+    for match in re.finditer(
+        r"https?:\\?/\\?/[^\"'<>\s]+?(?:\.mp4|\.m3u8|\.webm|\.jpg|\.jpeg|\.webp)(?:\?[^\"'<>\s]*)?",
+        page,
+        flags=re.I,
+    ):
+        candidates.append(_decode_web_url(match.group(0)))
+
+    return list(dict.fromkeys(x for x in candidates if x))
+
+
+def download_public_page_media(url: str, tmpdir: str) -> list[Path]:
+    """Download media URLs exposed by a public social page without login bypass."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Mobile Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    dest = Path(tmpdir) / "page_media"
+    dest.mkdir(parents=True, exist_ok=True)
+    results: list[Path] = []
+
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=25, proxy=PROXY or None) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        if "text/html" not in response.headers.get("content-type", ""):
+            return []
+        candidates = page_media_candidates(response.text)
+
+        for index, raw in enumerate(candidates[:40], 1):
+            media_url = urljoin(str(response.url), raw)
+            if not safe_remote_url(media_url):
+                continue
+            path_lower = urlparse(media_url).path.lower()
+
+            # HLS is delegated to yt-dlp/ffmpeg.
+            if path_lower.endswith(".m3u8"):
+                try:
+                    opts = base_ydl_opts(tmpdir)
+                    opts["format"] = "best"
+                    opts["http_headers"] = {**opts.get("http_headers", {}), "Referer": str(response.url)}
+                    with YoutubeDL(opts) as ydl:
+                        ydl.download([media_url])
+                    hls_files = files_in(Path(tmpdir) / "ytdl")
+                    if hls_files:
+                        results.extend(hls_files)
+                        break
+                except Exception as exc:
+                    log.info("public HLS fallback failed: %s", str(exc)[:140])
+                continue
+
+            try:
+                with client.stream("GET", media_url, headers={"Referer": str(response.url)}) as media:
+                    media.raise_for_status()
+                    content_type = media.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if not (content_type.startswith("video/") or content_type.startswith("image/") or content_type.startswith("audio/")):
+                        continue
+                    length = int(media.headers.get("content-length") or 0)
+                    if length and length > MAX_SOURCE_BYTES:
+                        continue
+                    ext = mimetypes.guess_extension(content_type) or Path(urlparse(media_url).path).suffix or ".bin"
+                    if ext == ".jpe":
+                        ext = ".jpg"
+                    out = dest / f"media_{index:02d}{ext}"
+                    total = 0
+                    with out.open("wb") as fh:
+                        for chunk in media.iter_bytes(1024 * 1024):
+                            total += len(chunk)
+                            if total > MAX_SOURCE_BYTES:
+                                raise RuntimeError("media too large")
+                            fh.write(chunk)
+                    if out.exists() and out.stat().st_size:
+                        results.append(out)
+            except Exception as exc:
+                log.info("public direct media failed: %s", str(exc)[:140])
+
+    # Prefer videos/audio over thumbnails if both are exposed.
+    results.sort(key=lambda p: (classify(p) == "image", -p.stat().st_size))
+    return results[:MAX_GALLERY_ITEMS]
+
+
 def download_open_graph(url: str, tmpdir: str) -> list[Path]:
     """Public-page fallback, useful for share pages with direct OG media."""
     if not platform_of(url):
@@ -541,6 +683,16 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
         first_error = exc
     if not files and platform in {"instagram", "pinterest"} and mode in {"original", AUTO_MODE, *VIDEO_PRESETS}:
         files = download_gallery(url, tmpdir)
+    if not files:
+        for page_url in public_page_candidates(url):
+            try:
+                files = download_public_page_media(page_url, tmpdir)
+                if files:
+                    break
+            except Exception as exc:
+                log.info("public page parser failed: %s", str(exc)[:160])
+                if first_error is None:
+                    first_error = exc
     if not files:
         for page_url in public_page_candidates(url):
             try:
@@ -754,8 +906,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not url:
         await q.edit_message_text("Send the link again.")
         return
-    await edit_status(q.message, "⬇️ Converting to MP3…")
-    await run_job(q.message, context, uid, url, mode, q.message)
+    status = await q.message.reply_text("⬇️ Converting to MP3…")
+    await run_job(q.message, context, uid, url, mode, status)
 
 
 async def send_images(msg, paths: list[Path], caption: str) -> int:
@@ -919,8 +1071,10 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                         raise RuntimeError("This media exposes audio only.")
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned.")
-                done_markup = mp3_button if video_sent else None
-                await edit_status(status, f"✅ Sent · {sent} file{'s' if sent != 1 else ''}", done_markup)
+                try:
+                    await status.delete()
+                except TelegramError:
+                    await edit_status(status, "✅ Done")
             except Exception as exc:
                 log.exception("download job failed")
                 safe_message = friendly_error(platform, exc) if platform in PLATFORMS else "Download failed. Please try another link."
