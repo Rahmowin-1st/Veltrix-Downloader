@@ -33,7 +33,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "3.2.0"
+VERSION = "4.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -222,23 +222,54 @@ def request_headers(url: str | None = None) -> dict[str, str]:
 
 
 def resolve_public_redirect(url: str) -> str:
-    """Resolve public short/share URLs such as pin.it to their canonical page."""
-    try:
-        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
-        if host not in {"pin.it"}:
-            return url
-        with httpx.Client(headers=request_headers(url), follow_redirects=True, timeout=12, proxy=PROXY or None) as client:
-            response = client.get(url)
-            response.raise_for_status()
-            resolved = str(response.url)
-        return resolved if platform_of(resolved) == "pinterest" else url
-    except Exception as exc:
-        log.info("share redirect resolution failed: %s", str(exc)[:120])
+    """Resolve public short/share URLs and recover canonical social post routes."""
+    platform = platform_of(url)
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    if host != "pin.it" and platform != "snapchat":
         return url
+
+    try:
+        with httpx.Client(
+            headers=request_headers(url),
+            follow_redirects=True,
+            timeout=15,
+            proxy=PROXY or None,
+        ) as client:
+            response = client.get(url)
+
+        final_url = str(response.url)
+        if platform_of(final_url) == platform and final_url != url:
+            return final_url
+
+        # Snapchat can render/return a compatibility page whose HTML contains
+        # the modern /@creator/spotlight/<id> route even when the old route
+        # itself is not the canonical address.
+        if platform == "snapchat":
+            target = re.search(
+                r'https?://(?:www\.)?snapchat\.com/@[^/"\']+/spotlight/[A-Za-z0-9_-]+',
+                response.text or "",
+                flags=re.I,
+            )
+            if target:
+                return html.unescape(target.group(0))
+            relative = re.search(
+                r'/(?:@[^/"\']+/)?spotlight/[A-Za-z0-9_-]+',
+                response.text or "",
+                flags=re.I,
+            )
+            if relative:
+                return "https://www.snapchat.com" + html.unescape(relative.group(0))
+
+        if platform == "pinterest" and platform_of(final_url) == "pinterest":
+            return final_url
+    except Exception as exc:
+        log.info("share redirect resolution failed: %s", str(exc)[:140])
+
+    return url
 
 
 def extractor_candidates(url: str) -> list[str]:
-    """Return canonical public URL variants, keeping the actual media post first."""
+    """Return canonical public URL variants, keeping useful share context."""
     platform = platform_of(url)
     resolved = resolve_public_redirect(url)
     out = [resolved, url] if resolved != url else [url]
@@ -250,11 +281,16 @@ def extractor_candidates(url: str) -> list[str]:
                 kind = "reel" if match.group(1).lower() in {"reel", "reels"} else match.group(1).lower()
                 out.insert(0, f"https://www.instagram.com/{kind}/{match.group(2)}/")
         elif platform == "snapchat":
-            match = re.search(r"/spotlight/([A-Za-z0-9_]+)", parsed.path, re.I)
+            match = re.search(r"/(?:@[^/]+/)?spotlight/([A-Za-z0-9_-]+)", parsed.path, re.I)
             if match:
                 snap_id = match.group(1)
+                # Keep the resolved @creator route first when available. yt-dlp
+                # currently handles some modern Spotlight pages through generic
+                # HTML5 extraction even when its dedicated extractor misses them.
+                if "/@" in parsed.path and "/spotlight/" in parsed.path:
+                    out.insert(0, resolved)
                 out.extend([
-                    f"https://www.snapchat.com/spotlight/{snap_id}?locale=en-US",
+                    f"https://www.snapchat.com/spotlight/{snap_id}?locale=en_US",
                     f"https://www.snapchat.com/spotlight/{snap_id}",
                     f"https://snapchat.com/spotlight/{snap_id}",
                 ])
@@ -477,6 +513,95 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     return []
 
 
+def _pinterest_quality_score(fmt: dict[str, Any]) -> tuple[int, int, int]:
+    """Prefer progressive 720p, then 1080p, then the closest useful fallback."""
+    url = str(fmt.get("url") or "")
+    h = int(fmt.get("height") or 0)
+    progressive = 1 if ".mp4" in url.lower() else 0
+    if h == 720:
+        tier = 100
+    elif h == 1080:
+        tier = 95
+    elif 0 < h < 720:
+        tier = 80 + h // 100
+    elif h > 1080:
+        tier = 70
+    else:
+        tier = 60
+    return (progressive, tier, h)
+
+
+def download_pinterest_dedicated(url: str, tmpdir: str) -> list[Path]:
+    """Use a Pinterest-specific public-data extractor before generic fallbacks."""
+    try:
+        from pinterest_downloader import Pinterest
+    except Exception as exc:
+        log.info("Pinterest dedicated extractor unavailable: %s", exc)
+        return []
+
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+    try:
+        client = Pinterest(timeout=25, proxies=proxies)
+        result = client.get_pin(url)
+    except Exception as exc:
+        log.info("Pinterest dedicated metadata failed: %s", str(exc)[:180])
+        return []
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        log.info("Pinterest dedicated extractor returned no pin: %s", str(result.get("error") if isinstance(result, dict) else result)[:160])
+        return []
+
+    pin = result.get("pin") or {}
+    video = pin.get("video") or {}
+    formats = [f for f in (video.get("formats") or []) if isinstance(f, dict) and f.get("url")]
+    if not formats:
+        return []
+
+    formats.sort(key=_pinterest_quality_score, reverse=True)
+    dest = Path(tmpdir) / "pinterest"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    headers = {**request_headers(url), "Referer": "https://www.pinterest.com/"}
+    with httpx.Client(headers=headers, follow_redirects=True, timeout=40, proxy=PROXY or None) as http:
+        for index, fmt in enumerate(formats, 1):
+            media_url = str(fmt.get("url") or "")
+            if not safe_remote_url(media_url):
+                continue
+            if ".m3u8" in media_url.lower():
+                try:
+                    opts = base_ydl_opts(tmpdir)
+                    opts["format"] = "best"
+                    opts["http_headers"] = headers
+                    with YoutubeDL(opts) as ydl:
+                        ydl.download([media_url])
+                    found = [p for p in files_in(Path(tmpdir) / "ytdl") if classify(p) == "video"]
+                    if found:
+                        return found[:1]
+                except Exception as exc:
+                    log.info("Pinterest HLS fallback failed: %s", str(exc)[:140])
+                continue
+            try:
+                with http.stream("GET", media_url) as response:
+                    response.raise_for_status()
+                    length = int(response.headers.get("content-length") or 0)
+                    if length and length > MAX_SOURCE_BYTES:
+                        continue
+                    ext = Path(urlparse(media_url).path).suffix or ".mp4"
+                    out = dest / f"pin_video_{index}{ext}"
+                    total = 0
+                    with out.open("wb") as fh:
+                        for chunk in response.iter_bytes(1024 * 1024):
+                            total += len(chunk)
+                            if total > MAX_SOURCE_BYTES:
+                                raise RuntimeError("Pinterest media too large")
+                            fh.write(chunk)
+                if out.exists() and out.stat().st_size:
+                    return [out]
+            except Exception as exc:
+                log.info("Pinterest progressive fallback failed: %s", str(exc)[:140])
+    return []
+
+
 def download_gallery(url: str, tmpdir: str) -> list[Path]:
     if platform_of(url) not in {"instagram", "pinterest"}:
         return []
@@ -493,6 +618,9 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
     except Exception as exc:
         log.warning("gallery-dl error: %s", exc)
     items = files_in(dest)
+    def natural_key(path: Path):
+        return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", path.name)]
+    items.sort(key=natural_key)
     if is_video_post_url(url):
         videos = [p for p in items if classify(p) == "video"]
         return videos
@@ -557,7 +685,7 @@ def page_media_candidates(page: str, include_images: bool = True) -> list[str]:
         })
 
     for match in re.finditer(
-        r"<script[^>]*(?:type=[\"']application/ld\+json[\"']|id=[\"']__NEXT_DATA__[\"'])[^>]*>(.*?)</script>",
+        r"<script[^>]*(?:type=[\"']application/(?:ld\+)?json[\"']|id=[\"']__NEXT_DATA__[\"'])[^>]*>(.*?)</script>",
         page,
         flags=re.I | re.S,
     ):
@@ -638,12 +766,19 @@ def download_public_page_media(url: str, tmpdir: str) -> list[Path]:
                 with client.stream("GET", media_url, headers={"Referer": str(response.url)}) as media:
                     media.raise_for_status()
                     content_type = media.headers.get("content-type", "").split(";", 1)[0].lower()
-                    if not (content_type.startswith("video/") or content_type.startswith("image/") or content_type.startswith("audio/")):
+                    media_host = (urlparse(media_url).hostname or "").lower()
+                    known_snap_video = media_host == "sc-cdn.net" or media_host.endswith(".sc-cdn.net")
+                    if not (
+                        content_type.startswith("video/")
+                        or content_type.startswith("image/")
+                        or content_type.startswith("audio/")
+                        or known_snap_video
+                    ):
                         continue
                     length = int(media.headers.get("content-length") or 0)
                     if length and length > MAX_SOURCE_BYTES:
                         continue
-                    ext = mimetypes.guess_extension(content_type) or Path(urlparse(media_url).path).suffix or ".bin"
+                    ext = mimetypes.guess_extension(content_type) or Path(urlparse(media_url).path).suffix or (".mp4" if known_snap_video else ".bin")
                     if ext == ".jpe":
                         ext = ".jpg"
                     out = dest / f"media_{index:02d}{ext}"
@@ -744,14 +879,20 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     first_error: Exception | None = None
     files: list[Path] = []
 
-    try:
-        files = download_ytdlp(url, mode, tmpdir)
-    except Exception as exc:
-        first_error = exc
+    # Pinterest has its own public resource model with video_list/HLS fields.
+    # Use that first so a video Pin cannot degrade into its poster image.
+    if platform == "pinterest":
+        files = download_pinterest_dedicated(url, tmpdir)
 
-    # For social video links, parse the canonical public page before any image
-    # downloader. This prevents Reel/Pin thumbnails and site artwork from being
-    # mistaken for the requested video.
+    if not files:
+        try:
+            files = download_ytdlp(url, mode, tmpdir)
+        except Exception as exc:
+            first_error = exc
+
+    # Public-page structured data is the strongest non-auth fallback for
+    # Instagram/Snapchat and also catches social schema changes faster than a
+    # single generic extractor.
     if not files:
         for page_url in public_page_candidates(url):
             try:
