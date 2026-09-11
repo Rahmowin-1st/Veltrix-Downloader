@@ -687,13 +687,18 @@ def extract_instagram_public(url: str) -> dict[str, Any]:
     return payload
 
 
-def download_instagram_dedicated(url: str, tmpdir: str) -> tuple[list[Path], str]:
+def download_instagram_dedicated(
+    url: str,
+    tmpdir: str,
+    info: dict[str, Any] | None = None,
+) -> tuple[list[Path], str]:
     """Download exact Instagram entries in original carousel order."""
-    try:
-        info = extract_instagram_public(url)
-    except Exception as exc:
-        log.info("Instagram dedicated metadata failed: %s", str(exc)[:180])
-        return [], ""
+    if not isinstance(info, dict) or not info.get("entries"):
+        try:
+            info = extract_instagram_public(url)
+        except Exception as exc:
+            log.info("Instagram dedicated metadata failed: %s", str(exc)[:180])
+            return [], ""
 
     entries = info.get("entries") if isinstance(info.get("entries"), list) else []
     if not entries:
@@ -745,6 +750,7 @@ def preview_media(url: str) -> dict[str, Any]:
                 "duration": insta.get("duration") or 0,
                 "format_count": sum(len(e.get("formats") or []) for e in entries if isinstance(e, dict)),
                 "thumbnail": str(insta.get("thumbnail") or ""),
+                "_instagram_info": insta,
             }
         except Exception as exc:
             log.info("Instagram preview unavailable: %s", str(exc)[:160])
@@ -758,6 +764,7 @@ def preview_media(url: str) -> dict[str, Any]:
                     "duration": 0,
                     "format_count": 1,
                     "thumbnail": str(snap.get("thumbnail") or ""),
+                    "_snap_info": snap,
                 }
         except Exception as exc:
             log.info("Snapchat preview unavailable: %s", str(exc)[:160])
@@ -901,11 +908,16 @@ def extract_snapchat_public(url: str) -> dict[str, str]:
     return {}
 
 
-def download_snapchat_dedicated(url: str, tmpdir: str) -> list[Path]:
-    try:
-        info = extract_snapchat_public(url)
-    except Exception:
-        return []
+def download_snapchat_dedicated(
+    url: str,
+    tmpdir: str,
+    info: dict[str, Any] | None = None,
+) -> list[Path]:
+    if not isinstance(info, dict) or not info.get("url"):
+        try:
+            info = extract_snapchat_public(url)
+        except Exception:
+            return []
     media_url = str(info.get("url") or "")
     if not media_url or not safe_remote_url(media_url):
         return []
@@ -1564,7 +1576,12 @@ def sanitize_media_files(paths: list[Path]) -> list[Path]:
     return clean
 
 
-def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
+def grab(
+    url: str,
+    mode: str,
+    tmpdir: str,
+    prefetched: dict[str, Any] | None = None,
+) -> list[Path]:
     platform = platform_of(url)
     if not platform:
         raise RuntimeError("Only YouTube, Instagram, Snapchat and Pinterest links are supported.")
@@ -1582,7 +1599,8 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
 
     # Platform-specialized engines go first. Generic extractors are fallbacks.
     if platform == "snapchat":
-        files = download_snapchat_dedicated(url, tmpdir)
+        snap_info = prefetched.get("_snap_info") if isinstance(prefetched, dict) else None
+        files = download_snapchat_dedicated(url, tmpdir, snap_info)
         expected_type = "video"
 
     elif platform == "pinterest":
@@ -1596,7 +1614,8 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
                 files = gallery_items
 
     elif platform == "instagram":
-        files, expected_type = download_instagram_dedicated(url, tmpdir)
+        insta_info = prefetched.get("_instagram_info") if isinstance(prefetched, dict) else None
+        files, expected_type = download_instagram_dedicated(url, tmpdir, insta_info)
 
     if not files:
         try:
@@ -2249,7 +2268,7 @@ async def run_job(
                         meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=15)
                     except Exception:
                         meta = {}
-                files = await asyncio.to_thread(grab, url, mode, str(tmp))
+                files = await asyncio.to_thread(grab, url, mode, str(tmp), meta)
                 kinds = [classify(p) for p in files]
                 sent = 0
                 caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
