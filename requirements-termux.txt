@@ -4,3 +4,4 @@ python-dotenv==1.0.1
 gallery-dl>=1.30.0
 httpx>=0.28.1
 pinterest-downloader==4.2.0
+parth-dl==1.2.1
