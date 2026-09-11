@@ -2110,6 +2110,7 @@ def start_health_server() -> None:
                 "version": VERSION,
                 "platforms": list(PLATFORMS),
                 "ffmpeg": bool(shutil.which("ffmpeg")),
+                "ffprobe": bool(shutil.which("ffprobe")),
                 "deno": bool(DENO_BIN),
                 "temp_free_mb": free_mb,
                 "cache_mb": (
