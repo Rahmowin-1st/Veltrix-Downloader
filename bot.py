@@ -457,6 +457,19 @@ def probe_media(url: str) -> dict[str, Any]:
 
 def preview_media(url: str) -> dict[str, Any]:
     """Best-effort preview metadata. Never blocks the actual download path."""
+    if platform_of(url) == "snapchat":
+        try:
+            snap = extract_snapchat_public(url)
+            if snap.get("url"):
+                return {
+                    "title": str(snap.get("title") or "Spotlight")[:180],
+                    "duration": 0,
+                    "format_count": 1,
+                    "thumbnail": str(snap.get("thumbnail") or ""),
+                }
+        except Exception as exc:
+            log.info("Snapchat preview unavailable: %s", str(exc)[:160])
+
     try:
         return probe_media(url)
     except Exception as first:
@@ -1606,12 +1619,13 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
         except asyncio.CancelledError:
             return
 
-    typing_task = asyncio.create_task(typing())
     tmp = Path(tempfile.mkdtemp(prefix="vx_"))
     platform = platform_of(url) or "web"
+    typing_task: asyncio.Task | None = None
 
     async with lock:
         await edit_status(status, f"⬇️ Downloading from {PLATFORMS.get(platform, {}).get('label', 'Media')}…")
+        typing_task = asyncio.create_task(typing())
         async with global_sem():
             try:
                 files = await asyncio.to_thread(grab, url, mode, str(tmp))
@@ -1675,7 +1689,8 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                 )
                 await edit_status(status, f"❌ {safe_message}")
             finally:
-                typing_task.cancel()
+                if typing_task is not None:
+                    typing_task.cancel()
                 shutil.rmtree(tmp, ignore_errors=True)
 
 
