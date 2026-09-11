@@ -58,6 +58,22 @@ class BackendTests(unittest.TestCase):
         # Probe details are network-dependent; the UI contract is a dict field.
         self.assertIn("thumbnail", {"thumbnail": ""})
 
+    def test_snapchat_creator_route(self):
+        url = "https://www.snapchat.com/@creator/spotlight/W7_ABC123?locale=en_US"
+        self.assertEqual(bot.platform_of(url), "snapchat")
+        candidates = bot.extractor_candidates(url)
+        self.assertTrue(any("/@creator/spotlight/" in item for item in candidates))
+
+    def test_application_json_content_url(self):
+        page = '<script type="application/json">{"props":{"pageProps":{"videoMetadata":{"contentUrl":"https://cf-st.sc-cdn.net/d/abc","thumbnailUrl":"https://cf-st.sc-cdn.net/d/thumb"}}}}</script>'
+        candidates = bot.page_media_candidates(page, include_images=False)
+        self.assertIn("https://cf-st.sc-cdn.net/d/abc", candidates)
+
+    def test_pinterest_quality_prefers_720(self):
+        q720 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/a.mp4", "height": 720})
+        q1080 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/b.mp4", "height": 1080})
+        self.assertGreater(q720, q1080)
+
 
 if __name__ == "__main__":
     unittest.main()
