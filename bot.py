@@ -913,26 +913,9 @@ def download_snapchat_dedicated(url: str, tmpdir: str) -> list[Path]:
     dest = Path(tmpdir) / "snapchat"
     dest.mkdir(parents=True, exist_ok=True)
     out = dest / "spotlight.mp4"
-    headers = {
-        "User-Agent": DESKTOP_UA,
-        "Referer": "https://www.snapchat.com/",
-        "Accept": "*/*",
-    }
-    try:
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=45, proxy=PROXY or None) as client:
-            with client.stream("GET", media_url) as response:
-                response.raise_for_status()
-                total = 0
-                with out.open("wb") as fh:
-                    for chunk in response.iter_bytes(1024 * 1024):
-                        total += len(chunk)
-                        if total > MAX_SOURCE_BYTES:
-                            raise RuntimeError("Snapchat media too large")
-                        fh.write(chunk)
-        return [out] if out.exists() and out.stat().st_size else []
-    except Exception as exc:
-        log.info("Snapchat media download failed: %s", str(exc)[:180])
-        return []
+    if _download_direct_file(media_url, out, referer="https://www.snapchat.com/", timeout=45):
+        return [out]
+    return []
 
 
 def files_in(root: Path) -> list[Path]:
@@ -1077,50 +1060,74 @@ def _download_direct_file(
     referer: str,
     timeout: int = 45,
 ) -> bool:
+    """Download a public media URL with redirect revalidation and bounded retries."""
     if not safe_remote_url(media_url):
         return False
+
     headers = {"User-Agent": DESKTOP_UA, "Referer": referer, "Accept": "*/*"}
     last_error: Exception | None = None
+
     for attempt in range(1, 4):
         try:
-            if out.exists():
-                out.unlink(missing_ok=True)
-            with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout, proxy=PROXY or None) as client:
-                with client.stream("GET", media_url) as response:
-                    response.raise_for_status()
-                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                    if (
-                        content_type.startswith("text/")
-                        or content_type in {"application/json", "application/xml", "text/html"}
-                    ):
-                        raise RuntimeError(f"non-media response: {content_type or 'unknown'}")
-                    length = int(response.headers.get("content-length") or 0)
-                    if length and length > MAX_SOURCE_BYTES:
-                        return False
-                    total = 0
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    part = out.with_suffix(out.suffix + ".part")
-                    part.unlink(missing_ok=True)
-                    with part.open("wb") as fh:
-                        for chunk in response.iter_bytes(1024 * 1024):
-                            total += len(chunk)
-                            if total > MAX_SOURCE_BYTES:
-                                raise RuntimeError("media too large")
-                            fh.write(chunk)
-                    if total <= 0:
+            out.unlink(missing_ok=True)
+            current = media_url
+
+            with httpx.Client(headers=headers, follow_redirects=False, timeout=timeout, proxy=PROXY or None) as client:
+                for _redirect in range(6):
+                    if not safe_remote_url(current):
+                        raise RuntimeError("unsafe media redirect")
+
+                    with client.stream("GET", current) as response:
+                        if response.status_code in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("location") or ""
+                            if not location:
+                                raise RuntimeError("media redirect missing location")
+                            current = urljoin(current, location)
+                            continue
+
+                        response.raise_for_status()
+                        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                        if (
+                            content_type.startswith("text/")
+                            or "json" in content_type
+                            or "html" in content_type
+                            or "xml" in content_type
+                        ):
+                            raise RuntimeError(f"non-media response: {content_type or 'unknown'}")
+
+                        length = int(response.headers.get("content-length") or 0)
+                        if length and length > MAX_SOURCE_BYTES:
+                            return False
+
+                        total = 0
+                        first = True
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        with out.open("wb") as fh:
+                            for chunk in response.iter_bytes(1024 * 1024):
+                                if not chunk:
+                                    continue
+                                if first:
+                                    probe = chunk[:512].lstrip().lower()
+                                    if probe.startswith((b"<!doctype html", b"<html", b'{"error"', b'{"errors"')):
+                                        raise RuntimeError("error page returned as media")
+                                    first = False
+                                total += len(chunk)
+                                if total > MAX_SOURCE_BYTES:
+                                    raise RuntimeError("media too large")
+                                fh.write(chunk)
+
+                        if out.exists() and out.stat().st_size > 0:
+                            return True
                         raise RuntimeError("empty media response")
-                    part.replace(out)
-            if out.exists() and out.stat().st_size > 0:
-                return True
+                else:
+                    raise RuntimeError("too many media redirects")
+
         except Exception as exc:
             last_error = exc
-            try:
-                out.unlink(missing_ok=True)
-                out.with_suffix(out.suffix + ".part").unlink(missing_ok=True)
-            except OSError:
-                pass
+            out.unlink(missing_ok=True)
             if attempt < 3:
                 time.sleep(0.7 * (2 ** (attempt - 1)))
+
     if last_error:
         log.info("direct media download failed after retries: %s", str(last_error)[:160])
     return False
