@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import bot
@@ -36,7 +37,14 @@ class BackendTests(unittest.TestCase):
     def test_safe_remote_url(self):
         self.assertFalse(bot.safe_remote_url("http://127.0.0.1/x"))
         self.assertFalse(bot.safe_remote_url("http://localhost/x"))
-        self.assertTrue(bot.safe_remote_url("https://example.com/media.mp4"))
+        with patch("bot.socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]):
+            self.assertTrue(bot.safe_remote_url("https://example.com/media.mp4"))
+        with patch("bot.socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("10.0.0.7", 443)),
+        ]):
+            self.assertFalse(bot.safe_remote_url("https://example.com/media.mp4"))
 
     def test_clean_instagram_candidate(self):
         urls = bot.extractor_candidates("https://www.instagram.com/reel/ABC123/?igsh=tracking")
