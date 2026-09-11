@@ -17,6 +17,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -35,7 +36,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "5.0.0"
+VERSION = "6.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -55,6 +56,14 @@ _user_lock = Lock()
 _action_lock = Lock()
 _job_locks: dict[int, asyncio.Lock] = {}
 _global_sem: asyncio.Semaphore | None = None
+_metrics_lock = Lock()
+_metrics = {
+    "jobs_started": 0,
+    "jobs_succeeded": 0,
+    "jobs_failed": 0,
+    "active_jobs": 0,
+    "queued_jobs": 0,
+}
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 YT_ID_RE = re.compile(r"(?:v=|/shorts/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})")
@@ -129,6 +138,34 @@ def job_lock(uid: int) -> asyncio.Lock:
     if uid not in _job_locks:
         _job_locks[uid] = asyncio.Lock()
     return _job_locks[uid]
+
+
+def metric_add(key: str, amount: int) -> None:
+    with _metrics_lock:
+        _metrics[key] = max(0, int(_metrics.get(key, 0)) + amount)
+
+
+def metric_snapshot() -> dict[str, int]:
+    with _metrics_lock:
+        return {k: int(v) for k, v in _metrics.items()}
+
+
+def cleanup_stale_temp(max_age_seconds: int = 6 * 3600) -> None:
+    """Remove abandoned temp directories left by killed Android/Termux processes."""
+    roots = [Path(tempfile.gettempdir())]
+    now = time.time()
+    for root in roots:
+        try:
+            for path in root.iterdir():
+                if not path.is_dir() or not path.name.startswith(("vx_", "vx_probe_")):
+                    continue
+                try:
+                    if now - path.stat().st_mtime >= max_age_seconds:
+                        shutil.rmtree(path, ignore_errors=True)
+                except OSError:
+                    continue
+        except OSError:
+            continue
 
 
 def load_users() -> dict:
@@ -380,17 +417,29 @@ def public_page_candidates(url: str) -> list[str]:
 
 
 def safe_remote_url(url: str) -> bool:
+    """Reject local/private destinations, including DNS-resolved private hosts."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return False
-        host = parsed.hostname.lower()
+        host = parsed.hostname.lower().rstrip(".")
         if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
             return False
         try:
             return ipaddress.ip_address(host).is_global
         except ValueError:
-            return True
+            pass
+
+        # Prevent SSRF through a hostname that resolves to loopback/private/link-local.
+        try:
+            infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+            addresses = {info[4][0] for info in infos if info and info[4]}
+            if not addresses:
+                return False
+            return all(ipaddress.ip_address(addr).is_global for addr in addresses)
+        except (socket.gaierror, ValueError, OSError):
+            # Media CDNs can be temporarily unresolvable. Do not fetch an unknown host.
+            return False
     except ValueError:
         return False
 
@@ -701,22 +750,28 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
 
     last: Exception | None = None
     seen: set[tuple[str, str]] = set()
+    attempt_no = 0
     for candidate in extractor_candidates(url):
         for fmt, extra in attempts:
             sig = (candidate, fmt)
             if sig in seen:
                 continue
             seen.add(sig)
+            attempt_no += 1
+            attempt_dir = Path(tmpdir) / "ytdl_attempts" / f"{attempt_no:02d}"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
             try:
                 opts = dict(base)
                 opts["format"] = fmt
                 opts["http_headers"] = request_headers(candidate)
+                opts["outtmpl"] = str(attempt_dir / "%(extractor)s_%(id)s_%(title).80B.%(ext)s")
                 opts.update(extra)
                 with YoutubeDL(opts) as ydl:
                     ydl.download([candidate])
-                files = files_in(Path(tmpdir) / "ytdl")
-                if files:
-                    return files
+                files = files_in(attempt_dir)
+                complete = [p for p in files if p.suffix.lower() not in {".part", ".ytdl"}]
+                if complete:
+                    return complete
             except Exception as exc:
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), str(exc)[:220])
@@ -753,25 +808,34 @@ def _download_direct_file(
     if not safe_remote_url(media_url):
         return False
     headers = {"User-Agent": DESKTOP_UA, "Referer": referer, "Accept": "*/*"}
-    try:
-        with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout, proxy=PROXY or None) as client:
-            with client.stream("GET", media_url) as response:
-                response.raise_for_status()
-                length = int(response.headers.get("content-length") or 0)
-                if length and length > MAX_SOURCE_BYTES:
-                    return False
-                total = 0
-                out.parent.mkdir(parents=True, exist_ok=True)
-                with out.open("wb") as fh:
-                    for chunk in response.iter_bytes(1024 * 1024):
-                        total += len(chunk)
-                        if total > MAX_SOURCE_BYTES:
-                            raise RuntimeError("media too large")
-                        fh.write(chunk)
-        return out.exists() and out.stat().st_size > 0
-    except Exception as exc:
-        log.info("direct media download failed: %s", str(exc)[:160])
-        return False
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            if out.exists():
+                out.unlink(missing_ok=True)
+            with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout, proxy=PROXY or None) as client:
+                with client.stream("GET", media_url) as response:
+                    response.raise_for_status()
+                    length = int(response.headers.get("content-length") or 0)
+                    if length and length > MAX_SOURCE_BYTES:
+                        return False
+                    total = 0
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with out.open("wb") as fh:
+                        for chunk in response.iter_bytes(1024 * 1024):
+                            total += len(chunk)
+                            if total > MAX_SOURCE_BYTES:
+                                raise RuntimeError("media too large")
+                            fh.write(chunk)
+            if out.exists() and out.stat().st_size > 0:
+                return True
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(0.7 * (2 ** (attempt - 1)))
+    if last_error:
+        log.info("direct media download failed after retries: %s", str(last_error)[:160])
+    return False
 
 
 def download_pinterest_dedicated(url: str, tmpdir: str) -> tuple[list[Path], str]:
@@ -1577,7 +1641,13 @@ async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, 
         return 1
 
 
-async def send_audio(msg, path: Path, caption: str, mode: str, tmp: Path) -> int:
+def safe_media_title(value: str) -> str:
+    value = re.sub(r"[\r\n\t]+", " ", value or "").strip()
+    value = re.sub(r"\s+", " ", value)
+    return value[:120] or "Veltrix Audio"
+
+
+async def send_audio(msg, path: Path, caption: str, mode: str, tmp: Path, title: str = "") -> int:
     preset = AUDIO_PRESETS.get(mode) or AUDIO_PRESETS["mp3_192"]
     final = path
     wanted_ext = ".m4a" if preset["codec"] == "m4a" else ".mp3"
@@ -1592,7 +1662,13 @@ async def send_audio(msg, path: Path, caption: str, mode: str, tmp: Path) -> int
     if final.stat().st_size > MAX_BYTES:
         raise RuntimeError("Audio could not be fitted for Telegram.")
     with final.open("rb") as fh:
-        await msg.reply_audio(audio=fh, caption=caption or None, filename=final.name)
+        await msg.reply_audio(
+            audio=fh,
+            caption=caption or None,
+            filename=final.name,
+            title=safe_media_title(title) if title else None,
+            performer="Veltrix Downloader",
+        )
     return 1
 
 
@@ -1606,9 +1682,11 @@ async def send_document(msg, path: Path, caption: str) -> int:
 
 async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> None:
     lock = job_lock(uid)
+    metric_add("jobs_started", 1)
     if status is None:
         status = await msg.reply_text("⬇️ Downloading…")
     elif lock.locked():
+        metric_add("queued_jobs", 1)
         await edit_status(status, "⏳ Queued…")
 
     async def typing() -> None:
@@ -1624,10 +1702,19 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
     typing_task: asyncio.Task | None = None
 
     async with lock:
+        if metric_snapshot().get("queued_jobs", 0) > 0:
+            metric_add("queued_jobs", -1)
+        metric_add("active_jobs", 1)
         await edit_status(status, f"⬇️ Downloading from {PLATFORMS.get(platform, {}).get('label', 'Media')}…")
         typing_task = asyncio.create_task(typing())
         async with global_sem():
             try:
+                meta = {}
+                if mode in AUDIO_PRESETS:
+                    try:
+                        meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=15)
+                    except Exception:
+                        meta = {}
                 files = await asyncio.to_thread(grab, url, mode, str(tmp))
                 kinds = [classify(p) for p in files]
                 sent = 0
@@ -1644,6 +1731,7 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                             caption if index == 0 else "",
                             mode,
                             tmp,
+                            str(meta.get("title") or ""),
                         )
                 else:
                     requested = 2160 if mode == "original" else (720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"]))
@@ -1675,12 +1763,14 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned.")
 
+                metric_add("jobs_succeeded", 1)
                 try:
                     await status.delete()
                 except TelegramError:
                     await edit_status(status, "✅ Done")
 
             except Exception as exc:
+                metric_add("jobs_failed", 1)
                 log.exception("download job failed")
                 safe_message = (
                     friendly_error(platform, exc)
@@ -1689,6 +1779,7 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                 )
                 await edit_status(status, f"❌ {safe_message}")
             finally:
+                metric_add("active_jobs", -1)
                 if typing_task is not None:
                     typing_task.cancel()
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -1698,7 +1789,21 @@ def start_health_server() -> None:
     port = int(os.getenv("PORT", "10000"))
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = json.dumps({"ok": True, "service": "veltrix-downloader", "version": VERSION, "platforms": list(PLATFORMS), "ffmpeg": bool(shutil.which("ffmpeg")), "deno": bool(DENO_BIN)}).encode()
+            try:
+                disk = shutil.disk_usage(tempfile.gettempdir())
+                free_mb = disk.free // (1024 * 1024)
+            except Exception:
+                free_mb = -1
+            body = json.dumps({
+                "ok": True,
+                "service": "veltrix-downloader",
+                "version": VERSION,
+                "platforms": list(PLATFORMS),
+                "ffmpeg": bool(shutil.which("ffmpeg")),
+                "deno": bool(DENO_BIN),
+                "temp_free_mb": free_mb,
+                "metrics": metric_snapshot(),
+            }).encode()
             self.send_response(200 if self.path in {"/", "/health", "/healthz", "/readyz"} else 404)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1713,6 +1818,7 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cleanup_stale_temp()
     start_health_server()
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1721,7 +1827,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Veltrix Downloader %s started", VERSION)
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
