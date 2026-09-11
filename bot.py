@@ -280,6 +280,9 @@ def create_action(
                 dest = CACHE_DIR / f"{token}{suffix}"
                 shutil.copy2(source_path, dest)
                 cache_path = str(dest)
+                cleanup_media_cache()
+                if not dest.exists():
+                    cache_path = ""
         except OSError as exc:
             log.info("media cache skipped: %s", str(exc)[:140])
 
@@ -1837,9 +1840,11 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str,
         try:
             if not source.exists():
                 raise RuntimeError("Cached media expired.")
+            local_source = tmp / ("source" + (source.suffix.lower() or ".bin"))
+            await asyncio.to_thread(shutil.copy2, source, local_source)
             sent = await send_audio(
                 msg,
-                source,
+                local_source,
                 "⚡ Veltrix Downloader · MP3",
                 "mp3_192",
                 tmp,
@@ -1999,6 +2004,10 @@ def start_health_server() -> None:
                 "ffmpeg": bool(shutil.which("ffmpeg")),
                 "deno": bool(DENO_BIN),
                 "temp_free_mb": free_mb,
+                "cache_mb": (
+                    sum(p.stat().st_size for p in CACHE_DIR.glob("*") if p.is_file()) // (1024 * 1024)
+                    if CACHE_DIR.exists() else 0
+                ),
                 "metrics": metric_snapshot(),
             }).encode()
             self.send_response(200 if self.path in {"/", "/health", "/healthz", "/readyz"} else 404)
