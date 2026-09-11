@@ -1418,10 +1418,15 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
 
     elif platform == "pinterest":
         files, expected_type = download_pinterest_dedicated(url, tmpdir)
-        if expected_type in {"image", "gif"}:
-            gallery_items = sanitize_media_files(download_gallery(resolve_public_redirect(url), tmpdir))
-            if len(gallery_items) > 1:
-                files = gallery_items
+        gallery_items = sanitize_media_files(download_gallery(resolve_public_redirect(url), tmpdir))
+        if expected_type == "video":
+            # Idea Pins can contain several pages. Merge the Pinterest-specific
+            # result with gallery-dl's page traversal, then keep videos only.
+            gallery_videos = [p for p in gallery_items if classify(p) == "video"]
+            if gallery_videos:
+                files = sanitize_media_files(files + gallery_videos)
+        elif expected_type in {"image", "gif"} and len(gallery_items) > 1:
+            files = gallery_items
 
     elif platform == "instagram" and not is_video_post_url(url):
         # gallery-dl handles Instagram multi-item posts/carousels better than
