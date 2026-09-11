@@ -112,16 +112,27 @@ class BackendTests(unittest.TestCase):
 
     def test_inline_action_is_bound_to_exact_request(self):
         with tempfile.TemporaryDirectory() as td:
-            old_dir, old_file = bot.DATA_DIR, bot.ACTIONS_FILE
+            old_dir, old_file, old_cache = bot.DATA_DIR, bot.ACTIONS_FILE, bot.CACHE_DIR
             try:
                 bot.DATA_DIR = Path(td)
                 bot.ACTIONS_FILE = Path(td) / "actions.json"
-                token = bot.create_action(7, "https://youtu.be/dQw4w9WgXcQ")
+                bot.CACHE_DIR = Path(td) / "cache"
+                source = Path(td) / "source.mp4"
+                source.write_bytes(b"video")
+                token = bot.create_action(
+                    7,
+                    "https://youtu.be/dQw4w9WgXcQ",
+                    source_path=source,
+                    item_index=2,
+                )
                 self.assertLessEqual(len("mp3|" + token), 64)
-                self.assertEqual(bot.resolve_action(7, token), "https://youtu.be/dQw4w9WgXcQ")
+                row = bot.resolve_action_data(7, token)
+                self.assertEqual(row["url"], "https://youtu.be/dQw4w9WgXcQ")
+                self.assertEqual(row["item_index"], 2)
+                self.assertTrue(Path(row["cache_path"]).exists())
                 self.assertEqual(bot.resolve_action(8, token), "")
             finally:
-                bot.DATA_DIR, bot.ACTIONS_FILE = old_dir, old_file
+                bot.DATA_DIR, bot.ACTIONS_FILE, bot.CACHE_DIR = old_dir, old_file, old_cache
 
     def test_pinterest_720_hls_beats_low_mp4(self):
         hls720 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/master.m3u8", "height": 720})
