@@ -145,6 +145,22 @@ class BackendTests(unittest.TestCase):
     def test_retry_delay_is_bounded(self):
         self.assertLessEqual(bot.telegram_retry_delay(TimeoutError(), 10), 8.0)
 
+    def test_dedupe_and_error_payload_filter(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a = root / "a.mp4"
+            b = root / "b.mp4"
+            bad = root / "bad.mp4"
+            a.write_bytes(b"real-media")
+            b.write_bytes(b"real-media")
+            bad.write_bytes(b"<!DOCTYPE html><html>blocked</html>")
+            result = bot.dedupe_media([a, b, bad])
+            self.assertEqual(result, [a])
+
+    def test_cache_defaults_are_bounded(self):
+        self.assertLessEqual(bot.CACHE_MAX_BYTES, bot.CACHE_TOTAL_MAX_BYTES)
+        self.assertGreater(bot.CACHE_TTL_SECONDS, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
