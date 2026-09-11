@@ -283,7 +283,10 @@ def create_action(
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 suffix = source_path.suffix.lower() or ".bin"
                 dest = CACHE_DIR / f"{token}{suffix}"
-                shutil.copy2(source_path, dest)
+                try:
+                    os.link(source_path, dest)
+                except OSError:
+                    shutil.copy2(source_path, dest)
                 cache_path = str(dest)
                 cleanup_media_cache()
                 if not dest.exists():
@@ -2072,13 +2075,16 @@ async def run_job(
                 caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
 
                 if mode in AUDIO_PRESETS:
-                    sources = [p for p, kind in zip(files, kinds) if kind in {"audio", "video", "animation"}]
+                    if selected_audio_index is not None:
+                        if selected_audio_index < 0 or selected_audio_index >= len(files):
+                            raise RuntimeError("Requested media item is no longer available.")
+                        if kinds[selected_audio_index] not in {"audio", "video", "animation"}:
+                            raise RuntimeError("Requested media item has no audio track.")
+                        sources = [files[selected_audio_index]]
+                    else:
+                        sources = [p for p, kind in zip(files, kinds) if kind in {"audio", "video", "animation"}]
                     if not sources:
                         raise RuntimeError("No audio/video stream was found in this post.")
-                    if selected_audio_index is not None:
-                        if selected_audio_index < 0 or selected_audio_index >= len(sources):
-                            raise RuntimeError("Requested media item is no longer available.")
-                        sources = [sources[selected_audio_index]]
                     for index, source in enumerate(sources):
                         sent += await send_audio(
                             msg,
@@ -2090,7 +2096,6 @@ async def run_job(
                         )
                 else:
                     requested = 2160 if mode == "original" else (720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"]))
-                    video_rank = 0
                     for index, (path, kind) in enumerate(zip(files, kinds)):
                         item_caption = caption if sent == 0 else ""
                         if kind == "image":
@@ -2103,9 +2108,8 @@ async def run_job(
                                 url,
                                 source_path=path,
                                 title=str(meta.get("title") or ""),
-                                item_index=video_rank,
+                                item_index=index,
                             )
-                            video_rank += 1
                             sent += await send_video(
                                 msg,
                                 path,
