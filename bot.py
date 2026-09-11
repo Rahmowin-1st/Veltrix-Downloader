@@ -709,7 +709,11 @@ async def make_downloading_status(msg, url: str, platform: str, meta: dict[str, 
 
 async def edit_status(status, text: str, reply_markup=None) -> None:
     try:
-        if getattr(status, "photo", None):
+        captionable = any(
+            getattr(status, field, None)
+            for field in ("photo", "video", "audio", "document", "animation")
+        )
+        if captionable:
             await status.edit_caption(caption=text, reply_markup=reply_markup)
         else:
             await status.edit_text(text, reply_markup=reply_markup)
@@ -795,9 +799,34 @@ async def send_album(msg, paths: list[Path], caption: str) -> int:
 
 
 async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, reply_markup=None) -> int:
-    final = path
-    if final.stat().st_size > MAX_BYTES:
-        final = await asyncio.to_thread(fit_video, final, tmp / "fit", max_height)
+    # Preserve source resolution whenever possible. Telegram hosted Bot API has
+    # a per-file cap, so large videos are split before we consider re-encoding.
+    if path.stat().st_size <= MAX_BYTES:
+        with path.open("rb") as fh:
+            try:
+                await msg.reply_video(video=fh, caption=caption, filename=path.name, supports_streaming=True, reply_markup=reply_markup)
+            except TelegramError:
+                fh.seek(0)
+                await msg.reply_document(document=fh, caption=caption, filename=path.name, reply_markup=reply_markup)
+        return 1
+
+    duration = await asyncio.to_thread(media_duration, path)
+    if duration >= 8 * 60:
+        parts = await asyncio.to_thread(split_video, path, tmp / "parts_original")
+        if parts and all(p.stat().st_size <= MAX_BYTES for p in parts):
+            for index, part in enumerate(parts, 1):
+                with part.open("rb") as fh:
+                    markup = reply_markup if index == len(parts) else None
+                    await msg.reply_video(
+                        video=fh,
+                        caption=f"{caption}\nPart {index}/{len(parts)}",
+                        filename=part.name,
+                        supports_streaming=True,
+                        reply_markup=markup,
+                    )
+            return len(parts)
+
+    final = await asyncio.to_thread(fit_video, path, tmp / "fit", max_height)
     if final.stat().st_size <= MAX_BYTES:
         with final.open("rb") as fh:
             try:
@@ -806,12 +835,20 @@ async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, 
                 fh.seek(0)
                 await msg.reply_document(document=fh, caption=caption, filename=final.name, reply_markup=reply_markup)
         return 1
+
     parts = await asyncio.to_thread(split_video, final, tmp / "parts")
     if not parts or any(p.stat().st_size > MAX_BYTES for p in parts):
         raise RuntimeError("Could not fit this video under Telegram's hosted bot upload limit.")
     for index, part in enumerate(parts, 1):
         with part.open("rb") as fh:
-            await msg.reply_video(video=fh, caption=f"{caption}\nPart {index}/{len(parts)}", filename=part.name, supports_streaming=True)
+            markup = reply_markup if index == len(parts) else None
+            await msg.reply_video(
+                video=fh,
+                caption=f"{caption}\nPart {index}/{len(parts)}",
+                filename=part.name,
+                supports_streaming=True,
+                reply_markup=markup,
+            )
     return len(parts)
 
 
