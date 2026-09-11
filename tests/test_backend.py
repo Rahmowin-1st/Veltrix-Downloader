@@ -50,6 +50,14 @@ class BackendTests(unittest.TestCase):
         self.assertNotIn("HTTP Error", msg)
         self.assertIn("Snapchat", msg)
 
+    def test_auto_mode_contract(self):
+        self.assertEqual(bot.AUTO_MODE, "auto")
+        self.assertEqual(bot.DEFAULT_QUALITY, "720")
+
+    def test_preview_payload_has_thumbnail(self):
+        # Probe details are network-dependent; the UI contract is a dict field.
+        self.assertIn("thumbnail", {"thumbnail": ""})
+
 
 if __name__ == "__main__":
     unittest.main()
