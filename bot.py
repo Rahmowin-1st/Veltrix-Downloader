@@ -36,7 +36,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "6.0.0"
+VERSION = "7.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -816,10 +816,10 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     base = base_ydl_opts(tmpdir)
     attempts: list[tuple[str, dict[str, Any]]] = []
     if mode == AUTO_MODE:
-        # Preference: 720p -> 1080p -> best <=720 -> 480p -> 360p -> any best.
-        # Social platforms often expose only one combined stream, so each rung
-        # includes both split A/V and combined-file fallbacks.
-        auto_chain = [
+        # One selector expression gives yt-dlp the complete preference ladder in
+        # a single extraction pass. This is faster and materially reduces
+        # platform rate-limit pressure versus retrying 10+ selectors separately.
+        preferred = "/".join([
             "bv*[height=720]+ba/b[height=720]",
             "bv*[height=1080]+ba/b[height=1080]",
             "bv*[height<=720]+ba/b[height<=720]",
@@ -831,8 +831,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
             "18",
             "best",
             "b",
-        ]
-        attempts = [(fmt, {}) for fmt in auto_chain]
+        ])
+        attempts = [(preferred, {}), ("best", {})]
     elif mode == "original":
         attempts = [("best", {}), ("bv*+ba/b", {})]
     elif mode in VIDEO_PRESETS:
@@ -1297,6 +1297,55 @@ def friendly_error(platform: str, exc: Exception) -> str:
     return f"{label}: couldn't download this media right now."
 
 
+def _looks_like_html(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(512).lstrip().lower()
+        return (
+            head.startswith(b"<!doctype html")
+            or head.startswith(b"<html")
+            or b"<head" in head[:256]
+            or b"<body" in head[:256]
+        )
+    except OSError:
+        return True
+
+
+def _quick_fingerprint(path: Path) -> tuple[int, str]:
+    """Cheap duplicate detection that preserves carousel order."""
+    size = path.stat().st_size
+    h = hashlib.blake2b(digest_size=16)
+    with path.open("rb") as fh:
+        h.update(fh.read(256 * 1024))
+        if size > 512 * 1024:
+            fh.seek(max(0, size - 256 * 1024))
+            h.update(fh.read(256 * 1024))
+    h.update(str(size).encode())
+    return size, h.hexdigest()
+
+
+def sanitize_media_files(paths: list[Path]) -> list[Path]:
+    """Drop empty/HTML/duplicate artifacts without reordering valid media."""
+    clean: list[Path] = []
+    seen: set[tuple[int, str]] = set()
+    for path in paths:
+        try:
+            if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+                continue
+            if _looks_like_html(path):
+                log.warning("discarding HTML masquerading as media: %s", path.name)
+                continue
+            key = _quick_fingerprint(path)
+            if key in seen:
+                log.info("discarding duplicate media artifact: %s", path.name)
+                continue
+            seen.add(key)
+            clean.append(path)
+        except OSError:
+            continue
+    return clean
+
+
 def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     platform = platform_of(url)
     if not platform:
@@ -1355,6 +1404,8 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+
+    files = sanitize_media_files(files)
 
     # Never degrade a known video post into its poster/thumbnail.
     force_video = is_video_post_url(url) or expected_type == "video"
@@ -1888,8 +1939,11 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str,
         await edit_status(status, "⏳ Queued…")
 
     tmp = Path(tempfile.mkdtemp(prefix="vx_cache_"))
+    was_queued = lock.locked()
+    if was_queued:
+        metric_add("queued_jobs", 1)
     async with lock:
-        if metric_snapshot().get("queued_jobs", 0) > 0:
+        if was_queued:
             metric_add("queued_jobs", -1)
         metric_add("active_jobs", 1)
         try:
@@ -1932,9 +1986,10 @@ async def run_job(
 ) -> None:
     lock = job_lock(uid)
     metric_add("jobs_started", 1)
+    was_queued = lock.locked()
     if status is None:
         status = await msg.reply_text("⬇️ Downloading…")
-    elif lock.locked():
+    elif was_queued:
         metric_add("queued_jobs", 1)
         await edit_status(status, "⏳ Queued…")
 
@@ -1951,7 +2006,7 @@ async def run_job(
     typing_task: asyncio.Task | None = None
 
     async with lock:
-        if metric_snapshot().get("queued_jobs", 0) > 0:
+        if was_queued:
             metric_add("queued_jobs", -1)
         metric_add("active_jobs", 1)
         await edit_status(status, f"⬇️ Downloading from {PLATFORMS.get(platform, {}).get('label', 'Media')}…")
@@ -2063,6 +2118,7 @@ def start_health_server() -> None:
                     sum(p.stat().st_size for p in CACHE_DIR.glob("*") if p.is_file()) // (1024 * 1024)
                     if CACHE_DIR.exists() else 0
                 ),
+                "pid": os.getpid(),
                 "metrics": metric_snapshot(),
             }).encode()
             self.send_response(200 if self.path in {"/", "/health", "/healthz", "/readyz"} else 404)
@@ -2072,7 +2128,13 @@ def start_health_server() -> None:
             self.wfile.write(body)
         def log_message(self, fmt, *args):
             return
-    Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever(), daemon=True).start()
+    def serve() -> None:
+        try:
+            ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+        except OSError as exc:
+            log.warning("health server unavailable on port %s: %s", port, exc)
+
+    Thread(target=serve, daemon=True).start()
 
 
 def main() -> None:
