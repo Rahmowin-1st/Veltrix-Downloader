@@ -19,7 +19,7 @@ fi
 echo "Veltrix preflight..."
 if ! python - <<'PY'
 import importlib
-for name in ("telegram", "yt_dlp", "gallery_dl", "pinterest_downloader", "httpx"):
+for name in ("telegram", "yt_dlp", "gallery_dl", "pinterest_downloader", "parth_dl", "httpx"):
     importlib.import_module(name)
 PY
 then
