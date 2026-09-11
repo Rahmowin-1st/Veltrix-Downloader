@@ -179,6 +179,21 @@ class BackendTests(unittest.TestCase):
             path.write_bytes(b"<!DOCTYPE html><html><body>blocked</body></html>")
             self.assertEqual(bot.sanitize_media_files([path]), [])
 
+    def test_pinterest_target_height_policy(self):
+        self.assertEqual(bot._pinterest_target_height([
+            {"height": 360}, {"height": 720}, {"height": 1080}
+        ]), 720)
+        self.assertEqual(bot._pinterest_target_height([
+            {"height": 480}, {"height": 1080}
+        ]), 1080)
+        self.assertEqual(bot._pinterest_target_height([
+            {"height": 360}, {"height": 480}
+        ]), 480)
+
+    def test_system_deno_is_preferred(self):
+        with patch("bot.shutil.which", side_effect=lambda name: "/usr/bin/deno" if name == "deno" else None):
+            self.assertEqual(bot.deno_runtime(), "/usr/bin/deno")
+
 
 if __name__ == "__main__":
     unittest.main()
