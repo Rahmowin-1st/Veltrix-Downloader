@@ -24,7 +24,18 @@ if [ ! -f .env ] || ! grep -q '^BOT_TOKEN=' .env; then
   chmod 600 .env
 fi
 
-echo "[4/4] Starting Veltrix Downloader..."
+echo "[4/5] Installing reboot hook..."
+REPO_DIR="$(pwd)"
+mkdir -p "$HOME/.termux/boot"
+cat > "$HOME/.termux/boot/veltrix-downloader" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+sleep 15
+cd "$REPO_DIR"
+bash ./termux_start.sh
+EOF
+chmod 700 "$HOME/.termux/boot/veltrix-downloader"
+
+echo "[5/5] Starting Veltrix Downloader..."
 termux-wake-lock || true
 bash ./termux_start.sh
 
