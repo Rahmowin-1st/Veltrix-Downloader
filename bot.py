@@ -118,6 +118,11 @@ def ensure_ffmpeg() -> None:
 
 
 def deno_runtime() -> str | None:
+    # Termux installs the real Deno binary through pkg; prefer it. Render can
+    # use the Python deno package as a fallback.
+    system_deno = shutil.which("deno")
+    if system_deno:
+        return system_deno
     try:
         import deno
         path = str(deno.find_deno_bin())
