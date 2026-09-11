@@ -270,6 +270,10 @@ def request_headers(url: str | None = None) -> dict[str, str]:
         headers["Referer"] = "https://www.instagram.com/"
     elif platform == "snapchat":
         headers["Referer"] = "https://www.snapchat.com/"
+        headers["Sec-Fetch-Dest"] = "document"
+        headers["Sec-Fetch-Mode"] = "navigate"
+        headers["Sec-Fetch-Site"] = "none"
+        headers["Upgrade-Insecure-Requests"] = "1"
     elif platform == "pinterest":
         headers["Referer"] = "https://www.pinterest.com/"
     return headers
@@ -477,6 +481,147 @@ def preview_media(url: str) -> dict[str, Any]:
         except Exception as exc:
             log.info("preview page unavailable: %s", str(exc)[:120])
     return {"title": "Media", "duration": 0, "format_count": 0, "thumbnail": ""}
+
+
+def _dig_dict(node: Any, *keys: str) -> dict[str, Any]:
+    cur = node
+    for key in keys:
+        if not isinstance(cur, dict):
+            return {}
+        cur = cur.get(key)
+    return cur if isinstance(cur, dict) else {}
+
+
+def _snap_requested_id(url: str, doc: dict[str, Any]) -> str:
+    query = doc.get("query") if isinstance(doc.get("query"), dict) else {}
+    snap_id = str(query.get("snapID") or "")
+    if snap_id:
+        return snap_id
+    match = re.search(r"/(?:@[^/]+/)?spotlight/([A-Za-z0-9_-]+)", urlparse(url).path, re.I)
+    return match.group(1) if match else ""
+
+
+def _snap_target_metadata(doc: dict[str, Any], requested_id: str) -> dict[str, Any]:
+    props = _dig_dict(doc, "props", "pageProps")
+    feed = props.get("spotlightFeed") if isinstance(props.get("spotlightFeed"), dict) else {}
+    stories = feed.get("spotlightStories") if isinstance(feed.get("spotlightStories"), list) else []
+
+    if requested_id:
+        for item in stories:
+            if not isinstance(item, dict):
+                continue
+            story = item.get("story") if isinstance(item.get("story"), dict) else {}
+            story_id = story.get("storyId") if isinstance(story.get("storyId"), dict) else {}
+            if str(story_id.get("value") or "") == requested_id:
+                meta = item.get("metadata")
+                if isinstance(meta, dict):
+                    return meta
+
+    top = props.get("videoMetadata")
+    if isinstance(top, dict) and str(top.get("contentUrl") or ""):
+        return {"videoMetadata": top}
+
+    for item in stories:
+        if isinstance(item, dict) and isinstance(item.get("metadata"), dict):
+            return item["metadata"]
+    return {}
+
+
+def _snap_info_from_doc(doc: dict[str, Any], page_url: str) -> dict[str, str]:
+    requested_id = _snap_requested_id(page_url, doc)
+    meta = _snap_target_metadata(doc, requested_id)
+    vm = meta.get("videoMetadata") if isinstance(meta.get("videoMetadata"), dict) else {}
+    video = str(vm.get("contentUrl") or "")
+    if not video:
+        return {}
+    creator = vm.get("creator") if isinstance(vm.get("creator"), dict) else {}
+    person = creator.get("personCreator") if isinstance(creator.get("personCreator"), dict) else {}
+    title = str(vm.get("name") or meta.get("llmTitle") or "Spotlight")
+    return {
+        "id": requested_id,
+        "url": video,
+        "thumbnail": str(vm.get("thumbnailUrl") or ""),
+        "title": title,
+        "uploader": str(person.get("username") or person.get("name") or ""),
+        "page_url": page_url,
+    }
+
+
+def extract_snapchat_public(url: str) -> dict[str, str]:
+    """Extract exactly the requested public Spotlight from Snapchat __NEXT_DATA__."""
+    candidates = extractor_candidates(url)
+    seen: set[str] = set()
+    last_error: Exception | None = None
+
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            with httpx.Client(
+                headers=request_headers(candidate),
+                follow_redirects=True,
+                timeout=25,
+                proxy=PROXY or None,
+            ) as client:
+                response = client.get(candidate)
+            if response.status_code != 200:
+                continue
+            page = response.text
+            match = re.search(
+                r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                page,
+                flags=re.I | re.S,
+            )
+            if not match:
+                match = re.search(r'__NEXT_DATA__["\'][^>]*>(.*?)</script>', page, flags=re.I | re.S)
+            if not match:
+                continue
+            doc = json.loads(html.unescape(match.group(1)).strip())
+            info = _snap_info_from_doc(doc, str(response.url))
+            if info.get("url"):
+                return info
+        except Exception as exc:
+            last_error = exc
+            log.info("Snapchat dedicated extractor failed: %s", str(exc)[:180])
+
+    if last_error:
+        raise last_error
+    return {}
+
+
+def download_snapchat_dedicated(url: str, tmpdir: str) -> list[Path]:
+    try:
+        info = extract_snapchat_public(url)
+    except Exception:
+        return []
+    media_url = str(info.get("url") or "")
+    if not media_url or not safe_remote_url(media_url):
+        return []
+
+    dest = Path(tmpdir) / "snapchat"
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / "spotlight.mp4"
+    headers = {
+        "User-Agent": DESKTOP_UA,
+        "Referer": "https://www.snapchat.com/",
+        "Accept": "*/*",
+    }
+    try:
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=45, proxy=PROXY or None) as client:
+            with client.stream("GET", media_url) as response:
+                response.raise_for_status()
+                total = 0
+                with out.open("wb") as fh:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        total += len(chunk)
+                        if total > MAX_SOURCE_BYTES:
+                            raise RuntimeError("Snapchat media too large")
+                        fh.write(chunk)
+        return [out] if out.exists() and out.stat().st_size else []
+    except Exception as exc:
+        log.info("Snapchat media download failed: %s", str(exc)[:180])
+        return []
 
 
 def files_in(root: Path) -> list[Path]:
