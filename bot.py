@@ -7,6 +7,7 @@ Optimized for Telegram hosted Bot API limits and small Render instances.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import ipaddress
 import json
@@ -18,6 +19,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
@@ -33,7 +35,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "4.0.0"
+VERSION = "5.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -43,12 +45,14 @@ MAX_GALLERY_ITEMS = max(1, min(int(os.getenv("MAX_GALLERY_ITEMS", "20")), 40))
 MAX_CONCURRENT_JOBS = max(1, min(int(os.getenv("MAX_CONCURRENT_JOBS", "1")), 3))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
+ACTIONS_FILE = DATA_DIR / "actions.json"
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix")
 _user_lock = Lock()
+_action_lock = Lock()
 _job_locks: dict[int, asyncio.Lock] = {}
 _global_sem: asyncio.Semaphore | None = None
 
@@ -160,6 +164,56 @@ def patch_user(uid: int, **fields: str) -> dict:
         users[str(uid)] = row
         save_users(users)
         return row
+
+
+def _load_actions() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(ACTIONS_FILE.read_text(encoding="utf-8")) if ACTIONS_FILE.exists() else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_actions(data: dict[str, dict[str, Any]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ACTIONS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(ACTIONS_FILE)
+
+
+def create_action(uid: int, url: str) -> str:
+    """Bind an inline action to the exact request, not the user's latest URL."""
+    now = int(time.time())
+    raw = f"{uid}:{url}:{time.time_ns()}".encode()
+    token = hashlib.sha256(raw).hexdigest()[:20]
+    with _action_lock:
+        actions = _load_actions()
+        cutoff = now - 7 * 24 * 3600
+        actions = {
+            k: v for k, v in actions.items()
+            if isinstance(v, dict) and int(v.get("created_at") or 0) >= cutoff
+        }
+        actions[token] = {"uid": uid, "url": url, "created_at": now}
+        if len(actions) > 1500:
+            newest = sorted(actions.items(), key=lambda kv: int(kv[1].get("created_at") or 0), reverse=True)[:1200]
+            actions = dict(newest)
+        _save_actions(actions)
+    return token
+
+
+def resolve_action(uid: int, token: str) -> str:
+    with _action_lock:
+        row = _load_actions().get(token) or {}
+    if int(row.get("uid") or -1) != int(uid):
+        return ""
+    if int(row.get("created_at") or 0) < int(time.time()) - 7 * 24 * 3600:
+        return ""
+    return str(row.get("url") or "")
+
+
+def mp3_button(uid: int, url: str) -> InlineKeyboardMarkup:
+    token = create_action(uid, url)
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MP3", callback_data=f"mp3|{token}")]])
 
 
 def extract_url(text: str) -> str | None:
