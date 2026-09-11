@@ -1197,12 +1197,36 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
 
 
 def classify(path: Path) -> str:
+    """Classify the actual media so Telegram receives it as the right type."""
     ext = path.suffix.lower()
-    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}:
+    if ext in {".jpg", ".jpeg", ".png", ".webp", ".avif", ".heic", ".heif"}:
         return "image"
+    if ext in {".gif"}:
+        return "animation"
     if ext in {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav", ".flac"}:
         return "audio"
-    return "video"
+    if ext in {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".ts"}:
+        return "video"
+
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            proc = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=15,
+            )
+            payload = json.loads(proc.stdout or "{}")
+            types = {str(x.get("codec_type") or "") for x in payload.get("streams") or [] if isinstance(x, dict)}
+            if "video" in types:
+                return "video"
+            if "audio" in types:
+                return "audio"
+        except Exception:
+            pass
+    return "document"
 
 
 def ffmpeg(cmd: list[str], timeout: int = 900) -> None:
@@ -1217,6 +1241,52 @@ def media_duration(path: Path) -> float:
     if not match:
         return 0.0
     return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def fit_image(path: Path, dest: Path) -> Path:
+    """Keep visual media as Telegram photo instead of falling back to document."""
+    if path.stat().st_size <= MAX_PHOTO_BYTES and path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+        return path
+    dest.mkdir(parents=True, exist_ok=True)
+    for width, quality in ((4096, 4), (3072, 6), (2048, 8), (1600, 10)):
+        out = dest / f"{path.stem}.{width}.jpg"
+        ffmpeg([
+            "ffmpeg", "-y", "-i", str(path), "-frames:v", "1",
+            "-vf", f"scale='min({width},iw)':-2",
+            "-q:v", str(quality), str(out),
+        ], timeout=180)
+        if out.exists() and out.stat().st_size <= MAX_PHOTO_BYTES:
+            return out
+    return out if out.exists() else path
+
+
+def fit_animation(path: Path, dest: Path) -> Path:
+    """Convert oversized/unsupported GIF-like media to Telegram animation MP4."""
+    if path.stat().st_size <= MAX_BYTES and path.suffix.lower() in {".gif", ".mp4"}:
+        return path
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / f"{path.stem}.animation.mp4"
+    ffmpeg([
+        "ffmpeg", "-y", "-i", str(path), "-an",
+        "-vf", "scale='min(1280,iw)':-2:flags=lanczos",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out),
+    ])
+    return out if out.exists() else path
+
+
+def normalize_video(path: Path, dest: Path, max_height: int) -> Path:
+    """Create a Telegram-streamable H.264/AAC MP4 when the source container/codec fails."""
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / f"{path.stem}.normalized.mp4"
+    ffmpeg([
+        "ffmpeg", "-y", "-i", str(path),
+        "-vf", f"scale=-2:'min({max_height},ih)'",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", "-pix_fmt", "yuv420p", str(out),
+    ])
+    return out if out.exists() else path
 
 
 def fit_video(path: Path, dest: Path, max_height: int) -> Path:
@@ -1236,14 +1306,27 @@ def fit_video(path: Path, dest: Path, max_height: int) -> Path:
         height = min(height, 480)
     if video_bps < 350_000:
         height = min(height, 360)
-    ladder = [(height, video_bps), (min(height, 1080), int(video_bps * .82)), (min(height, 720), int(video_bps * .68)), (min(height, 480), int(video_bps * .52)), (360, max(int(video_bps * .42), 140_000))]
+    ladder = [
+        (height, video_bps),
+        (min(height, 1080), int(video_bps * .82)),
+        (min(height, 720), int(video_bps * .68)),
+        (min(height, 480), int(video_bps * .52)),
+        (360, max(int(video_bps * .42), 140_000)),
+    ]
     out = dest / f"{path.stem}.telegram.mp4"
     seen: set[tuple[int, int]] = set()
     for h, bitrate in ladder:
         if (h, bitrate) in seen:
             continue
         seen.add((h, bitrate))
-        ffmpeg(["ffmpeg", "-y", "-i", str(path), "-vf", f"scale=-2:'min({h},ih)'", "-c:v", "libx264", "-preset", "veryfast", "-b:v", str(bitrate), "-maxrate", str(bitrate), "-bufsize", str(bitrate * 2), "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", "-pix_fmt", "yuv420p", str(out)])
+        ffmpeg([
+            "ffmpeg", "-y", "-i", str(path),
+            "-vf", f"scale=-2:'min({h},ih)'",
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", str(bitrate), "-maxrate", str(bitrate), "-bufsize", str(bitrate * 2),
+            "-c:a", "aac", "-b:a", "96k",
+            "-movflags", "+faststart", "-pix_fmt", "yuv420p", str(out),
+        ])
         if out.exists() and out.stat().st_size <= MAX_BYTES:
             return out
     return out if out.exists() else path
@@ -1276,7 +1359,10 @@ def split_video(path: Path, dest: Path) -> list[Path]:
     count = max(2, math.ceil(path.stat().st_size / (MAX_BYTES * 0.88)))
     segment = max(10, int(duration / count))
     pattern = str(dest / f"{path.stem}.part%02d.mp4")
-    ffmpeg(["ffmpeg", "-y", "-i", str(path), "-c", "copy", "-map", "0", "-f", "segment", "-segment_time", str(segment), "-reset_timestamps", "1", pattern])
+    ffmpeg([
+        "ffmpeg", "-y", "-i", str(path), "-c", "copy", "-map", "0",
+        "-f", "segment", "-segment_time", str(segment), "-reset_timestamps", "1", pattern,
+    ])
     return sorted(p for p in dest.glob(f"{path.stem}.part*.mp4") if p.stat().st_size > 0)
 
 
