@@ -33,7 +33,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -77,6 +77,7 @@ AUDIO_PRESETS = {
 }
 DEFAULT_QUALITY = "720"
 AUTO_MODE = "auto"
+DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
 
 def ensure_ffmpeg() -> None:
@@ -195,23 +196,72 @@ def platform_label(url: str) -> str:
     return PLATFORMS[key]["label"] if key else "Unsupported"
 
 
-def extractor_candidates(url: str) -> list[str]:
-    """Return clean public URL variants without leaking tracking parameters."""
+def is_video_post_url(url: str) -> bool:
     platform = platform_of(url)
-    out = [url]
+    path = urlparse(url).path.lower()
+    return (
+        (platform == "instagram" and re.search(r"/(?:reels?|tv)/", path) is not None)
+        or (platform == "snapchat" and "/spotlight/" in path)
+    )
+
+
+def request_headers(url: str | None = None) -> dict[str, str]:
+    platform = platform_of(url or "")
+    headers = {
+        "User-Agent": DESKTOP_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    if platform == "instagram":
+        headers["Referer"] = "https://www.instagram.com/"
+    elif platform == "snapchat":
+        headers["Referer"] = "https://www.snapchat.com/"
+    elif platform == "pinterest":
+        headers["Referer"] = "https://www.pinterest.com/"
+    return headers
+
+
+def resolve_public_redirect(url: str) -> str:
+    """Resolve public short/share URLs such as pin.it to their canonical page."""
     try:
-        parsed = urlparse(url)
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        if host not in {"pin.it"}:
+            return url
+        with httpx.Client(headers=request_headers(url), follow_redirects=True, timeout=12, proxy=PROXY or None) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            resolved = str(response.url)
+        return resolved if platform_of(resolved) == "pinterest" else url
+    except Exception as exc:
+        log.info("share redirect resolution failed: %s", str(exc)[:120])
+        return url
+
+
+def extractor_candidates(url: str) -> list[str]:
+    """Return canonical public URL variants, keeping the actual media post first."""
+    platform = platform_of(url)
+    resolved = resolve_public_redirect(url)
+    out = [resolved, url] if resolved != url else [url]
+    try:
+        parsed = urlparse(resolved)
         if platform == "instagram":
             match = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", parsed.path, re.I)
             if match:
                 kind = "reel" if match.group(1).lower() in {"reel", "reels"} else match.group(1).lower()
-                out.append(f"https://www.instagram.com/{kind}/{match.group(2)}/")
+                out.insert(0, f"https://www.instagram.com/{kind}/{match.group(2)}/")
         elif platform == "snapchat":
             match = re.search(r"/spotlight/([A-Za-z0-9_]+)", parsed.path, re.I)
             if match:
                 snap_id = match.group(1)
-                out.append(f"https://www.snapchat.com/spotlight/{snap_id}")
-                out.append(f"https://snapchat.com/spotlight/{snap_id}")
+                out.extend([
+                    f"https://www.snapchat.com/spotlight/{snap_id}?locale=en-US",
+                    f"https://www.snapchat.com/spotlight/{snap_id}",
+                    f"https://snapchat.com/spotlight/{snap_id}",
+                ])
+        elif platform == "pinterest":
+            match = re.search(r"/pin/(?:[\w-]+--)?(\d+)", parsed.path, re.I)
+            if match:
+                out.insert(0, f"https://www.pinterest.com/pin/{match.group(1)}/")
     except Exception:
         pass
     return list(dict.fromkeys(out))
@@ -281,10 +331,7 @@ def base_ydl_opts(tmpdir: str) -> dict[str, Any]:
         "overwrites": True,
         "cachedir": False,
         "merge_output_format": "mp4",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Mobile Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        "http_headers": request_headers(),
     }
     if PROXY:
         opts["proxy"] = PROXY
@@ -320,10 +367,7 @@ def preview_media(url: str) -> dict[str, Any]:
         return probe_media(url)
     except Exception as first:
         log.info("preview extractor unavailable: %s", str(first)[:160])
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Mobile Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    headers = request_headers(url)
     for page_url in public_page_candidates(url):
         try:
             with httpx.Client(headers=headers, follow_redirects=True, timeout=12, proxy=PROXY or None) as client:
@@ -350,7 +394,9 @@ def files_in(root: Path) -> list[Path]:
         return []
     skip = {".json", ".vtt", ".srt", ".part", ".ytdl", ".nfo", ".txt"}
     result = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() not in skip and p.stat().st_size > 0]
-    result.sort(key=lambda p: (p.stat().st_size, p.name), reverse=True)
+    # Downloaders create carousel items sequentially. Keep that order instead of
+    # sorting by size, which used to scramble item 1/2/3.
+    result.sort(key=lambda p: (p.stat().st_mtime_ns, str(p)))
     return result
 
 
@@ -416,6 +462,7 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
             try:
                 opts = dict(base)
                 opts["format"] = fmt
+                opts["http_headers"] = request_headers(candidate)
                 opts.update(extra)
                 with YoutubeDL(opts) as ydl:
                     ydl.download([candidate])
@@ -445,7 +492,11 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
             log.warning("gallery-dl: %s", (proc.stderr or "")[-250:])
     except Exception as exc:
         log.warning("gallery-dl error: %s", exc)
-    return files_in(dest)
+    items = files_in(dest)
+    if is_video_post_url(url):
+        videos = [p for p in items if classify(p) == "video"]
+        return videos
+    return items
 
 
 def og_values(page: str, names: set[str]) -> list[str]:
@@ -492,16 +543,19 @@ def _walk_media_urls(value: Any, key_hint: str = "") -> list[str]:
     return found
 
 
-def page_media_candidates(page: str) -> list[str]:
-    """Parse public HTML for OG, JSON-LD, Next.js and embedded media URLs."""
-    candidates: list[str] = []
-    candidates += og_values(page, {
-        "og:video", "og:video:url", "og:video:secure_url",
-        "twitter:player:stream", "og:image", "og:image:url",
-        "og:image:secure_url", "twitter:image",
-    })
+def page_media_candidates(page: str, include_images: bool = True) -> list[str]:
+    """Parse public HTML while excluding unrelated page artwork for video posts."""
+    video_candidates: list[str] = []
+    image_candidates: list[str] = []
 
-    # Structured script payloads (Instagram embeds, Snapchat Next.js, Pinterest).
+    video_candidates += og_values(page, {
+        "og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream",
+    })
+    if include_images:
+        image_candidates += og_values(page, {
+            "og:image", "og:image:url", "og:image:secure_url", "twitter:image",
+        })
+
     for match in re.finditer(
         r"<script[^>]*(?:type=[\"']application/ld\+json[\"']|id=[\"']__NEXT_DATA__[\"'])[^>]*>(.*?)</script>",
         page,
@@ -509,35 +563,43 @@ def page_media_candidates(page: str) -> list[str]:
     ):
         raw = html.unescape(match.group(1)).strip()
         try:
-            candidates += _walk_media_urls(json.loads(raw))
+            for candidate in _walk_media_urls(json.loads(raw)):
+                path = urlparse(candidate).path.lower()
+                if any(ext in path for ext in (".mp4", ".m4v", ".mov", ".webm", ".m3u8")):
+                    video_candidates.append(candidate)
+                elif include_images and any(ext in path for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    image_candidates.append(candidate)
         except Exception:
             pass
 
-    # Common serialized media keys used by social pages.
     for match in re.finditer(
-        r"[\"'](?:video_url|videoUrl|contentUrl|content_url|playbackUrl|playback_url|thumbnailUrl|thumbnail_url)[\"']\s*:\s*[\"']([^\"']+)",
+        r"[\"'](?:video_url|videoUrl|contentUrl|content_url|playbackUrl|playback_url)[\"']\s*:\s*[\"']([^\"']+)",
         page,
         flags=re.I,
     ):
-        candidates.append(_decode_web_url(match.group(1)))
+        video_candidates.append(_decode_web_url(match.group(1)))
 
-    # Last public-page fallback: direct media URLs embedded in JS.
     for match in re.finditer(
-        r"https?:\\?/\\?/[^\"'<>\s]+?(?:\.mp4|\.m3u8|\.webm|\.jpg|\.jpeg|\.webp)(?:\?[^\"'<>\s]*)?",
+        r"https?:\\?/\\?/[^\"'<>\s]+?(?:\.mp4|\.m3u8|\.webm)(?:\?[^\"'<>\s]*)?",
         page,
         flags=re.I,
     ):
-        candidates.append(_decode_web_url(match.group(0)))
+        video_candidates.append(_decode_web_url(match.group(0)))
 
-    return list(dict.fromkeys(x for x in candidates if x))
+    if include_images:
+        for match in re.finditer(
+            r"[\"'](?:thumbnailUrl|thumbnail_url|imageUrl|image_url)[\"']\s*:\s*[\"']([^\"']+)",
+            page,
+            flags=re.I,
+        ):
+            image_candidates.append(_decode_web_url(match.group(1)))
+
+    return list(dict.fromkeys(x for x in video_candidates + image_candidates if x))
 
 
 def download_public_page_media(url: str, tmpdir: str) -> list[Path]:
     """Download media URLs exposed by a public social page without login bypass."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Mobile Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    headers = request_headers(url)
     dest = Path(tmpdir) / "page_media"
     dest.mkdir(parents=True, exist_ok=True)
     results: list[Path] = []
@@ -547,7 +609,8 @@ def download_public_page_media(url: str, tmpdir: str) -> list[Path]:
         response.raise_for_status()
         if "text/html" not in response.headers.get("content-type", ""):
             return []
-        candidates = page_media_candidates(response.text)
+        force_video = is_video_post_url(str(response.url)) or is_video_post_url(url)
+        candidates = page_media_candidates(response.text, include_images=not force_video)
 
         for index, raw in enumerate(candidates[:40], 1):
             media_url = urljoin(str(response.url), raw)
@@ -596,8 +659,12 @@ def download_public_page_media(url: str, tmpdir: str) -> list[Path]:
             except Exception as exc:
                 log.info("public direct media failed: %s", str(exc)[:140])
 
-    # Prefer videos/audio over thumbnails if both are exposed.
-    results.sort(key=lambda p: (classify(p) == "image", -p.stat().st_size))
+    if is_video_post_url(url):
+        return [p for p in results if classify(p) == "video"][:MAX_GALLERY_ITEMS]
+    videos = [p for p in results if classify(p) == "video"]
+    if videos:
+        return videos[:MAX_GALLERY_ITEMS]
+    # Keep original media order for image/carousel posts.
     return results[:MAX_GALLERY_ITEMS]
 
 
@@ -605,10 +672,7 @@ def download_open_graph(url: str, tmpdir: str) -> list[Path]:
     """Public-page fallback, useful for share pages with direct OG media."""
     if not platform_of(url):
         return []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Mobile Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    headers = request_headers(url)
     proxy = PROXY or None
     with httpx.Client(headers=headers, follow_redirects=True, timeout=25, proxy=proxy) as client:
         response = client.get(url)
@@ -617,7 +681,9 @@ def download_open_graph(url: str, tmpdir: str) -> list[Path]:
             return []
         video_names = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"}
         image_names = {"og:image", "og:image:url", "og:image:secure_url", "twitter:image"}
-        candidates = og_values(response.text, video_names) + og_values(response.text, image_names)
+        candidates = og_values(response.text, video_names)
+        if not is_video_post_url(url):
+            candidates += og_values(response.text, image_names)
         dest = Path(tmpdir) / "og"
         dest.mkdir(parents=True, exist_ok=True)
         results: list[Path] = []
@@ -677,12 +743,15 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
     first_error: Exception | None = None
     files: list[Path] = []
+
     try:
         files = download_ytdlp(url, mode, tmpdir)
     except Exception as exc:
         first_error = exc
-    if not files and platform in {"instagram", "pinterest"} and mode in {"original", AUTO_MODE, *VIDEO_PRESETS}:
-        files = download_gallery(url, tmpdir)
+
+    # For social video links, parse the canonical public page before any image
+    # downloader. This prevents Reel/Pin thumbnails and site artwork from being
+    # mistaken for the requested video.
     if not files:
         for page_url in public_page_candidates(url):
             try:
@@ -693,6 +762,10 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
                 log.info("public page parser failed: %s", str(exc)[:160])
                 if first_error is None:
                     first_error = exc
+
+    if not files and platform in {"instagram", "pinterest"} and mode in {"original", AUTO_MODE, *VIDEO_PRESETS}:
+        files = download_gallery(resolve_public_redirect(url), tmpdir)
+
     if not files:
         for page_url in public_page_candidates(url):
             try:
@@ -702,10 +775,15 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
+
+    if is_video_post_url(url):
+        files = [p for p in files if classify(p) == "video"]
+
     if not files:
         if first_error:
             raise RuntimeError(friendly_error(platform, first_error)) from first_error
-        raise RuntimeError("No public downloadable media was found in this link.")
+        raise RuntimeError("No downloadable media was found in this link.")
+
     usable = [p for p in files if p.stat().st_size <= MAX_SOURCE_BYTES]
     if not usable:
         raise RuntimeError(f"Source file is over the {MAX_SOURCE_BYTES // 1048576} MB service cap.")
