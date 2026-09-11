@@ -161,6 +161,24 @@ class BackendTests(unittest.TestCase):
         self.assertLessEqual(bot.CACHE_MAX_BYTES, bot.CACHE_TOTAL_MAX_BYTES)
         self.assertGreater(bot.CACHE_TTL_SECONDS, 0)
 
+    def test_sanitize_media_preserves_order_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            a = root / "01.mp4"
+            b = root / "02.mp4"
+            c = root / "03.mp4"
+            a.write_bytes(b"video-one")
+            b.write_bytes(b"video-two")
+            c.write_bytes(b"video-one")
+            result = bot.sanitize_media_files([a, b, c])
+            self.assertEqual(result, [a, b])
+
+    def test_html_masquerading_as_media_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "fake.mp4"
+            path.write_bytes(b"<!DOCTYPE html><html><body>blocked</body></html>")
+            self.assertEqual(bot.sanitize_media_files([path]), [])
+
 
 if __name__ == "__main__":
     unittest.main()
