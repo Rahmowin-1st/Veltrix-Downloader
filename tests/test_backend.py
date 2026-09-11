@@ -194,6 +194,33 @@ class BackendTests(unittest.TestCase):
         with patch("bot.shutil.which", side_effect=lambda name: "/usr/bin/deno" if name == "deno" else None):
             self.assertEqual(bot.deno_runtime(), "/usr/bin/deno")
 
+    def test_instagram_quality_prefers_720(self):
+        q720 = bot._instagram_format_score(
+            {"url": "https://cdn.example/a.mp4", "height": 720, "width": 1280, "has_audio": True},
+            "video",
+        )
+        q1080 = bot._instagram_format_score(
+            {"url": "https://cdn.example/b.mp4", "height": 1080, "width": 1920, "has_audio": True},
+            "video",
+        )
+        q480 = bot._instagram_format_score(
+            {"url": "https://cdn.example/c.mp4", "height": 480, "width": 854, "has_audio": True},
+            "video",
+        )
+        self.assertGreater(q720, q1080)
+        self.assertGreater(q1080, q480)
+
+    def test_instagram_image_prefers_larger_area(self):
+        small = bot._instagram_format_score({"width": 640, "height": 640}, "image")
+        large = bot._instagram_format_score({"width": 1080, "height": 1080}, "image")
+        self.assertGreater(large, small)
+
+    def test_fake_jpeg_is_not_telegram_photo_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "fake.jpg"
+            path.write_bytes(b"<html>not an image</html>")
+            self.assertFalse(bot.telegram_photo_ready(path))
+
 
 if __name__ == "__main__":
     unittest.main()
