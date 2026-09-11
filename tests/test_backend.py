@@ -36,6 +36,20 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(bot.safe_remote_url("http://localhost/x"))
         self.assertTrue(bot.safe_remote_url("https://example.com/media.mp4"))
 
+    def test_clean_instagram_candidate(self):
+        urls = bot.extractor_candidates("https://www.instagram.com/reel/ABC123/?igsh=tracking")
+        self.assertIn("https://www.instagram.com/reel/ABC123/", urls)
+
+    def test_clean_snapchat_candidate(self):
+        urls = bot.extractor_candidates("https://www.snapchat.com/spotlight/W7_ABC123?share_id=x&locale=en-UZ")
+        self.assertIn("https://www.snapchat.com/spotlight/W7_ABC123", urls)
+
+    def test_user_errors_never_leak_extractor_trace(self):
+        msg = bot.friendly_error("snapchat", RuntimeError("ERROR: [SnapchatSpotlight] HTTP Error 404: Not Found"))
+        self.assertNotIn("ERROR:", msg)
+        self.assertNotIn("HTTP Error", msg)
+        self.assertIn("Snapchat", msg)
+
 
 if __name__ == "__main__":
     unittest.main()
