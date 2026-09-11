@@ -68,6 +68,9 @@ _metrics = {
     "active_jobs": 0,
     "queued_jobs": 0,
 }
+_metadata_lock = Lock()
+_metadata_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+METADATA_CACHE_TTL = 60.0
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 YT_ID_RE = re.compile(r"(?:v=|/shorts/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})")
@@ -157,6 +160,33 @@ def metric_add(key: str, amount: int) -> None:
 def metric_snapshot() -> dict[str, int]:
     with _metrics_lock:
         return {k: int(v) for k, v in _metrics.items()}
+
+
+def metadata_cache_get(key: str) -> dict[str, Any]:
+    now = time.monotonic()
+    with _metadata_lock:
+        row = _metadata_cache.get(key)
+        if not row:
+            return {}
+        created, payload = row
+        if now - created > METADATA_CACHE_TTL:
+            _metadata_cache.pop(key, None)
+            return {}
+        return payload
+
+
+def metadata_cache_put(key: str, payload: dict[str, Any]) -> None:
+    if not payload:
+        return
+    now = time.monotonic()
+    with _metadata_lock:
+        stale = [k for k, (created, _) in _metadata_cache.items() if now - created > METADATA_CACHE_TTL]
+        for k in stale:
+            _metadata_cache.pop(k, None)
+        if len(_metadata_cache) >= 128:
+            oldest = min(_metadata_cache.items(), key=lambda item: item[1][0])[0]
+            _metadata_cache.pop(oldest, None)
+        _metadata_cache[key] = (now, payload)
 
 
 def cleanup_stale_temp(max_age_seconds: int = 6 * 3600) -> None:
@@ -638,6 +668,11 @@ def _instagram_format_score(fmt: dict[str, Any], kind: str) -> tuple[int, int, i
 
 def extract_instagram_public(url: str) -> dict[str, Any]:
     """Dedicated public Instagram metadata path for Reels/posts/carousels."""
+    cache_key = f"instagram:{url}"
+    cached = metadata_cache_get(cache_key)
+    if cached:
+        return cached
+
     from parth_dl import InstagramDownloader
 
     downloader = InstagramDownloader(
@@ -647,7 +682,9 @@ def extract_instagram_public(url: str) -> dict[str, Any]:
         overwrite=True,
     )
     info = downloader.get_info(url)
-    return info if isinstance(info, dict) else {}
+    payload = info if isinstance(info, dict) else {}
+    metadata_cache_put(cache_key, payload)
+    return payload
 
 
 def download_instagram_dedicated(url: str, tmpdir: str) -> tuple[list[Path], str]:
@@ -817,6 +854,11 @@ def _snap_info_from_doc(doc: dict[str, Any], page_url: str) -> dict[str, str]:
 
 def extract_snapchat_public(url: str) -> dict[str, str]:
     """Extract exactly the requested public Spotlight from Snapchat __NEXT_DATA__."""
+    cache_key = f"snapchat:{url}"
+    cached = metadata_cache_get(cache_key)
+    if cached:
+        return {str(k): str(v) for k, v in cached.items()}
+
     candidates = extractor_candidates(url)
     seen: set[str] = set()
     last_error: Exception | None = None
@@ -848,6 +890,7 @@ def extract_snapchat_public(url: str) -> dict[str, str]:
             doc = json.loads(html.unescape(match.group(1)).strip())
             info = _snap_info_from_doc(doc, str(response.url))
             if info.get("url"):
+                metadata_cache_put(cache_key, dict(info))
                 return info
         except Exception as exc:
             last_error = exc
