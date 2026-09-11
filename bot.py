@@ -75,7 +75,8 @@ AUDIO_PRESETS = {
     "mp3_128": {"label": "MP3 128", "codec": "mp3", "bitrate": "128"},
     "m4a": {"label": "M4A", "codec": "m4a", "bitrate": "192"},
 }
-DEFAULT_QUALITY = "720"\nAUTO_MODE = "auto"
+DEFAULT_QUALITY = "720"
+AUTO_MODE = "auto"
 
 
 def ensure_ffmpeg() -> None:
