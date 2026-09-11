@@ -33,7 +33,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -194,6 +194,46 @@ def platform_label(url: str) -> str:
     return PLATFORMS[key]["label"] if key else "Unsupported"
 
 
+def extractor_candidates(url: str) -> list[str]:
+    """Return clean public URL variants without leaking tracking parameters."""
+    platform = platform_of(url)
+    out = [url]
+    try:
+        parsed = urlparse(url)
+        if platform == "instagram":
+            match = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", parsed.path, re.I)
+            if match:
+                kind = "reel" if match.group(1).lower() in {"reel", "reels"} else match.group(1).lower()
+                out.append(f"https://www.instagram.com/{kind}/{match.group(2)}/")
+        elif platform == "snapchat":
+            match = re.search(r"/spotlight/([A-Za-z0-9_]+)", parsed.path, re.I)
+            if match:
+                snap_id = match.group(1)
+                out.append(f"https://www.snapchat.com/spotlight/{snap_id}")
+                out.append(f"https://snapchat.com/spotlight/{snap_id}")
+    except Exception:
+        pass
+    return list(dict.fromkeys(out))
+
+
+def public_page_candidates(url: str) -> list[str]:
+    out = extractor_candidates(url)
+    if platform_of(url) == "instagram":
+        try:
+            parsed = urlparse(url)
+            match = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", parsed.path, re.I)
+            if match:
+                kind = "reel" if match.group(1).lower() in {"reel", "reels"} else match.group(1).lower()
+                code = match.group(2)
+                out.extend([
+                    f"https://www.instagram.com/{kind}/{code}/embed/",
+                    f"https://www.instagram.com/{kind}/{code}/embed/captioned/",
+                ])
+        except Exception:
+            pass
+    return list(dict.fromkeys(out))
+
+
 def safe_remote_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
@@ -315,23 +355,25 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
         raise ValueError("Unknown download mode")
 
     last: Exception | None = None
-    seen: set[str] = set()
-    for fmt, extra in attempts:
-        if fmt in seen:
-            continue
-        seen.add(fmt)
-        try:
-            opts = dict(base)
-            opts["format"] = fmt
-            opts.update(extra)
-            with YoutubeDL(opts) as ydl:
-                ydl.download([url])
-            files = files_in(Path(tmpdir) / "ytdl")
-            if files:
-                return files
-        except Exception as exc:
-            last = exc
-            log.warning("yt-dlp %s failed: %s", fmt, str(exc)[:220])
+    seen: set[tuple[str, str]] = set()
+    for candidate in extractor_candidates(url):
+        for fmt, extra in attempts:
+            sig = (candidate, fmt)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            try:
+                opts = dict(base)
+                opts["format"] = fmt
+                opts.update(extra)
+                with YoutubeDL(opts) as ydl:
+                    ydl.download([candidate])
+                files = files_in(Path(tmpdir) / "ytdl")
+                if files:
+                    return files
+            except Exception as exc:
+                last = exc
+                log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), str(exc)[:220])
     if last:
         raise last
     return []
@@ -416,18 +458,23 @@ def download_open_graph(url: str, tmpdir: str) -> list[Path]:
 
 
 def friendly_error(platform: str, exc: Exception) -> str:
+    """User-safe errors only. Full extractor details stay in logs."""
     text = str(exc)
     low = text.lower()
-    label = PLATFORMS[platform]["label"]
+    label = PLATFORMS.get(platform, {}).get("label", "Media")
+    if any(x in low for x in ("login", "sign in", "cookies", "private", "empty media response")):
+        return f"{label}: this post currently requires access the bot does not have."
+    if "404" in low or "not found" in low:
+        return f"{label}: this link is unavailable, expired, or its public page changed."
     if "403" in low or "forbidden" in low:
-        return f"{label} refused this server's media request (HTTP 403)."
-    if "429" in low or "too many" in low:
-        return f"{label} rate-limited this server. Try again later."
-    if "login" in low or "cookies" in low or "private" in low:
-        return f"{label} did not expose this media as a public download."
+        return f"{label}: the platform blocked this download request."
+    if "429" in low or "too many" in low or "rate-limit" in low:
+        return f"{label}: temporarily rate-limited. Try again later."
     if "unsupported url" in low:
-        return f"This {label} URL type is not supported by the current extractor."
-    return f"{label} download failed: {text[:180]}"
+        return f"{label}: this link type is not supported yet."
+    if "telegram" in low and ("limit" in low or "fit" in low or "over" in low):
+        return "Telegram upload limit prevented this file from being sent."
+    return f"{label}: couldn't download this media right now."
 
 
 def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
@@ -444,11 +491,14 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     if not files and platform in {"instagram", "pinterest"} and mode in {"original", *VIDEO_PRESETS}:
         files = download_gallery(url, tmpdir)
     if not files:
-        try:
-            files = download_open_graph(url, tmpdir)
-        except Exception as exc:
-            if first_error is None:
-                first_error = exc
+        for page_url in public_page_candidates(url):
+            try:
+                files = download_open_graph(page_url, tmpdir)
+                if files:
+                    break
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
     if not files:
         if first_error:
             raise RuntimeError(friendly_error(platform, first_error)) from first_error
@@ -765,10 +815,11 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                 await status.edit_text(f"✅ Sent · {sent} file{'s' if sent != 1 else ''}")
             except Exception as exc:
                 log.exception("download job failed")
+                safe_message = friendly_error(platform, exc) if platform in PLATFORMS else "Download failed. Please try another link."
                 try:
-                    await status.edit_text(f"❌ {str(exc)[:350]}")
+                    await status.edit_text(f"❌ {safe_message}")
                 except TelegramError:
-                    await msg.reply_text(f"❌ {str(exc)[:350]}")
+                    await msg.reply_text(f"❌ {safe_message}")
             finally:
                 typing_task.cancel()
                 shutil.rmtree(tmp, ignore_errors=True)
