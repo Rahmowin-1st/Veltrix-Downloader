@@ -1448,34 +1448,6 @@ def split_video(path: Path, dest: Path) -> list[Path]:
     return sorted(p for p in dest.glob(f"{path.stem}.part*.mp4") if p.stat().st_size > 0)
 
 
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🎬 Video", callback_data="menu|video"), InlineKeyboardButton("🎵 Audio", callback_data="menu|audio")], [InlineKeyboardButton("📦 Original media", callback_data="dl|original")]])
-
-
-def video_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Best", callback_data="dl|best"), InlineKeyboardButton("4K", callback_data="dl|2160"), InlineKeyboardButton("1440p", callback_data="dl|1440")], [InlineKeyboardButton("1080p", callback_data="dl|1080"), InlineKeyboardButton("720p", callback_data="dl|720")], [InlineKeyboardButton("480p", callback_data="dl|480"), InlineKeyboardButton("360p", callback_data="dl|360")], [InlineKeyboardButton("‹ Back", callback_data="menu|main")]])
-
-
-def audio_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("MP3 320", callback_data="dl|mp3_320"), InlineKeyboardButton("MP3 192", callback_data="dl|mp3_192")], [InlineKeyboardButton("MP3 128", callback_data="dl|mp3_128"), InlineKeyboardButton("M4A", callback_data="dl|m4a")], [InlineKeyboardButton("‹ Back", callback_data="menu|main")]])
-
-
-def settings_kb(current: str) -> InlineKeyboardMarkup:
-    def label(key: str) -> str:
-        return ("• " if key == current else "") + VIDEO_PRESETS[key]["label"]
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label("1080"), callback_data="set|1080"), InlineKeyboardButton(label("720"), callback_data="set|720")], [InlineKeyboardButton(label("480"), callback_data="set|480"), InlineKeyboardButton(label("360"), callback_data="set|360")]])
-
-
-def link_caption(url: str, meta: dict[str, Any] | None) -> str:
-    label = platform_label(url)
-    if not meta:
-        return f"✅ {label} link\nChoose download type."
-    title = (meta.get("title") or "Media").strip()
-    duration = format_duration(meta.get("duration"))
-    extra = f"\n⏱ {duration}" if duration != "—" else ""
-    return f"✅ {label}\n{title}{extra}\n\nChoose download type."
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "⚡ Veltrix Downloader\n\n"
