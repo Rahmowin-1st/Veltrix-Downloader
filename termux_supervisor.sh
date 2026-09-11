@@ -23,9 +23,8 @@ while true; do
   RUNTIME=$((END_TS - START_TS))
   CHILD_PID=""
 
-  if [ "$CODE" -eq 0 ]; then
-    exit 0
-  fi
+  # Even a clean child exit is unexpected for a 24/7 polling bot. Restart it.
+  # The supervisor itself still exits cleanly when termux_start.sh sends TERM.
 
   # A long healthy run means the previous crash storm is over.
   if [ "$RUNTIME" -ge 120 ]; then
