@@ -16,6 +16,26 @@ if [ -z "${BOT_TOKEN:-}" ]; then
   exit 1
 fi
 
+echo "Veltrix preflight..."
+if ! python - <<'PY'
+import importlib
+for name in ("telegram", "yt_dlp", "gallery_dl", "pinterest_downloader", "httpx"):
+    importlib.import_module(name)
+PY
+then
+  echo "Dependencies changed; syncing Termux Python packages..."
+  python -m pip install -U --upgrade-strategy only-if-needed -r requirements-termux.txt
+fi
+
+python -m compileall -q bot.py
+for bin in ffmpeg ffprobe deno; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "Missing required runtime: $bin"
+    echo "Run: bash termux_setup.sh"
+    exit 1
+  fi
+done
+
 termux-wake-lock || true
 
 # Polling and webhook cannot be active at the same time. Keep pending updates so
