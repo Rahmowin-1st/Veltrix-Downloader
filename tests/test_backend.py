@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import bot
 
@@ -73,6 +75,45 @@ class BackendTests(unittest.TestCase):
         q720 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/a.mp4", "height": 720})
         q1080 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/b.mp4", "height": 1080})
         self.assertGreater(q720, q1080)
+
+    def test_snapchat_exact_story_is_selected(self):
+        doc = {
+            "query": {"snapID": "wanted"},
+            "props": {"pageProps": {
+                "spotlightFeed": {"spotlightStories": [
+                    {"story": {"storyId": {"value": "wrong"}}, "metadata": {"videoMetadata": {"contentUrl": "https://cf-st.sc-cdn.net/d/wrong"}}},
+                    {"story": {"storyId": {"value": "wanted"}}, "metadata": {"videoMetadata": {"contentUrl": "https://cf-st.sc-cdn.net/d/right", "thumbnailUrl": "https://cf-st.sc-cdn.net/i/right"}}},
+                ]}
+            }}
+        }
+        info = bot._snap_info_from_doc(doc, "https://www.snapchat.com/spotlight/wanted")
+        self.assertEqual(info["url"], "https://cf-st.sc-cdn.net/d/right")
+
+    def test_classify_real_media_types(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name, expected in [
+                ("a.jpg", "image"),
+                ("a.gif", "animation"),
+                ("a.mp4", "video"),
+                ("a.mp3", "audio"),
+            ]:
+                p = root / name
+                p.write_bytes(b"x")
+                self.assertEqual(bot.classify(p), expected)
+
+    def test_inline_action_is_bound_to_exact_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_dir, old_file = bot.DATA_DIR, bot.ACTIONS_FILE
+            try:
+                bot.DATA_DIR = Path(td)
+                bot.ACTIONS_FILE = Path(td) / "actions.json"
+                token = bot.create_action(7, "https://youtu.be/dQw4w9WgXcQ")
+                self.assertLessEqual(len("mp3|" + token), 64)
+                self.assertEqual(bot.resolve_action(7, token), "https://youtu.be/dQw4w9WgXcQ")
+                self.assertEqual(bot.resolve_action(8, token), "")
+            finally:
+                bot.DATA_DIR, bot.ACTIONS_FILE = old_dir, old_file
 
 
 if __name__ == "__main__":
