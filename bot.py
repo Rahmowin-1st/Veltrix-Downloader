@@ -1934,14 +1934,12 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str,
     """Fast MP3 path using the exact video already downloaded for this button."""
     lock = job_lock(uid)
     metric_add("jobs_started", 1)
-    if lock.locked():
+    was_queued = lock.locked()
+    if was_queued:
         metric_add("queued_jobs", 1)
         await edit_status(status, "⏳ Queued…")
 
     tmp = Path(tempfile.mkdtemp(prefix="vx_cache_"))
-    was_queued = lock.locked()
-    if was_queued:
-        metric_add("queued_jobs", 1)
     async with lock:
         if was_queued:
             metric_add("queued_jobs", -1)
@@ -1989,7 +1987,7 @@ async def run_job(
     was_queued = lock.locked()
     if status is None:
         status = await msg.reply_text("⬇️ Downloading…")
-    elif was_queued:
+    if was_queued:
         metric_add("queued_jobs", 1)
         await edit_status(status, "⏳ Queued…")
 
