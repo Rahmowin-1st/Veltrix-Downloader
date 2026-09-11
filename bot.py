@@ -36,7 +36,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "7.0.0"
+VERSION = "8.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
@@ -614,9 +614,105 @@ def probe_media(url: str) -> dict[str, Any]:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _instagram_format_score(fmt: dict[str, Any], kind: str) -> tuple[int, int, int]:
+    """Choose Instagram media by the same 720-first policy as the bot."""
+    width = int(fmt.get("width") or 0)
+    height = int(fmt.get("height") or 0)
+    area = width * height
+    if kind != "video":
+        return (area, width, height)
+
+    if height == 720:
+        tier = 1000
+    elif height == 1080:
+        tier = 950
+    elif 0 < height < 720:
+        tier = 800 + height
+    elif height > 1080:
+        tier = 700 - min(height - 1080, 600)
+    else:
+        tier = 500
+    audio = 1 if fmt.get("has_audio") else 0
+    return (tier, audio, area)
+
+
+def extract_instagram_public(url: str) -> dict[str, Any]:
+    """Dedicated public Instagram metadata path for Reels/posts/carousels."""
+    from parth_dl import InstagramDownloader
+
+    downloader = InstagramDownloader(
+        verbose=False,
+        rate_limit=True,
+        quiet=True,
+        overwrite=True,
+    )
+    info = downloader.get_info(url)
+    return info if isinstance(info, dict) else {}
+
+
+def download_instagram_dedicated(url: str, tmpdir: str) -> tuple[list[Path], str]:
+    """Download exact Instagram entries in original carousel order."""
+    try:
+        info = extract_instagram_public(url)
+    except Exception as exc:
+        log.info("Instagram dedicated metadata failed: %s", str(exc)[:180])
+        return [], ""
+
+    entries = info.get("entries") if isinstance(info.get("entries"), list) else []
+    if not entries:
+        return [], str(info.get("type") or "").lower()
+
+    dest = Path(tmpdir) / "instagram"
+    dest.mkdir(parents=True, exist_ok=True)
+    outputs: list[Path] = []
+
+    for index, entry in enumerate(entries[:MAX_GALLERY_ITEMS], 1):
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "").lower()
+        if kind not in {"video", "image"}:
+            continue
+        formats = [
+            fmt for fmt in (entry.get("formats") or [])
+            if isinstance(fmt, dict) and fmt.get("url")
+        ]
+        formats.sort(key=lambda fmt: _instagram_format_score(fmt, kind), reverse=True)
+
+        for fmt in formats:
+            media_url = str(fmt.get("url") or "")
+            if not media_url or not safe_remote_url(media_url):
+                continue
+            path_ext = Path(urlparse(media_url).path).suffix.lower()
+            if kind == "video":
+                ext = path_ext if path_ext in {".mp4", ".m4v", ".mov", ".webm"} else ".mp4"
+            else:
+                ext = path_ext if path_ext in {".jpg", ".jpeg", ".png", ".webp", ".avif"} else ".jpg"
+            out = dest / f"{index:02d}_{kind}{ext}"
+            if _download_direct_file(media_url, out, referer="https://www.instagram.com/"):
+                outputs.append(out)
+                break
+
+    return sanitize_media_files(outputs), str(info.get("type") or "").lower()
+
+
 def preview_media(url: str) -> dict[str, Any]:
     """Best-effort preview metadata. Never blocks the actual download path."""
-    if platform_of(url) == "snapchat":
+    platform = platform_of(url)
+
+    if platform == "instagram":
+        try:
+            insta = extract_instagram_public(url)
+            entries = insta.get("entries") if isinstance(insta.get("entries"), list) else []
+            return {
+                "title": str(insta.get("title") or "Instagram media")[:180],
+                "duration": insta.get("duration") or 0,
+                "format_count": sum(len(e.get("formats") or []) for e in entries if isinstance(e, dict)),
+                "thumbnail": str(insta.get("thumbnail") or ""),
+            }
+        except Exception as exc:
+            log.info("Instagram preview unavailable: %s", str(exc)[:160])
+
+    if platform == "snapchat":
         try:
             snap = extract_snapchat_public(url)
             if snap.get("url"):
@@ -1428,10 +1524,8 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
         elif expected_type in {"image", "gif"} and len(gallery_items) > 1:
             files = gallery_items
 
-    elif platform == "instagram" and not is_video_post_url(url):
-        # gallery-dl handles Instagram multi-item posts/carousels better than
-        # a single-video extractor and preserves all public media items.
-        files = download_gallery(url, tmpdir)
+    elif platform == "instagram":
+        files, expected_type = download_instagram_dedicated(url, tmpdir)
 
     if not files:
         try:
