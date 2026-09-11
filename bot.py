@@ -1128,9 +1128,11 @@ def _download_direct_file(
                                     raise RuntimeError("media too large")
                                 fh.write(chunk)
 
-                        if out.exists() and out.stat().st_size > 0:
-                            return True
-                        raise RuntimeError("empty media response")
+                        if total <= 0 or not out.exists() or out.stat().st_size <= 0:
+                            raise RuntimeError("empty media response")
+                        if length and total != length:
+                            raise RuntimeError(f"incomplete media response: {total}/{length}")
+                        return True
                 else:
                     raise RuntimeError("too many media redirects")
 
