@@ -1434,6 +1434,11 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
         except Exception as exc:
             first_error = exc
 
+    # Instagram's dedicated gallery extractor is safer than generic page scraping:
+    # use it before parsing page-wide JSON that may contain recommendations.
+    if not files and platform == "instagram" and mode in {"original", AUTO_MODE, *VIDEO_PRESETS}:
+        files = download_gallery(resolve_public_redirect(url), tmpdir)
+
     if not files:
         for page_url in public_page_candidates(url):
             try:
