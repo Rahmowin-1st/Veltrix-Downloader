@@ -1669,9 +1669,54 @@ def media_duration(path: Path) -> float:
     return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
 
 
+def image_dimensions(path: Path) -> tuple[int, int]:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return (0, 0)
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "json", str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=15,
+        )
+        streams = (json.loads(proc.stdout or "{}").get("streams") or [])
+        if streams and isinstance(streams[0], dict):
+            return (int(streams[0].get("width") or 0), int(streams[0].get("height") or 0))
+    except Exception:
+        pass
+    return (0, 0)
+
+
+def telegram_photo_ready(path: Path) -> bool:
+    """Conservative sendPhoto preflight: valid container, size, dimensions and aspect."""
+    try:
+        if path.stat().st_size <= 0 or path.stat().st_size > MAX_PHOTO_BYTES:
+            return False
+        with path.open("rb") as fh:
+            head = fh.read(16)
+        jpeg = head.startswith(b"\xff\xd8\xff")
+        png = head.startswith(b"\x89PNG\r\n\x1a\n")
+        if not (jpeg or png):
+            return False
+        width, height = image_dimensions(path)
+        if width <= 0 or height <= 0:
+            return False
+        if width + height > 10000:
+            return False
+        ratio = max(width / height, height / width)
+        return ratio <= 20
+    except (OSError, ZeroDivisionError):
+        return False
+
+
 def fit_image(path: Path, dest: Path) -> Path:
-    """Keep visual media as Telegram photo instead of falling back to document."""
-    if path.stat().st_size <= MAX_PHOTO_BYTES and path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+    """Keep visual media native only when it is guaranteed to fit Telegram photo rules."""
+    if telegram_photo_ready(path):
         return path
     dest.mkdir(parents=True, exist_ok=True)
     for width, quality in ((4096, 4), (3072, 6), (2048, 8), (1600, 10)):
