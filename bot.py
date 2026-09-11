@@ -33,11 +33,11 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 MAX_BYTES = int(os.getenv("TELEGRAM_MAX_BYTES", str(48 * 1024 * 1024)))
-MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(300 * 1024 * 1024)))
+MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(1024 * 1024 * 1024)))
 MAX_PHOTO_BYTES = int(os.getenv("MAX_PHOTO_BYTES", str(9 * 1024 * 1024)))
 MAX_GALLERY_ITEMS = max(1, min(int(os.getenv("MAX_GALLERY_ITEMS", "20")), 40))
 MAX_CONCURRENT_JOBS = max(1, min(int(os.getenv("MAX_CONCURRENT_JOBS", "1")), 3))
@@ -75,7 +75,7 @@ AUDIO_PRESETS = {
     "mp3_128": {"label": "MP3 128", "codec": "mp3", "bitrate": "128"},
     "m4a": {"label": "M4A", "codec": "m4a", "bitrate": "192"},
 }
-DEFAULT_QUALITY = "720"
+DEFAULT_QUALITY = "720"\nAUTO_MODE = "auto"
 
 
 def ensure_ffmpeg() -> None:
@@ -307,9 +307,41 @@ def probe_media(url: str) -> dict[str, Any]:
             "title": str(info.get("title") or info.get("description") or "Media")[:180],
             "duration": info.get("duration") or 0,
             "format_count": len(info.get("formats") or []),
+            "thumbnail": str(info.get("thumbnail") or ""),
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def preview_media(url: str) -> dict[str, Any]:
+    """Best-effort preview metadata. Never blocks the actual download path."""
+    try:
+        return probe_media(url)
+    except Exception as first:
+        log.info("preview extractor unavailable: %s", str(first)[:160])
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0 Mobile Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for page_url in public_page_candidates(url):
+        try:
+            with httpx.Client(headers=headers, follow_redirects=True, timeout=12, proxy=PROXY or None) as client:
+                response = client.get(page_url)
+                response.raise_for_status()
+            title = ""
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", response.text, flags=re.I | re.S)
+            if title_match:
+                title = re.sub(r"\s+", " ", html.unescape(title_match.group(1))).strip()
+            thumbs = og_values(response.text, {"og:image", "og:image:url", "twitter:image"})
+            return {
+                "title": title[:180] or "Media",
+                "duration": 0,
+                "format_count": 0,
+                "thumbnail": urljoin(str(response.url), thumbs[0]) if thumbs else "",
+            }
+        except Exception as exc:
+            log.info("preview page unavailable: %s", str(exc)[:120])
+    return {"title": "Media", "duration": 0, "format_count": 0, "thumbnail": ""}
 
 
 def files_in(root: Path) -> list[Path]:
@@ -337,7 +369,25 @@ def video_chain(height: int) -> list[str]:
 def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     base = base_ydl_opts(tmpdir)
     attempts: list[tuple[str, dict[str, Any]]] = []
-    if mode == "original":
+    if mode == AUTO_MODE:
+        # Preference: 720p -> 1080p -> best <=720 -> 480p -> 360p -> any best.
+        # Social platforms often expose only one combined stream, so each rung
+        # includes both split A/V and combined-file fallbacks.
+        auto_chain = [
+            "bv*[height=720]+ba/b[height=720]",
+            "bv*[height=1080]+ba/b[height=1080]",
+            "bv*[height<=720]+ba/b[height<=720]",
+            "best[height<=720]",
+            "bv*[height=480]+ba/b[height=480]",
+            "best[height<=480]",
+            "bv*[height=360]+ba/b[height=360]",
+            "best[height<=360]",
+            "18",
+            "best",
+            "b",
+        ]
+        attempts = [(fmt, {}) for fmt in auto_chain]
+    elif mode == "original":
         attempts = [("best", {}), ("bv*+ba/b", {})]
     elif mode in VIDEO_PRESETS:
         attempts = [(fmt, {}) for fmt in video_chain(int(VIDEO_PRESETS[mode]["height"]))]
@@ -488,7 +538,7 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
         files = download_ytdlp(url, mode, tmpdir)
     except Exception as exc:
         first_error = exc
-    if not files and platform in {"instagram", "pinterest"} and mode in {"original", *VIDEO_PRESETS}:
+    if not files and platform in {"instagram", "pinterest"} and mode in {"original", AUTO_MODE, *VIDEO_PRESETS}:
         files = download_gallery(url, tmpdir)
     if not files:
         for page_url in public_page_candidates(url):
@@ -622,16 +672,48 @@ def link_caption(url: str, meta: dict[str, Any] | None) -> str:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("⚡ Veltrix Downloader\n\nYouTube • Instagram • Snapchat • Pinterest\nSend a public media link → choose Video / Audio / Original.")
+    await update.effective_message.reply_text(
+        "⚡ Veltrix Downloader\n\n"
+        "YouTube • Instagram • Snapchat • Pinterest\n"
+        "Send a media link — I download it automatically."
+    )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("📥 YouTube • Instagram • Snapchat • Pinterest\n🎬 Best / 4K / 1440p / 1080p / 720p / 480p / 360p\n🎵 MP3 320 / 192 / 128 • M4A\n📦 Original media and supported carousels\nLarge media is compressed or split to fit Telegram's hosted bot upload limit.")
+    await update.effective_message.reply_text(
+        "📥 Send a YouTube, Instagram, Snapchat or Pinterest media link.\n"
+        "🎬 Automatic quality: prefers 720p, then 1080p, then lower fallbacks.\n"
+        "🎵 After a video is sent, tap MP3 to get audio."
+    )
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    quality = user_row(update.effective_user.id)["quality"]
-    await update.effective_message.reply_text(f"Default video: {VIDEO_PRESETS[quality]['label']}", reply_markup=settings_kb(quality))
+    await update.effective_message.reply_text("⚙️ Quality is automatic. No setup needed.")
+
+
+async def make_downloading_status(msg, url: str, platform: str, meta: dict[str, Any]):
+    label = PLATFORMS[platform]["label"]
+    title = str(meta.get("title") or "").strip()
+    caption = f"⬇️ Downloading from {label}…"
+    if title and title != "Media":
+        caption += f"\n{title[:160]}"
+    thumb = str(meta.get("thumbnail") or "").strip()
+    if thumb and safe_remote_url(thumb):
+        try:
+            return await msg.reply_photo(photo=thumb, caption=caption)
+        except Exception as exc:
+            log.info("thumbnail preview failed: %s", str(exc)[:120])
+    return await msg.reply_text(caption)
+
+
+async def edit_status(status, text: str, reply_markup=None) -> None:
+    try:
+        if getattr(status, "photo", None):
+            await status.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await status.edit_text(text, reply_markup=reply_markup)
+    except TelegramError:
+        pass
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -639,20 +721,19 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     url = extract_url(msg.text or msg.caption or "")
     if not url:
-        await msg.reply_text("Send a YouTube, Instagram, Snapchat or Pinterest link.")
         return
     platform = platform_of(url)
     if not platform:
-        await msg.reply_text("Only YouTube, Instagram, Snapchat and Pinterest are supported.")
         return
     patch_user(uid, last_url=url)
-    status = await msg.reply_text(f"🔎 Reading {PLATFORMS[platform]['label']} link…")
-    meta: dict[str, Any] | None = None
+
     try:
-        meta = await asyncio.wait_for(asyncio.to_thread(probe_media, url), timeout=35)
-    except Exception as exc:
-        log.info("metadata unavailable for %s: %s", platform, str(exc)[:160])
-    await status.edit_text(link_caption(url, meta), reply_markup=main_menu())
+        meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=18)
+    except Exception:
+        meta = {"title": "Media", "thumbnail": ""}
+
+    status = await make_downloading_status(msg, url, platform, meta)
+    await run_job(msg, context, uid, url, AUTO_MODE, status)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -660,32 +741,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
     data = q.data or ""
     uid = q.from_user.id
-    if data.startswith("set|"):
-        quality = data.split("|", 1)[1]
-        if quality in VIDEO_PRESETS:
-            patch_user(uid, quality=quality)
-            await q.edit_message_text(f"Default video: {VIDEO_PRESETS[quality]['label']}")
+    # New UX exposes only one action after a successful video: MP3.
+    if data != "dl|mp3_192":
         return
-    if data == "menu|main":
-        await q.edit_message_reply_markup(reply_markup=main_menu())
-        return
-    if data == "menu|video":
-        await q.edit_message_reply_markup(reply_markup=video_menu())
-        return
-    if data == "menu|audio":
-        await q.edit_message_reply_markup(reply_markup=audio_menu())
-        return
-    if not data.startswith("dl|"):
-        return
-    mode = data.split("|", 1)[1]
-    if mode not in {*VIDEO_PRESETS, *AUDIO_PRESETS, "original"}:
-        return
+    mode = "mp3_192"
     url = user_row(uid).get("last_url") or ""
     if not url:
         await q.edit_message_text("Send the link again.")
         return
-    label = "Original media" if mode == "original" else (VIDEO_PRESETS.get(mode) or AUDIO_PRESETS.get(mode))["label"]
-    await q.edit_message_text(f"⬇️ Downloading…\n{label}")
+    await edit_status(q.message, "⬇️ Converting to MP3…")
     await run_job(q.message, context, uid, url, mode, q.message)
 
 
@@ -729,17 +793,17 @@ async def send_album(msg, paths: list[Path], caption: str) -> int:
                 pass
 
 
-async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path) -> int:
+async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, reply_markup=None) -> int:
     final = path
     if final.stat().st_size > MAX_BYTES:
         final = await asyncio.to_thread(fit_video, final, tmp / "fit", max_height)
     if final.stat().st_size <= MAX_BYTES:
         with final.open("rb") as fh:
             try:
-                await msg.reply_video(video=fh, caption=caption, filename=final.name, supports_streaming=True)
+                await msg.reply_video(video=fh, caption=caption, filename=final.name, supports_streaming=True, reply_markup=reply_markup)
             except TelegramError:
                 fh.seek(0)
-                await msg.reply_document(document=fh, caption=caption, filename=final.name)
+                await msg.reply_document(document=fh, caption=caption, filename=final.name, reply_markup=reply_markup)
         return 1
     parts = await asyncio.to_thread(split_video, final, tmp / "parts")
     if not parts or any(p.stat().st_size > MAX_BYTES for p in parts):
@@ -788,7 +852,10 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                 videos = [p for p in files if classify(p) == "video"]
                 audios = [p for p in files if classify(p) == "audio"]
                 sent = 0
+                video_sent = False
                 caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
+                mp3_button = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MP3", callback_data="dl|mp3_192")]])
+
                 if mode in AUDIO_PRESETS:
                     sources = audios or videos
                     if not sources:
@@ -799,27 +866,30 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                     if images:
                         sent += await send_images(msg, images, caption)
                     for video in videos:
-                        sent += await send_video(msg, video, caption, 2160, tmp)
+                        sent += await send_video(msg, video, caption, 2160, tmp, mp3_button)
+                        video_sent = True
                     for audio in audios:
                         sent += await send_audio(msg, audio, caption, "mp3_192", tmp)
                 else:
-                    requested = int(VIDEO_PRESETS[mode]["height"])
+                    requested = 720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"])
                     if images and not videos:
                         sent += await send_images(msg, images, caption)
                     for video in videos:
-                        sent += await send_video(msg, video, caption, requested, tmp)
+                        sent += await send_video(msg, video, caption, requested, tmp, mp3_button)
+                        video_sent = True
                     if not videos and audios:
-                        raise RuntimeError("This link exposes audio only; choose Audio.")
+                        raise RuntimeError("This media exposes audio only.")
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned.")
-                await status.edit_text(f"✅ Sent · {sent} file{'s' if sent != 1 else ''}")
+                done_markup = mp3_button if video_sent else None
+                await edit_status(status, f"✅ Sent · {sent} file{'s' if sent != 1 else ''}", done_markup)
             except Exception as exc:
                 log.exception("download job failed")
                 safe_message = friendly_error(platform, exc) if platform in PLATFORMS else "Download failed. Please try another link."
                 try:
-                    await status.edit_text(f"❌ {safe_message}")
-                except TelegramError:
-                    await msg.reply_text(f"❌ {safe_message}")
+                    await edit_status(status, f"❌ {safe_message}")
+                except Exception:
+                    await msg.reply_text("❌ Download failed.")
             finally:
                 typing_task.cancel()
                 shutil.rmtree(tmp, ignore_errors=True)
