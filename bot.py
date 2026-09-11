@@ -975,9 +975,16 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
                 with YoutubeDL(opts) as ydl:
                     ydl.download([candidate])
                 files = files_in(attempt_dir)
-                complete = [p for p in files if p.suffix.lower() not in {".part", ".ytdl"}]
+                complete = sanitize_media_files(
+                    [p for p in files if p.suffix.lower() not in {".part", ".ytdl"}]
+                )
+                if mode in AUDIO_PRESETS:
+                    complete = [p for p in complete if classify(p) in {"audio", "video", "animation"}]
+                elif platform_of(url) == "youtube" or is_video_post_url(url):
+                    complete = [p for p in complete if classify(p) == "video"]
                 if complete:
                     return complete
+                shutil.rmtree(attempt_dir, ignore_errors=True)
             except Exception as exc:
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), str(exc)[:220])
@@ -1038,21 +1045,37 @@ def _download_direct_file(
             with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout, proxy=PROXY or None) as client:
                 with client.stream("GET", media_url) as response:
                     response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if (
+                        content_type.startswith("text/")
+                        or content_type in {"application/json", "application/xml", "text/html"}
+                    ):
+                        raise RuntimeError(f"non-media response: {content_type or 'unknown'}")
                     length = int(response.headers.get("content-length") or 0)
                     if length and length > MAX_SOURCE_BYTES:
                         return False
                     total = 0
                     out.parent.mkdir(parents=True, exist_ok=True)
-                    with out.open("wb") as fh:
+                    part = out.with_suffix(out.suffix + ".part")
+                    part.unlink(missing_ok=True)
+                    with part.open("wb") as fh:
                         for chunk in response.iter_bytes(1024 * 1024):
                             total += len(chunk)
                             if total > MAX_SOURCE_BYTES:
                                 raise RuntimeError("media too large")
                             fh.write(chunk)
+                    if total <= 0:
+                        raise RuntimeError("empty media response")
+                    part.replace(out)
             if out.exists() and out.stat().st_size > 0:
                 return True
         except Exception as exc:
             last_error = exc
+            try:
+                out.unlink(missing_ok=True)
+                out.with_suffix(out.suffix + ".part").unlink(missing_ok=True)
+            except OSError:
+                pass
             if attempt < 3:
                 time.sleep(0.7 * (2 ** (attempt - 1)))
     if last_error:
