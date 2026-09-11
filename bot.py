@@ -730,38 +730,72 @@ def _pinterest_quality_score(fmt: dict[str, Any]) -> tuple[int, int, int]:
     return (progressive, tier, h)
 
 
-def download_pinterest_dedicated(url: str, tmpdir: str) -> list[Path]:
-    """Use a Pinterest-specific public-data extractor before generic fallbacks."""
+def _download_direct_file(
+    media_url: str,
+    out: Path,
+    *,
+    referer: str,
+    timeout: int = 45,
+) -> bool:
+    if not safe_remote_url(media_url):
+        return False
+    headers = {"User-Agent": DESKTOP_UA, "Referer": referer, "Accept": "*/*"}
+    try:
+        with httpx.Client(headers=headers, follow_redirects=True, timeout=timeout, proxy=PROXY or None) as client:
+            with client.stream("GET", media_url) as response:
+                response.raise_for_status()
+                length = int(response.headers.get("content-length") or 0)
+                if length and length > MAX_SOURCE_BYTES:
+                    return False
+                total = 0
+                out.parent.mkdir(parents=True, exist_ok=True)
+                with out.open("wb") as fh:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        total += len(chunk)
+                        if total > MAX_SOURCE_BYTES:
+                            raise RuntimeError("media too large")
+                        fh.write(chunk)
+        return out.exists() and out.stat().st_size > 0
+    except Exception as exc:
+        log.info("direct media download failed: %s", str(exc)[:160])
+        return False
+
+
+def download_pinterest_dedicated(url: str, tmpdir: str) -> tuple[list[Path], str]:
+    """Return the exact Pinterest media and the platform-reported media type."""
     try:
         from pinterest_downloader import Pinterest
     except Exception as exc:
         log.info("Pinterest dedicated extractor unavailable: %s", exc)
-        return []
+        return [], ""
 
+    resolved = resolve_public_redirect(url)
     proxies = {"http": PROXY, "https": PROXY} if PROXY else None
     try:
         client = Pinterest(timeout=25, proxies=proxies)
-        result = client.get_pin(url)
+        result = client.get_pin(resolved)
     except Exception as exc:
         log.info("Pinterest dedicated metadata failed: %s", str(exc)[:180])
-        return []
+        return [], ""
 
     if not isinstance(result, dict) or not result.get("ok"):
-        log.info("Pinterest dedicated extractor returned no pin: %s", str(result.get("error") if isinstance(result, dict) else result)[:160])
-        return []
+        log.info(
+            "Pinterest dedicated extractor returned no pin: %s",
+            str(result.get("error") if isinstance(result, dict) else result)[:160],
+        )
+        return [], ""
 
     pin = result.get("pin") or {}
-    video = pin.get("video") or {}
-    formats = [f for f in (video.get("formats") or []) if isinstance(f, dict) and f.get("url")]
-    if not formats:
-        return []
-
-    formats.sort(key=_pinterest_quality_score, reverse=True)
+    media_type = str(pin.get("media_type") or "").lower()
     dest = Path(tmpdir) / "pinterest"
     dest.mkdir(parents=True, exist_ok=True)
 
-    headers = {**request_headers(url), "Referer": "https://www.pinterest.com/"}
-    with httpx.Client(headers=headers, follow_redirects=True, timeout=40, proxy=PROXY or None) as http:
+    if media_type == "video":
+        video = pin.get("video") or {}
+        formats = [f for f in (video.get("formats") or []) if isinstance(f, dict) and f.get("url")]
+        formats.sort(key=_pinterest_quality_score, reverse=True)
+        headers = {**request_headers(resolved), "Referer": "https://www.pinterest.com/"}
+
         for index, fmt in enumerate(formats, 1):
             media_url = str(fmt.get("url") or "")
             if not safe_remote_url(media_url):
@@ -775,30 +809,41 @@ def download_pinterest_dedicated(url: str, tmpdir: str) -> list[Path]:
                         ydl.download([media_url])
                     found = [p for p in files_in(Path(tmpdir) / "ytdl") if classify(p) == "video"]
                     if found:
-                        return found[:1]
+                        return found[:1], "video"
                 except Exception as exc:
                     log.info("Pinterest HLS fallback failed: %s", str(exc)[:140])
                 continue
-            try:
-                with http.stream("GET", media_url) as response:
-                    response.raise_for_status()
-                    length = int(response.headers.get("content-length") or 0)
-                    if length and length > MAX_SOURCE_BYTES:
-                        continue
-                    ext = Path(urlparse(media_url).path).suffix or ".mp4"
-                    out = dest / f"pin_video_{index}{ext}"
-                    total = 0
-                    with out.open("wb") as fh:
-                        for chunk in response.iter_bytes(1024 * 1024):
-                            total += len(chunk)
-                            if total > MAX_SOURCE_BYTES:
-                                raise RuntimeError("Pinterest media too large")
-                            fh.write(chunk)
-                if out.exists() and out.stat().st_size:
-                    return [out]
-            except Exception as exc:
-                log.info("Pinterest progressive fallback failed: %s", str(exc)[:140])
-    return []
+
+            ext = Path(urlparse(media_url).path).suffix or ".mp4"
+            out = dest / f"pin_video_{index}{ext}"
+            if _download_direct_file(media_url, out, referer="https://www.pinterest.com/"):
+                return [out], "video"
+        return [], "video"
+
+    images = pin.get("images") if isinstance(pin.get("images"), dict) else {}
+    image_url = ""
+    for size_key in ("orig", "736x", "474x", "236x", "170x"):
+        item = images.get(size_key)
+        if isinstance(item, dict) and item.get("url"):
+            image_url = str(item["url"])
+            break
+    if not image_url and images:
+        for item in images.values():
+            if isinstance(item, dict) and item.get("url"):
+                image_url = str(item["url"])
+                break
+
+    if image_url:
+        ext = Path(urlparse(image_url).path).suffix
+        if not ext:
+            ext = ".gif" if media_type == "gif" else ".jpg"
+        out = dest / f"pin_media{ext}"
+        if _download_direct_file(image_url, out, referer="https://www.pinterest.com/"):
+            return [out], media_type or "image"
+
+    return [], media_type
+
+
 
 
 def download_gallery(url: str, tmpdir: str) -> list[Path]:
@@ -817,12 +862,10 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
     except Exception as exc:
         log.warning("gallery-dl error: %s", exc)
     items = files_in(dest)
-    def natural_key(path: Path):
-        return [int(x) if x.isdigit() else x.lower() for x in re.split(r"(\d+)", path.name)]
-    items.sort(key=natural_key)
+    # gallery-dl writes carousel items sequentially; files_in preserves that
+    # download order. Do not re-sort by hash-like filenames.
     if is_video_post_url(url):
-        videos = [p for p in items if classify(p) == "video"]
-        return videos
+        return [p for p in items if classify(p) == "video"]
     return items
 
 
