@@ -48,8 +48,9 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
 ACTIONS_FILE = DATA_DIR / "actions.json"
 CACHE_DIR = DATA_DIR / "cache"
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(2 * 3600)))
-CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(3600)))
+CACHE_MAX_BYTES = int(os.getenv("CACHE_MAX_BYTES", str(384 * 1024 * 1024)))
+CACHE_TOTAL_MAX_BYTES = int(os.getenv("CACHE_TOTAL_MAX_BYTES", str(768 * 1024 * 1024)))
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -224,6 +225,7 @@ def _save_actions(data: dict[str, dict[str, Any]]) -> None:
 def cleanup_media_cache() -> None:
     now = time.time()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    files: list[Path] = []
     try:
         for path in CACHE_DIR.iterdir():
             if not path.is_file():
@@ -231,13 +233,38 @@ def cleanup_media_cache() -> None:
             try:
                 if now - path.stat().st_mtime > CACHE_TTL_SECONDS:
                     path.unlink(missing_ok=True)
+                elif path.exists():
+                    files.append(path)
             except OSError:
                 continue
+    except OSError:
+        return
+
+    # Bound total cache size so repeated large videos cannot fill phone storage.
+    try:
+        files = [p for p in files if p.exists()]
+        total = sum(p.stat().st_size for p in files)
+        if total > CACHE_TOTAL_MAX_BYTES:
+            for path in sorted(files, key=lambda p: p.stat().st_mtime):
+                if total <= CACHE_TOTAL_MAX_BYTES:
+                    break
+                try:
+                    size = path.stat().st_size
+                    path.unlink(missing_ok=True)
+                    total -= size
+                except OSError:
+                    continue
     except OSError:
         pass
 
 
-def create_action(uid: int, url: str, source_path: Path | None = None, title: str = "") -> str:
+def create_action(
+    uid: int,
+    url: str,
+    source_path: Path | None = None,
+    title: str = "",
+    item_index: int = 0,
+) -> str:
     """Bind an inline action to the exact request and optionally cache its source."""
     now = int(time.time())
     raw = f"{uid}:{url}:{time.time_ns()}".encode()
@@ -269,6 +296,7 @@ def create_action(uid: int, url: str, source_path: Path | None = None, title: st
             "created_at": now,
             "cache_path": cache_path,
             "title": safe_media_title(title) if title else "",
+            "item_index": max(0, int(item_index)),
         }
         if len(actions) > 1500:
             newest = sorted(
@@ -304,8 +332,20 @@ def resolve_action(uid: int, token: str) -> str:
     return str(resolve_action_data(uid, token).get("url") or "")
 
 
-def mp3_button(uid: int, url: str, source_path: Path | None = None, title: str = "") -> InlineKeyboardMarkup:
-    token = create_action(uid, url, source_path=source_path, title=title)
+def mp3_button(
+    uid: int,
+    url: str,
+    source_path: Path | None = None,
+    title: str = "",
+    item_index: int = 0,
+) -> InlineKeyboardMarkup:
+    token = create_action(
+        uid,
+        url,
+        source_path=source_path,
+        title=title,
+        item_index=item_index,
+    )
     return InlineKeyboardMarkup([[InlineKeyboardButton("🎵 MP3", callback_data=f"mp3|{token}")]])
 
 
@@ -1604,7 +1644,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             status,
         )
     else:
-        await run_job(q.message, context, uid, url, "mp3_192", status)
+        await run_job(
+            q.message,
+            context,
+            uid,
+            url,
+            "mp3_192",
+            status,
+            selected_audio_index=int(action.get("item_index") or 0),
+        )
 
 
 def telegram_retry_delay(exc: Exception, attempt: int) -> float:
@@ -1813,7 +1861,15 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str,
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> None:
+async def run_job(
+    msg,
+    context,
+    uid: int,
+    url: str,
+    mode: str,
+    status=None,
+    selected_audio_index: int | None = None,
+) -> None:
     lock = job_lock(uid)
     metric_add("jobs_started", 1)
     if status is None:
@@ -1856,6 +1912,10 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                     sources = [p for p, kind in zip(files, kinds) if kind in {"audio", "video", "animation"}]
                     if not sources:
                         raise RuntimeError("No audio/video stream was found in this post.")
+                    if selected_audio_index is not None:
+                        if selected_audio_index < 0 or selected_audio_index >= len(sources):
+                            raise RuntimeError("Requested media item is no longer available.")
+                        sources = [sources[selected_audio_index]]
                     for index, source in enumerate(sources):
                         sent += await send_audio(
                             msg,
@@ -1867,6 +1927,7 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                         )
                 else:
                     requested = 2160 if mode == "original" else (720 if mode == AUTO_MODE else int(VIDEO_PRESETS[mode]["height"]))
+                    video_rank = 0
                     for index, (path, kind) in enumerate(zip(files, kinds)):
                         item_caption = caption if sent == 0 else ""
                         if kind == "image":
@@ -1879,7 +1940,9 @@ async def run_job(msg, context, uid: int, url: str, mode: str, status=None) -> N
                                 url,
                                 source_path=path,
                                 title=str(meta.get("title") or ""),
+                                item_index=video_rank,
                             )
+                            video_rank += 1
                             sent += await send_video(
                                 msg,
                                 path,
