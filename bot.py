@@ -31,7 +31,7 @@ import httpx
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 
@@ -795,7 +795,8 @@ def _pinterest_quality_score(fmt: dict[str, Any]) -> tuple[int, int, int]:
         tier = 70
     else:
         tier = 60
-    return (progressive, tier, h)
+    # Quality preference is authoritative; progressive MP4 only breaks ties.
+    return (tier, progressive, h)
 
 
 def _download_direct_file(
@@ -1097,7 +1098,11 @@ def download_public_page_media(url: str, tmpdir: str) -> list[Path]:
                     length = int(media.headers.get("content-length") or 0)
                     if length and length > MAX_SOURCE_BYTES:
                         continue
-                    ext = mimetypes.guess_extension(content_type) or Path(urlparse(media_url).path).suffix or (".mp4" if known_snap_video else ".bin")
+                    ext = (
+                        ".mp4"
+                        if known_snap_video
+                        else (mimetypes.guess_extension(content_type) or Path(urlparse(media_url).path).suffix or ".bin")
+                    )
                     if ext == ".jpe":
                         ext = ".jpg"
                     out = dest / f"media_{index:02d}{ext}"
@@ -1560,12 +1565,42 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await run_job(q.message, context, uid, url, "mp3_192", status)
 
 
+def telegram_retry_delay(exc: Exception, attempt: int) -> float:
+    if isinstance(exc, RetryAfter):
+        value = getattr(exc, "retry_after", 1)
+        try:
+            seconds = value.total_seconds() if hasattr(value, "total_seconds") else float(value)
+            return max(1.0, min(seconds + 0.5, 30.0))
+        except Exception:
+            return 2.0
+    return float(min(2 ** attempt, 8))
+
+
+async def _retry_telegram(call, attempts: int = 3):
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await call()
+        except (RetryAfter, TimedOut, NetworkError) as exc:
+            last = exc
+            if attempt + 1 >= attempts:
+                break
+            await asyncio.sleep(telegram_retry_delay(exc, attempt))
+    if last:
+        raise last
+    raise RuntimeError("Telegram operation failed")
+
+
 async def send_image(msg, path: Path, caption: str, tmp: Path) -> int:
     final = await asyncio.to_thread(fit_image, path, tmp / "fit_images")
     if final.stat().st_size > MAX_PHOTO_BYTES:
         raise RuntimeError("Photo could not be fitted for Telegram.")
-    with final.open("rb") as fh:
-        await msg.reply_photo(photo=fh, caption=caption or None)
+
+    async def send_once():
+        with final.open("rb") as fh:
+            return await msg.reply_photo(photo=fh, caption=caption or None)
+
+    await _retry_telegram(send_once)
     return 1
 
 
@@ -1575,20 +1610,26 @@ async def send_animation(msg, path: Path, caption: str, tmp: Path) -> int:
         final = await asyncio.to_thread(fit_animation, final, tmp / "fit_animation")
     if final.stat().st_size > MAX_BYTES:
         raise RuntimeError("Animation could not be fitted for Telegram.")
-    with final.open("rb") as fh:
-        await msg.reply_animation(animation=fh, caption=caption or None, filename=final.name)
+
+    async def send_once():
+        with final.open("rb") as fh:
+            return await msg.reply_animation(animation=fh, caption=caption or None, filename=final.name)
+
+    await _retry_telegram(send_once)
     return 1
 
 
 async def _send_video_file(msg, path: Path, caption: str, reply_markup=None) -> None:
-    with path.open("rb") as fh:
-        await msg.reply_video(
-            video=fh,
-            caption=caption or None,
-            filename=path.name,
-            supports_streaming=True,
-            reply_markup=reply_markup,
-        )
+    async def send_once():
+        with path.open("rb") as fh:
+            return await msg.reply_video(
+                video=fh,
+                caption=caption or None,
+                filename=path.name,
+                supports_streaming=True,
+                reply_markup=reply_markup,
+            )
+    await _retry_telegram(send_once)
 
 
 async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, reply_markup=None) -> int:
@@ -1597,6 +1638,8 @@ async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, 
         try:
             await _send_video_file(msg, path, caption, reply_markup)
             return 1
+        except (RetryAfter, TimedOut, NetworkError):
+            raise
         except TelegramError as exc:
             log.info("Telegram rejected source video; normalizing: %s", str(exc)[:140])
             normalized = await asyncio.to_thread(normalize_video, path, tmp / "normalized", max_height)
@@ -1631,6 +1674,8 @@ async def send_video(msg, path: Path, caption: str, max_height: int, tmp: Path, 
     try:
         await _send_video_file(msg, final, caption, reply_markup)
         return 1
+    except (RetryAfter, TimedOut, NetworkError):
+        raise
     except TelegramError:
         normalized = await asyncio.to_thread(normalize_video, final, tmp / "normalized_final", max_height)
         if normalized.stat().st_size > MAX_BYTES:
@@ -1661,22 +1706,28 @@ async def send_audio(msg, path: Path, caption: str, mode: str, tmp: Path, title:
         )
     if final.stat().st_size > MAX_BYTES:
         raise RuntimeError("Audio could not be fitted for Telegram.")
-    with final.open("rb") as fh:
-        await msg.reply_audio(
-            audio=fh,
-            caption=caption or None,
-            filename=final.name,
-            title=safe_media_title(title) if title else None,
-            performer="Veltrix Downloader",
-        )
+    async def send_once():
+        with final.open("rb") as fh:
+            return await msg.reply_audio(
+                audio=fh,
+                caption=caption or None,
+                filename=final.name,
+                title=safe_media_title(title) if title else None,
+                performer="Veltrix Downloader",
+            )
+    await _retry_telegram(send_once)
     return 1
 
 
 async def send_document(msg, path: Path, caption: str) -> int:
     if path.stat().st_size > MAX_BYTES:
         raise RuntimeError("Unsupported media is over Telegram's upload limit.")
-    with path.open("rb") as fh:
-        await msg.reply_document(document=fh, caption=caption or None, filename=path.name)
+
+    async def send_once():
+        with path.open("rb") as fh:
+            return await msg.reply_document(document=fh, caption=caption or None, filename=path.name)
+
+    await _retry_telegram(send_once)
     return 1
 
 
