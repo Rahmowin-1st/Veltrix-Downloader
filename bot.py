@@ -906,6 +906,21 @@ def _pinterest_quality_score(fmt: dict[str, Any]) -> tuple[int, int, int]:
     return (tier, progressive, h)
 
 
+def _pinterest_target_height(formats: list[dict[str, Any]]) -> int:
+    heights = sorted({int(f.get("height") or 0) for f in formats if int(f.get("height") or 0) > 0})
+    if 720 in heights:
+        return 720
+    if 1080 in heights:
+        return 1080
+    below = [h for h in heights if h < 720]
+    if below:
+        return max(below)
+    above = [h for h in heights if h > 1080]
+    if above:
+        return min(above)
+    return max(heights) if heights else 0
+
+
 def _download_direct_file(
     media_url: str,
     out: Path,
@@ -978,32 +993,58 @@ def download_pinterest_dedicated(url: str, tmpdir: str) -> tuple[list[Path], str
     if media_type == "video":
         video = pin.get("video") or {}
         formats = [f for f in (video.get("formats") or []) if isinstance(f, dict) and f.get("url")]
-        formats.sort(key=_pinterest_quality_score, reverse=True)
-        headers = {**request_headers(resolved), "Referer": "https://www.pinterest.com/"}
+        if not formats:
+            return [], "video"
 
-        for index, fmt in enumerate(formats, 1):
+        target_height = _pinterest_target_height(formats)
+        selected = [
+            f for f in formats
+            if target_height == 0 or int(f.get("height") or 0) == target_height
+        ]
+        if not selected:
+            selected = sorted(formats, key=_pinterest_quality_score, reverse=True)[:1]
+
+        # Story/Idea Pins may contain several pages. The upstream parser flattens
+        # their format lists; selecting the preferred height from the original
+        # order recovers one media stream per page without mixing quality tiers.
+        unique_selected: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        for fmt in selected:
+            media_url = str(fmt.get("url") or "")
+            if media_url and media_url not in seen_urls:
+                seen_urls.add(media_url)
+                unique_selected.append(fmt)
+
+        headers = {**request_headers(resolved), "Referer": "https://www.pinterest.com/"}
+        outputs: list[Path] = []
+        for index, fmt in enumerate(unique_selected[:MAX_GALLERY_ITEMS], 1):
             media_url = str(fmt.get("url") or "")
             if not safe_remote_url(media_url):
                 continue
+
             if ".m3u8" in media_url.lower():
+                attempt_dir = dest / f"hls_{index:02d}"
+                attempt_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    opts = base_ydl_opts(tmpdir)
+                    opts = base_ydl_opts(str(attempt_dir))
                     opts["format"] = "best"
                     opts["http_headers"] = headers
+                    opts["outtmpl"] = str(attempt_dir / "pin_%(id)s.%(ext)s")
                     with YoutubeDL(opts) as ydl:
                         ydl.download([media_url])
-                    found = [p for p in files_in(Path(tmpdir) / "ytdl") if classify(p) == "video"]
+                    found = [p for p in files_in(attempt_dir) if classify(p) == "video"]
                     if found:
-                        return found[:1], "video"
+                        outputs.append(found[0])
                 except Exception as exc:
                     log.info("Pinterest HLS fallback failed: %s", str(exc)[:140])
                 continue
 
             ext = Path(urlparse(media_url).path).suffix or ".mp4"
-            out = dest / f"pin_video_{index}{ext}"
+            out = dest / f"pin_video_{index:02d}{ext}"
             if _download_direct_file(media_url, out, referer="https://www.pinterest.com/"):
-                return [out], "video"
-        return [], "video"
+                outputs.append(out)
+
+        return sanitize_media_files(outputs), "video"
 
     images = pin.get("images") if isinstance(pin.get("images"), dict) else {}
     image_url = ""
@@ -1374,6 +1415,10 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
 
     elif platform == "pinterest":
         files, expected_type = download_pinterest_dedicated(url, tmpdir)
+        if expected_type in {"image", "gif"}:
+            gallery_items = sanitize_media_files(download_gallery(resolve_public_redirect(url), tmpdir))
+            if len(gallery_items) > 1:
+                files = gallery_items
 
     elif platform == "instagram" and not is_video_post_url(url):
         # gallery-dl handles Instagram multi-item posts/carousels better than
