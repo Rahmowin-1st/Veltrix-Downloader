@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import logging
 import os
 import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -56,6 +58,7 @@ ensure_ffmpeg()
 YOUTUBE_COOKIE_FILE = materialize_youtube_cookies()
 
 import bot  # noqa: E402
+from telegram import Bot  # noqa: E402
 from telegram.ext import (  # noqa: E402
     Application,
     CallbackQueryHandler,
@@ -95,6 +98,15 @@ def main() -> None:
         raise SystemExit("BOT_TOKEN is missing")
     bot.BOT_TOKEN = token
     bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # In the all-free setup, Termux is the Telegram worker. Render stays health-only
+    # and must not recreate a webhook that would steal updates from Termux polling.
+    if os.getenv("TERMUX_PRIMARY", "").strip() == "1":
+        asyncio.run(Bot(token).delete_webhook(drop_pending_updates=False))
+        bot.start_health_server()
+        log.info("TERMUX_PRIMARY=1: Telegram disabled on Render; health-only mode")
+        while True:
+            time.sleep(3600)
 
     app = Application.builder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", bot.cmd_start))
