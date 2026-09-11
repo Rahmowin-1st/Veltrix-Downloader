@@ -1741,7 +1741,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         meta = {"title": "Media", "thumbnail": ""}
 
     status = await make_downloading_status(msg, url, platform, meta)
-    await run_job(msg, context, uid, url, AUTO_MODE, status)
+    await run_job(msg, context, uid, url, AUTO_MODE, status, known_meta=meta)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1781,6 +1781,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "mp3_192",
             status,
             selected_audio_index=int(action.get("item_index") or 0),
+            known_meta={"title": str(action.get("title") or "")},
         )
 
 
@@ -2001,6 +2002,7 @@ async def run_job(
     mode: str,
     status=None,
     selected_audio_index: int | None = None,
+    known_meta: dict[str, Any] | None = None,
 ) -> None:
     lock = job_lock(uid)
     metric_add("jobs_started", 1)
@@ -2031,11 +2033,12 @@ async def run_job(
         typing_task = asyncio.create_task(typing())
         async with global_sem():
             try:
-                meta = {}
-                try:
-                    meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=15)
-                except Exception:
-                    meta = {}
+                meta = dict(known_meta or {})
+                if not meta:
+                    try:
+                        meta = await asyncio.wait_for(asyncio.to_thread(preview_media, url), timeout=15)
+                    except Exception:
+                        meta = {}
                 files = await asyncio.to_thread(grab, url, mode, str(tmp))
                 kinds = [classify(p) for p in files]
                 sent = 0
