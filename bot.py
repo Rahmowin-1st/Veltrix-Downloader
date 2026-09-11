@@ -1477,7 +1477,6 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
             raise RuntimeError(friendly_error(platform, first_error)) from first_error
         raise RuntimeError("No downloadable media was found in this link.")
 
-    files = dedupe_media(files)
     usable = [p for p in files if p.stat().st_size <= MAX_SOURCE_BYTES]
     if not usable:
         raise RuntimeError(f"Source file is over the {MAX_SOURCE_BYTES // 1048576} MB service cap.")
@@ -1491,51 +1490,9 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     return usable[:MAX_GALLERY_ITEMS]
 
 
-def is_error_payload(path: Path) -> bool:
-    """Reject HTML/JSON error bodies accidentally saved with media extensions."""
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return True
-        with path.open("rb") as fh:
-            head = fh.read(1024).lstrip().lower()
-        return (
-            head.startswith(b"<!doctype html")
-            or head.startswith(b"<html")
-            or head.startswith(b"{\"error\"")
-            or head.startswith(b"{\"errors\"")
-        )
-    except OSError:
-        return True
-
-
-def media_fingerprint(path: Path) -> str:
-    """Cheap order-preserving duplicate detector without hashing huge files fully."""
-    try:
-        size = path.stat().st_size
-        h = hashlib.sha256()
-        h.update(str(size).encode())
-        with path.open("rb") as fh:
-            h.update(fh.read(65536))
-            if size > 131072:
-                fh.seek(max(0, size - 65536))
-                h.update(fh.read(65536))
-        return h.hexdigest()
-    except OSError:
-        return str(path)
-
-
 def dedupe_media(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    result: list[Path] = []
-    for path in paths:
-        if is_error_payload(path):
-            continue
-        fp = media_fingerprint(path)
-        if fp in seen:
-            continue
-        seen.add(fp)
-        result.append(path)
-    return result
+    """Backward-compatible alias for the canonical media sanitizer."""
+    return sanitize_media_files(paths)
 
 
 def classify(path: Path) -> str:
