@@ -1118,13 +1118,23 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     if not platform:
         raise RuntimeError("Only YouTube, Instagram, Snapchat and Pinterest links are supported.")
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
+
     first_error: Exception | None = None
     files: list[Path] = []
+    expected_type = ""
 
-    # Pinterest has its own public resource model with video_list/HLS fields.
-    # Use that first so a video Pin cannot degrade into its poster image.
-    if platform == "pinterest":
-        files = download_pinterest_dedicated(url, tmpdir)
+    # Platform-specialized engines go first. Generic extractors are fallbacks.
+    if platform == "snapchat":
+        files = download_snapchat_dedicated(url, tmpdir)
+        expected_type = "video"
+
+    elif platform == "pinterest":
+        files, expected_type = download_pinterest_dedicated(url, tmpdir)
+
+    elif platform == "instagram" and not is_video_post_url(url):
+        # gallery-dl handles Instagram multi-item posts/carousels better than
+        # a single-video extractor and preserves all public media items.
+        files = download_gallery(url, tmpdir)
 
     if not files:
         try:
@@ -1132,9 +1142,6 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
         except Exception as exc:
             first_error = exc
 
-    # Public-page structured data is the strongest non-auth fallback for
-    # Instagram/Snapchat and also catches social schema changes faster than a
-    # single generic extractor.
     if not files:
         for page_url in public_page_candidates(url):
             try:
@@ -1159,8 +1166,17 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
                 if first_error is None:
                     first_error = exc
 
-    if is_video_post_url(url):
+    # Never degrade a known video post into its poster/thumbnail.
+    force_video = is_video_post_url(url) or expected_type == "video"
+    if force_video:
         files = [p for p in files if classify(p) == "video"]
+
+    # If Pinterest itself says the pin is an image/GIF, keep only that type.
+    if platform == "pinterest" and expected_type in {"image", "gif"}:
+        wanted = "animation" if expected_type == "gif" else "image"
+        typed = [p for p in files if classify(p) == wanted]
+        if typed:
+            files = typed
 
     if not files:
         if first_error:
@@ -1170,6 +1186,13 @@ def grab(url: str, mode: str, tmpdir: str) -> list[Path]:
     usable = [p for p in files if p.stat().st_size <= MAX_SOURCE_BYTES]
     if not usable:
         raise RuntimeError(f"Source file is over the {MAX_SOURCE_BYTES // 1048576} MB service cap.")
+
+    log.info(
+        "grab success platform=%s count=%s types=%s",
+        platform,
+        len(usable),
+        ",".join(classify(p) for p in usable),
+    )
     return usable[:MAX_GALLERY_ITEMS]
 
 
