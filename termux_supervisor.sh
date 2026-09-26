@@ -10,7 +10,8 @@ cleanup() {
     wait "$CHILD_PID" 2>/dev/null || true
   fi
 }
-trap cleanup TERM INT EXIT
+trap cleanup EXIT
+trap 'exit 0' TERM INT
 
 BACKOFF=2
 while true; do
@@ -38,3 +39,4 @@ while true; do
     if [ "$BACKOFF" -gt 30 ]; then BACKOFF=30; fi
   fi
 done
+

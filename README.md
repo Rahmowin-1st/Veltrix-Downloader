@@ -1,43 +1,60 @@
-# Veltrix Downloader
+# Veltrix Downloader 9
 
-Telegram downloader for **YouTube, Instagram, Snapchat and Pinterest**.
+One public media link → automatic extraction → highest exposed quality → Telegram delivery.
+No quality menu, paid downloader API or per-download subscription.
 
-## User flow
+## Platform routes
 
-1. Send a supported public media link.
-2. Veltrix resolves it automatically — no quality menu or extra confirmation.
-3. Video quality preference is **720p → 1080p → lower fallbacks**.
-4. Photos are sent as photos, videos as videos, GIF-like media as animations, audio as audio.
-5. Every delivered video gets an **MP3** inline action bound to that exact media item.
+| Platform | Implemented route | Media handled by that route |
+| --- | --- | --- |
+| YouTube | yt-dlp + yt-dlp-ejs + Deno + ffmpeg | Videos, Shorts, accessible long videos and audio streams |
+| Instagram | parth-dl, then gallery-dl, then yt-dlp | Public Reels, posts, ordered mixed image/video carousels exposed by these extractors |
+| Snapchat | Exact Spotlight ID / public story metadata; dedicated video preload; yt-dlp fallback | Spotlight videos; public story images/videos, selected story item or current public highlight |
+| Pinterest | gallery-dl ordered manifest + direct media/HLS | Pin images, GIFs, video, mixed Idea Pin pages, image carousels and exposed audio blocks |
 
-## Extraction stack
+This is an implementation support matrix, **not a claim that every current URL was tested live**.
+Expired/deleted/private posts, unavailable music, DRM, unsupported page schemas and platform blocks can fail.
+YouTube community image posts and all possible Snapchat share URL variants are not certified.
 
-Veltrix uses platform-specific engines first, then conservative fallbacks:
+## Quality and Telegram behavior
 
-- **YouTube:** yt-dlp + Deno/yt-dlp-ejs + ffmpeg.
-- **Instagram:** parth-dl for public Reels/posts/mixed carousels, then yt-dlp and gallery-dl fallbacks.
-- **Snapchat:** exact Spotlight-ID matching against public `__NEXT_DATA__`, then CDN download with redirect validation.
-- **Pinterest:** pinterest-downloader for authoritative media type/quality, plus gallery-dl traversal for multi-page Idea Pins.
-
-Generic public-page/Open Graph extraction is only a last fallback. Known video links never degrade into poster images.
+- Automatic mode uses `bv*+ba/b` without a resolution ceiling. Instagram ranks available renditions by pixel area.
+- “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
+- Compatible H.264/AAC videos are remuxed to MP4 without re-encoding and sent as playable videos.
+- Other codecs remain original files. The bot does not silently reduce resolution or bitrate.
+- Original photos are sent as documents because Telegram's photo endpoint recompresses them. Set `PRESERVE_ORIGINALS=0` only if a compressed photo display is preferred.
+- MP3 buttons refer to the exact item. On-demand MP3 is encoded at 320 kbps; this does not improve a lower-quality source.
+- Files are streamed during upload rather than read entirely into RAM.
+- Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
+- An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081`; it supports uploads up to 2,000,000,000 bytes. A server must actually be installed/configured; setting the variable alone does not create it. Switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
+- If even one keyframe-sized segment exceeds the upload limit, the bot reports the limit instead of silently damaging the original.
 
 ## Reliability
 
-- per-user job serialization + global concurrency limit
-- Telegram retry/backoff for transient network and flood-control errors
-- automatic H.264/AAC normalization when Telegram rejects a source container
-- ffmpeg size fitting / splitting for hosted Bot API limits
-- media-type validation, HTML/error-payload rejection and duplicate suppression
-- temporary-file cleanup and bounded exact-media cache for MP3 actions
-- stale cache cleanup, health diagnostics and Termux crash supervisor
-- SSRF/private-address protection and redirect revalidation
-- Python 3.12 + 3.13 CI gates, dependency integrity, compile, shell syntax and unit tests
+- Per-user serialization and bounded global work concurrency.
+- Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
+- ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.
+- Carousel order is retained; failed entries, extractor error records and item caps are reported instead of silently truncating a post.
+- Snapchat will not substitute a recommended item when the requested Spotlight ID is missing.
+- No generic page-wide download fallback: these can return thumbnails, recommendations or unrelated media.
+- Telegram flood-control delays are honored in full. Ambiguous network/upload timeouts are not blindly retried because Telegram may already have accepted the file.
+- Long uploads have dedicated timeouts; MP3 conversions share the same resource semaphore.
+- Termux supervisor exits on shutdown signals. Startup refuses to launch a second supervisor while the previous one is still stopping.
+- Dependency changes are detected during normal restart. Pending Telegram updates are preserved.
 
-Only media the platform exposes publicly is intended to be downloaded. Private/login-only content is not bypassed.
+No program can guarantee zero interruption on sleeping Android/free hosting. In-flight jobs are not durably resumed after power loss. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
 
-## $0 primary runtime — Termux
+## Free primary runtime: existing Termux phone
 
-Initial setup:
+Update:
+
+```bash
+cd ~/Veltrix-Downloader
+git pull --ff-only
+bash termux_start.sh
+```
+
+Fresh installation:
 
 ```bash
 git clone https://github.com/Rahmowin-1st/Veltrix-Downloader.git
@@ -45,32 +62,32 @@ cd Veltrix-Downloader
 bash termux_setup.sh
 ```
 
-Normal update/restart:
+Keep Termux battery optimization disabled. Reboot startup additionally requires Termux:Boot to be installed and opened once. Device storage, internet and power remain required; no paid API is used.
+
+`.env.example` documents normal settings. Default caps: 100 items, 4 GiB per source, 6 GiB total download workspace, 128 MiB disk reserve, one concurrent job. Remuxing/splitting also needs additional free disk space.
+
+`BOT_TOKEN` stays in `.env`. Never commit tokens, cookies, sessions or proxy credentials. Existing optional authorized YouTube cookie configuration on Render is passed to the isolated worker; age restrictions remain enforced.
+
+Render with `TERMUX_PRIMARY=1` is health-only and must not poll alongside Termux.
+
+## Validation
 
 ```bash
-cd ~/Veltrix-Downloader
-git pull
-bash termux_start.sh
+python -m unittest discover -s tests -v
+python -m compileall -q bot.py media_io.py download_worker.py render_free.py tests
+bash -n termux_start.sh termux_setup.sh termux_supervisor.sh
 ```
 
-`termux_start.sh` performs dependency/runtime preflight before replacing the running worker. The supervisor restarts the bot after crashes with bounded exponential backoff.
+50 tests passed locally on Python 3.12, including generated real MP4/M4A/PNG/GIF media, stream-copy splits with audio/resolution/duration checks, remuxing, extraction manifests and async delivery failures. Source-page tests use controlled fixtures.
 
-Keep Android battery optimization disabled for Termux if you want reliable 24/7 operation.
+Direct requests to all four platforms timed out in the editing environment. No live Telegram bot token or access to the running Termux session was available here. Therefore this release still needs live URL-to-Telegram acceptance on the actual runtime. See `docs/RELEASE_AUDIT.md`.
 
-## Render
+## Upstream references reviewed
 
-Render remains a **health-only fallback** in the all-free architecture when:
+- [yt-dlp EJS requirements](https://github.com/yt-dlp/yt-dlp/wiki/EJS)
+- [yt-dlp YouTube token constraints](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)
+- [gallery-dl Pinterest extractor](https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/pinterest.py)
+- [Cobalt Snapchat implementation](https://github.com/imputnet/cobalt/blob/main/api/src/processing/services/snapchat.js)
+- [Telegram local Bot API limits](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
 
-```text
-TERMUX_PRIMARY=1
-```
-
-It must not compete with Termux for Telegram updates.
-
-Required secret:
-
-```text
-BOT_TOKEN=...
-```
-
-Never commit tokens, cookies, proxies, or account sessions.
+Cobalt was studied for behavior and public schema structure. No Cobalt service or paid endpoint is required.

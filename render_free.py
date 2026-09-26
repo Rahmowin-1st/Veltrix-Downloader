@@ -77,18 +77,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
 
 
-# Inject the optional YouTube cookie file into every yt-dlp session. It is
-# harmless for non-YouTube extractors and keeps the core downloader portable.
+# Pass the local path to isolated workers; cookie values are never logged.
 if YOUTUBE_COOKIE_FILE:
-    _base_ydl_opts = bot.base_ydl_opts
-
-    def _base_ydl_opts_with_cookie(tmpdir: str):
-        opts = _base_ydl_opts(tmpdir)
-        opts["cookiefile"] = str(YOUTUBE_COOKIE_FILE)
-        return opts
-
-    bot.base_ydl_opts = _base_ydl_opts_with_cookie
-    log.info("YouTube authenticated-session support enabled")
+    os.environ["YOUTUBE_COOKIE_FILE"] = str(YOUTUBE_COOKIE_FILE)
 
 
 def main() -> None:
@@ -108,7 +99,7 @@ def main() -> None:
         while True:
             time.sleep(3600)
 
-    app = Application.builder().token(token).concurrent_updates(True).build()
+    app = bot.application_builder(token).build()
     app.add_handler(CommandHandler("start", bot.cmd_start))
     app.add_handler(CommandHandler("help", bot.cmd_help))
     app.add_handler(CommandHandler("settings", bot.cmd_settings))
@@ -119,7 +110,7 @@ def main() -> None:
     port = int(os.getenv("PORT", "10000"))
     if not hostname:
         log.info("No Render hostname; polling")
-        app.run_polling(drop_pending_updates=True)
+        app.run_polling(drop_pending_updates=False)
         return
 
     webhook_url = f"https://{hostname}/telegram"
@@ -129,7 +120,7 @@ def main() -> None:
         port=port,
         url_path="telegram",
         webhook_url=webhook_url,
-        drop_pending_updates=True,
+        drop_pending_updates=False,
     )
 
 
@@ -141,3 +132,4 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         raise
+

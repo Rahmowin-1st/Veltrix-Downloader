@@ -10,3 +10,6 @@ downloads/
 data/
 logs/
 .veltrix.pid
+
+
+.dependencies.sha256

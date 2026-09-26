@@ -19,15 +19,22 @@ fi
 echo "Veltrix preflight..."
 if ! python - <<'PY'
 import importlib
-for name in ("telegram", "yt_dlp", "gallery_dl", "pinterest_downloader", "parth_dl", "httpx"):
+from pathlib import Path
+import hashlib
+stamp = Path('.dependencies.sha256')
+wanted = hashlib.sha256(Path('requirements-termux.txt').read_bytes()).hexdigest()
+if not stamp.exists() or stamp.read_text().strip() != wanted:
+    raise SystemExit(1)
+for name in ("telegram", "yt_dlp", "gallery_dl", "parth_dl", "httpx"):
     importlib.import_module(name)
 PY
 then
   echo "Dependencies changed; syncing Termux Python packages..."
   python -m pip install -U --upgrade-strategy only-if-needed -r requirements-termux.txt
+  python -c "import hashlib,pathlib; pathlib.Path('.dependencies.sha256').write_text(hashlib.sha256(pathlib.Path('requirements-termux.txt').read_bytes()).hexdigest())"
 fi
 
-python -m compileall -q bot.py
+python -m compileall -q bot.py media_io.py download_worker.py
 for bin in ffmpeg ffprobe deno; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "Missing required runtime: $bin"
@@ -44,7 +51,9 @@ python - <<'PY'
 import asyncio, os
 from telegram import Bot
 async def main():
-    bot = Bot(os.environ['BOT_TOKEN'])
+    from bot import TELEGRAM_API_BASE
+    kwargs = {'base_url': TELEGRAM_API_BASE + '/bot'} if TELEGRAM_API_BASE else {}
+    bot = Bot(os.environ['BOT_TOKEN'], **kwargs)
     await bot.delete_webhook(drop_pending_updates=False)
 asyncio.run(main())
 PY
@@ -57,6 +66,10 @@ if [ -f .veltrix.pid ]; then
       kill -0 "$OLD_PID" 2>/dev/null || break
       sleep 1
     done
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+      echo "The previous worker is still finishing its shutdown. No second worker was started."
+      exit 1
+    fi
   fi
 fi
 

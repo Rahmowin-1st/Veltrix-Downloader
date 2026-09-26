@@ -62,7 +62,7 @@ class BackendTests(unittest.TestCase):
 
     def test_auto_mode_contract(self):
         self.assertEqual(bot.AUTO_MODE, "auto")
-        self.assertEqual(bot.DEFAULT_QUALITY, "720")
+        self.assertEqual(bot.DEFAULT_QUALITY, "best")
 
     def test_preview_payload_has_thumbnail(self):
         # Probe details are network-dependent; the UI contract is a dict field.
@@ -79,10 +79,10 @@ class BackendTests(unittest.TestCase):
         candidates = bot.page_media_candidates(page, include_images=False)
         self.assertIn("https://cf-st.sc-cdn.net/d/abc", candidates)
 
-    def test_pinterest_quality_prefers_720(self):
+    def test_pinterest_quality_prefers_highest(self):
         q720 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/a.mp4", "height": 720})
         q1080 = bot._pinterest_quality_score({"url": "https://v1.pinimg.com/b.mp4", "height": 1080})
-        self.assertGreater(q720, q1080)
+        self.assertGreater(q1080, q720)
 
     def test_snapchat_exact_story_is_selected(self):
         doc = {
@@ -182,7 +182,7 @@ class BackendTests(unittest.TestCase):
     def test_pinterest_target_height_policy(self):
         self.assertEqual(bot._pinterest_target_height([
             {"height": 360}, {"height": 720}, {"height": 1080}
-        ]), 720)
+        ]), 1080)
         self.assertEqual(bot._pinterest_target_height([
             {"height": 480}, {"height": 1080}
         ]), 1080)
@@ -194,7 +194,7 @@ class BackendTests(unittest.TestCase):
         with patch("bot.shutil.which", side_effect=lambda name: "/usr/bin/deno" if name == "deno" else None):
             self.assertEqual(bot.deno_runtime(), "/usr/bin/deno")
 
-    def test_instagram_quality_prefers_720(self):
+    def test_instagram_quality_prefers_highest(self):
         q720 = bot._instagram_format_score(
             {"url": "https://cdn.example/a.mp4", "height": 720, "width": 1280, "has_audio": True},
             "video",
@@ -207,7 +207,7 @@ class BackendTests(unittest.TestCase):
             {"url": "https://cdn.example/c.mp4", "height": 480, "width": 854, "has_audio": True},
             "video",
         )
-        self.assertGreater(q720, q1080)
+        self.assertGreater(q1080, q720)
         self.assertGreater(q1080, q480)
 
     def test_instagram_image_prefers_larger_area(self):
@@ -224,3 +224,4 @@ class BackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

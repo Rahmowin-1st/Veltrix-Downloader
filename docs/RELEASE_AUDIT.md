@@ -1,0 +1,51 @@
+# Veltrix Downloader v9 audit — 2026-09-26
+
+Baseline: `4c999bbae572e62e308c1633cd27be8853ff7ee3`.
+
+| Observed code problem | Change | Evidence / remaining limit |
+| --- | --- | --- |
+| 720p ranked over 1080p/4K | Best available format policy | Quality and downloader-option regression tests |
+| Snapchat could choose the first unrelated recommendation | Match requested ID; reject missing match | Matching, missing-ID and public story fixture tests |
+| Snapchat always forced video | Parse story media type per item | Mixed image/video story fixture |
+| Flattened Pinterest formats lost page identity | Ordered gallery manifest with per-page download | Mixed video/image/audio manifest test |
+| Gallery process could return partial files as success | Parse error records even on exit code zero; reject missing entries | Partial carousel and gallery error tests |
+| Filename extension treated as authoritative media type | Inspect real media streams with ffprobe | Real fixtures with deliberately wrong suffixes |
+| Large files silently recompressed | Stream-copy splitting / remux; original-codec file fallback | Real audio, dimensions, codec and duration validation |
+| Photos recompressed despite maximum-quality request | Send original document by default | Original byte-preservation delivery test |
+| Upload retries could duplicate completed sends | Retry explicit flood rejection only | Timeout single-send test and RetryAfter test |
+| RetryAfter cut to 30 seconds | Wait full server-specified interval | 90-second delay calculation test |
+| Long upload used short library defaults | Dedicated 1800-second media upload timeout; streaming InputFile | Builder and file-handle inspection; live transport still unverified |
+| Preview threads continued after wait_for expired | Immediate queue acknowledgement; one isolated download process | Worker deadline/reaping test |
+| Cached audio bypassed global work limit | Share semaphore | Code review |
+| Supervisor TERM cleanup could resume its loop | Exit trap + reject overlapping restart | Shell syntax and code review |
+| Dependency preflight tested imports but not changed requirements | Requirements checksum invalidation | Code review |
+| Render dropped pending updates | Preserve pending updates in polling and webhook modes | Code review |
+
+## Completed verification
+
+- 50 local unit/regression tests, including real ffmpeg/ffprobe fixtures.
+- Python compilation, shell parsing and git whitespace checks.
+- Installed dependency integrity (`pip check`) passed in the editing runtime.
+- Read current upstream yt-dlp, gallery-dl and Cobalt implementations/documentation.
+
+## Not verified / not claimed complete
+
+- All four direct platform HTTP probes timed out in this environment. This does not establish a platform outage or a downloader success.
+- Live Telegram upload, token health and the user's running Termux state were not accessible.
+- Full coverage of every platform/media/link combination is not established.
+- Local Bot API server is supported by configuration, not deployed by this change.
+- Automatic recovery of an in-flight job after device power loss is not implemented.
+- Platform 403/rate limits, expired URLs and upstream schema changes remain external failure modes.
+
+## Runtime acceptance checklist
+
+Use public posts you own or are authorized to download. Send links normally to the bot, with no quality selection.
+
+1. YouTube: Short, ordinary video, long video larger than cloud Telegram limit; verify highest selected rendition, sound, full duration and ordered parts.
+2. Instagram: photo, Reel and mixed carousel; compare source item count and order, check every video's sound.
+3. Snapchat: Spotlight, exact public story photo, exact public story video, public story sequence. Confirm no recommendation is substituted for an expired item.
+4. Pinterest: image, GIF, video, mixed Idea Pin; compare every page and available audio block.
+5. Queue two requests; confirm both finish in request order. Tap an MP3 button on the second carousel video and confirm it uses that video.
+6. Restart when idle; confirm a single polling worker and normal `/start`. Inspect `logs/termux.log` for real failures without sharing the bot token.
+
+A release should be called production-verified only after these checks pass on the actual network/runtime.
