@@ -88,7 +88,7 @@ Direct requests to all four platforms timed out in the editing environment. No l
 
 Run `python diagnose.py` on the phone for package/runtime checks, DNS and authenticated bot identity. It never consumes updates, changes the webhook or prints the token. It does not prove downloader success or exclude a second polling instance.
 
-Startup prints the authenticated bot username so a wrong token/chat is visible. `TELEGRAM_IPV4=1` optionally selects IPv4 for both polling and sends; default is automatic addressing. `TELEGRAM_PROXY` or the existing `HTTPS_PROXY` is honored, not silently removed. A successful `curl -4` does not establish that IPv6 is broken.
+Startup prints the authenticated bot username so a wrong token/chat is visible. Termux defaults `TELEGRAM_IPV4=1` for both polling and sends because the deployed phone reached Telegram over IPv4 while the automatic transport timed out. Set `TELEGRAM_IPV4=0` only on a network verified to support the automatic route. Only explicit `TELEGRAM_PROXY` affects Telegram traffic, avoiding stale generic shell proxies.
 
 Optional owner-supplied cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, and `PINTEREST_COOKIE_FILE`. They do not guarantee access; do not share them in chat or use them to bypass restrictions. Worker failures now include a URL/token-redacted diagnostic in `logs/termux.log`.
 

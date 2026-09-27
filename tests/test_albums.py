@@ -166,3 +166,11 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNot(app.bot._request[0], app.bot._request[1])
             for request in app.bot._request:
                 await request.shutdown()
+
+    async def test_generic_proxy_does_not_hijack_telegram(self):
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://broken.invalid:9999"}, clear=False), \
+                patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
+            os.environ.pop("TELEGRAM_PROXY", None)
+            request = bot.telegram_request()
+            self.assertIsNone(transport.call_args.kwargs["proxy"])
+            await request.shutdown()

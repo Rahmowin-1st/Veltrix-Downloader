@@ -2084,7 +2084,9 @@ def telegram_request(pool_size: int = 16):
     limits = httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
     # IPv4 is opt-in: a successful curl -4 alone does not prove IPv6 is broken.
     ipv4 = os.getenv("TELEGRAM_IPV4", "0") == "1"
-    proxy = os.getenv("TELEGRAM_PROXY") or os.getenv("HTTPS_PROXY") or None
+    # Only an explicit Telegram proxy may affect polling. Generic shell proxy
+    # variables are often stale on Termux and can make a healthy API time out.
+    proxy = os.getenv("TELEGRAM_PROXY") or None
     transport = httpx.AsyncHTTPTransport(
         local_address="0.0.0.0" if ipv4 else None, limits=limits, retries=2, proxy=proxy,
     )

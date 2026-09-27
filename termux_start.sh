@@ -11,6 +11,11 @@ set -a
 . ./.env
 set +a
 
+# Android networks commonly expose an unusable IPv6 route for Telegram while
+# IPv4 remains healthy. Existing .env files predate this option, so Termux uses
+# IPv4 by default without requiring a manual migration.
+export TELEGRAM_IPV4="${TELEGRAM_IPV4:-1}"
+
 if [ -z "${BOT_TOKEN:-}" ]; then
   echo "BOT_TOKEN missing in .env"
   exit 1
@@ -49,14 +54,25 @@ termux-wake-lock || true
 # restarts do not silently lose links users sent while the worker was offline.
 python - <<'PY'
 import asyncio, os
-from telegram import Bot
+from telegram.error import NetworkError, TimedOut
 async def main():
     from bot import application_builder
-    bot = application_builder(os.environ['BOT_TOKEN']).build().bot
-    async with bot:
-        me = await bot.get_me()
-        print(f'Telegram identity verified: @{me.username}')
-        await bot.delete_webhook(drop_pending_updates=False)
+    for attempt in range(1, 4):
+        try:
+            bot = application_builder(os.environ['BOT_TOKEN']).build().bot
+            async with bot:
+                me = await bot.get_me()
+                print(f'Telegram identity verified: @{me.username}')
+                await bot.delete_webhook(drop_pending_updates=False)
+            return
+        except (TimedOut, NetworkError):
+            if attempt == 3:
+                raise SystemExit(
+                    'Telegram API unreachable after 3 IPv4 attempts. '
+                    'Switch phone network or Private DNS, then run bash termux_start.sh again.'
+                )
+            print(f'Telegram connection attempt {attempt}/3 failed; retrying...')
+            await asyncio.sleep(attempt * 2)
 asyncio.run(main())
 PY
 
