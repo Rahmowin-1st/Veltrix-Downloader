@@ -35,12 +35,13 @@ import httpx
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, InputMediaVideo, InputMediaAudio, Update
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.error import BadRequest, Conflict, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
+from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.2.0"
+VERSION = "9.3.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
@@ -68,8 +69,9 @@ log = logging.getLogger("veltrix")
 _user_lock = Lock()
 _action_lock = Lock()
 _job_locks: dict[int, asyncio.Lock] = {}
-_pending_links: set[tuple[int, int, str, str]] = set()
 _global_sem: asyncio.Semaphore | None = None
+_jobs: JobManager | None = None
+_instance_lock = None
 _metrics_lock = Lock()
 _metrics = {
     "jobs_started": 0,
@@ -639,6 +641,8 @@ def download_instagram_dedicated(
         try:
             info = extract_instagram_public(url)
         except Exception as exc:
+            if fatal_download_error(exc):
+                raise
             log.info("Instagram dedicated metadata failed: %s", str(exc)[:180])
             return [], ""
 
@@ -906,87 +910,18 @@ def _pinterest_target_height(formats: list[dict[str, Any]]) -> int:
     return max((int(f.get("height") or 0) for f in formats), default=0)
 
 
-def _download_direct_file(
-    media_url: str,
-    out: Path,
-    *,
-    referer: str,
-    timeout: int = 45,
-) -> bool:
-    """Download a public media URL with redirect revalidation and bounded retries."""
-    if not safe_remote_url(media_url):
+def _download_direct_file(media_url: str, out: Path, *, referer: str, timeout: int = 45) -> bool:
+    from transfer import download
+    try:
+        return download(media_url, out,
+                        headers={"User-Agent": DESKTOP_UA, "Referer": referer, "Accept": "*/*"},
+                        safe_url=safe_remote_url, budget=check_download_budget,
+                        max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None, timeout=timeout)
+    except RuntimeError as exc:
+        if fatal_download_error(exc):
+            raise
+        log.info("Direct source variant unavailable: %s", type(exc).__name__)
         return False
-
-    headers = {"User-Agent": DESKTOP_UA, "Referer": referer, "Accept": "*/*"}
-    last_error: Exception | None = None
-
-    for attempt in range(1, 4):
-        try:
-            out.unlink(missing_ok=True)
-            current = media_url
-
-            with httpx.Client(headers=headers, follow_redirects=False, timeout=timeout, proxy=PROXY or None) as client:
-                for _redirect in range(6):
-                    if not safe_remote_url(current):
-                        raise RuntimeError("unsafe media redirect")
-
-                    with client.stream("GET", current) as response:
-                        if response.status_code in {301, 302, 303, 307, 308}:
-                            location = response.headers.get("location") or ""
-                            if not location:
-                                raise RuntimeError("media redirect missing location")
-                            current = urljoin(current, location)
-                            continue
-
-                        response.raise_for_status()
-                        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                        if (
-                            content_type.startswith("text/")
-                            or "json" in content_type
-                            or "html" in content_type
-                            or "xml" in content_type
-                        ):
-                            raise RuntimeError(f"non-media response: {content_type or 'unknown'}")
-
-                        length = int(response.headers.get("content-length") or 0)
-                        if length and length > MAX_SOURCE_BYTES:
-                            return False
-
-                        total = 0
-                        first = True
-                        out.parent.mkdir(parents=True, exist_ok=True)
-                        with out.open("wb") as fh:
-                            for chunk in response.iter_bytes(1024 * 1024):
-                                if not chunk:
-                                    continue
-                                if first:
-                                    probe = chunk[:512].lstrip().lower()
-                                    if probe.startswith((b"<!doctype html", b"<html", b'{"error"', b'{"errors"')):
-                                        raise RuntimeError("error page returned as media")
-                                    first = False
-                                total += len(chunk)
-                                if total > MAX_SOURCE_BYTES:
-                                    raise RuntimeError("media too large")
-                                check_download_budget({})
-                                fh.write(chunk)
-
-                        if total <= 0 or not out.exists() or out.stat().st_size <= 0:
-                            raise RuntimeError("empty media response")
-                        if length and total != length:
-                            raise RuntimeError(f"incomplete media response: {total}/{length}")
-                        return True
-                else:
-                    raise RuntimeError("too many media redirects")
-
-        except Exception as exc:
-            last_error = exc
-            out.unlink(missing_ok=True)
-            if attempt < 3:
-                time.sleep(0.7 * (2 ** (attempt - 1)))
-
-    if last_error:
-        log.info("direct media download failed after retries: %s", str(last_error)[:160])
-    return False
 
 
 def download_gallery(url: str, tmpdir: str) -> list[Path]:
@@ -1006,10 +941,12 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
     if proc.returncode:
         raise RuntimeError("Gallery metadata unavailable")
     manifest = json.loads(proc.stdout)
-    if any(row and row[0] in {-1, 6} for row in manifest):
-        raise RuntimeError("Incomplete gallery metadata or unresolved media item")
     entries = [row for row in manifest if isinstance(row, list) and len(row) >= 3 and row[0] == 3
                and not str(row[1]).startswith("text:")]
+    if any(row and row[0] in {-1, 6} for row in manifest):
+        if entries:
+            raise RuntimeError("Incomplete gallery metadata or unresolved media item")
+        raise RuntimeError("Gallery metadata unavailable; no items extracted")
     if platform_of(url) == "pinterest":
         from source_metadata import pinterest_entries
         pins = [row[-1] for row in manifest if isinstance(row, list) and row and row[0] == 2
@@ -1084,6 +1021,8 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
                 completed = path
                 break
             except Exception as exc:
+                if fatal_download_error(exc):
+                    raise
                 log.warning("Source variant failed: %s", type(exc).__name__)
         if completed is None:
             raise RuntimeError(f"Incomplete post: item {index + 1}/{len(entries)} unavailable; poster substitution refused")
@@ -1227,6 +1166,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     """User-safe errors only. Full extractor details stay in logs."""
     if isinstance(exc, WorkerFailure):
         return str(exc)
+    if connection_failed_before_send(exc):
+        return "Could not connect to Telegram. The failed upload was not sent; try again when the connection returns."
     if isinstance(exc, (TimedOut, NetworkError)):
         return "Telegram did not confirm delivery. Check the chat before retrying to avoid duplicates."
     text = str(exc)
@@ -1398,7 +1339,8 @@ def classify(path: Path) -> str:
 
 
 def ffmpeg(cmd: list[str], timeout: int = 900) -> None:
-    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    from media_process import run
+    proc = run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or "")[-400:] or "ffmpeg failed")
 
@@ -1502,9 +1444,9 @@ async def edit_status(status, text: str, reply_markup=None) -> None:
             for field in ("photo", "video", "audio", "document", "animation")
         )
         if captionable:
-            await status.edit_caption(caption=text, reply_markup=reply_markup)
+            await status.edit_caption(caption=text, reply_markup=reply_markup, connect_timeout=8, read_timeout=8)
         else:
-            await status.edit_text(text, reply_markup=reply_markup)
+            await status.edit_text(text, reply_markup=reply_markup, connect_timeout=8, read_timeout=8)
     except TelegramError:
         pass
 
@@ -1525,20 +1467,70 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await dispatch_job(msg, context, uid, url, AUTO_MODE)
 
 
-async def dispatch_job(msg, context, uid: int, url: str, mode: str) -> None:
-    key = (uid, msg.chat_id, url, mode)
-    if key in _pending_links:
-        await msg.reply_text("This link is already being processed here. Its result will arrive automatically.")
+def job_manager() -> JobManager:
+    global _jobs
+    if _jobs is None:
+        _jobs = JobManager(DATA_DIR / "jobs.sqlite3",
+                           max_pending=max(3, min(int(os.getenv("MAX_PENDING_JOBS", "20")), 100)))
+    return _jobs
+
+
+class DeferredStatus:
+    """A lost acknowledgement must not lose an admitted download."""
+    def __init__(self, msg):
+        self.msg, self.message = msg, None
+
+    async def edit_text(self, text, **kwargs):
+        if self.message is None:
+            self.message = await self.msg.reply_text(text, **kwargs)
+        else:
+            await self.message.edit_text(text, **kwargs)
+
+    async def delete(self):
+        if self.message is not None:
+            await self.message.delete()
+
+
+async def dispatch_job(msg, context, uid: int, url: str, mode: str, action=None) -> None:
+    url = extract_url(url) or url
+    if platform_of(url) == "instagram":
+        match = re.search(r"/(reels?|p|tv)/([A-Za-z0-9_-]+)", urlparse(url).path)
+        if match:
+            kind = "reel" if match[1] in {"reel", "reels"} else match[1]
+            url = f"https://www.instagram.com/{kind}/{match[2]}/"
+    manager = job_manager()
+    result, row = manager.admit(uid, msg.chat_id, url, mode, getattr(msg, "message_thread_id", None))
+    if result != "accepted":
+        messages = {
+            "duplicate": "This link is already being processed here. Use /status to see its state.",
+            "user_full": "You already have 3 requests in progress. Please wait for one to finish.",
+            "full": "The download queue is full. Please try again shortly.",
+        }
+        await msg.reply_text(messages[result])
         return
-    if sum(row[0] == uid for row in _pending_links) >= 3:
-        await msg.reply_text("You already have 3 requests in progress. Please wait for one to finish.")
-        return
-    _pending_links.add(key)
-    try:
-        status = await msg.reply_text(f"⏳ {platform_label(url)} · queued")
-        await run_job(msg, context, uid, url, mode, status, known_meta={"title": "Media"})
-    finally:
-        _pending_links.discard(key)
+
+    async def execute(_):
+        status = DeferredStatus(msg)
+        await edit_status(status, f"⏳ {platform_label(url)} · queued")
+        sources = []
+        if action:
+            rows = [resolve_action_data(uid, child) for child in action.get("children", [])] if action.get("post") else [action]
+            sources = [Path(r["cache_path"]) for r in rows if r.get("cache_path")]
+            if not sources or len(sources) != len(rows) or not all(p.is_file() for p in sources):
+                sources = []
+        await run_job(msg, context, uid, url, mode, status,
+                      cached_sources=sources or None, known_meta={"title": "Media"})
+    manager.launch(row, execute)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = job_manager().recent(update.effective_user.id, update.effective_message.chat_id)
+    labels = {"queued": "⏳ Queued", "downloading": "⬇️ Downloading / preparing",
+              "sending": "📤 Sending", "done": "✅ Delivered", "failed": "❌ Failed — send the link to retry",
+              "interrupted": "⚠️ Delivery interrupted — check received media before retrying",
+              "expired": "⌛ Expired — send the link again"}
+    text = "\n".join(f"{platform_label(r['url'])} · {labels.get(r['state'], r['state'])}" for r in rows)
+    await update.effective_message.reply_text(text or "No recent downloads. Send a media link.")
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1566,37 +1558,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await q.answer()
-    status = await q.message.reply_text("⬇️ Converting to MP3…")
-    if action.get("post"):
-        rows = [resolve_action_data(uid, child) for child in action.get("children", [])]
-        sources = [Path(row["cache_path"]) for row in rows if row.get("cache_path")]
-        if sources and len(sources) == len(rows):
-            await run_cached_audio_job(q.message, context, uid, sources, str(action.get("title") or ""), status)
-        else:
-            await run_job(q.message, context, uid, url, "mp3_320", status,
-                          known_meta={"title": str(action.get("title") or "")})
-        return
-    cache_path = str(action.get("cache_path") or "")
-    if cache_path and Path(cache_path).exists():
-        await run_cached_audio_job(
-            q.message,
-            context,
-            uid,
-            Path(cache_path),
-            str(action.get("title") or ""),
-            status,
-        )
-    else:
-        await run_job(
-            q.message,
-            context,
-            uid,
-            url,
-            "mp3_320",
-            status,
-            selected_audio_index=int(action.get("item_index") or 0),
-            known_meta={"title": str(action.get("title") or "")},
-        )
+    await dispatch_job(q.message, context, uid, url, "mp3_320", action=action)
 
 
 def telegram_retry_delay(exc: Exception, attempt: int) -> float:
@@ -1610,12 +1572,30 @@ def telegram_retry_delay(exc: Exception, attempt: int) -> float:
     return float(min(2 ** attempt, 8))
 
 
-async def _retry_telegram(call, attempts: int = 3):
+def connection_failed_before_send(exc: Exception) -> bool:
+    """Only connection establishment / pool failures prove no upload began."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return True
+        exc = exc.__cause__
+    return False
+
+
+async def _retry_telegram(call, attempts: int = 4):
     last: Exception | None = None
     for attempt in range(attempts):
         try:
             return await call()
         except RetryAfter as exc:
+            last = exc
+            if attempt + 1 >= attempts:
+                break
+            await asyncio.sleep(telegram_retry_delay(exc, attempt))
+        except (TimedOut, NetworkError) as exc:
+            if not connection_failed_before_send(exc):
+                raise
             last = exc
             if attempt + 1 >= attempts:
                 break
@@ -1644,7 +1624,7 @@ def has_audio(path: Path) -> bool:
 
 async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None) -> int:
     """Preserve order; group compatible native types in batches of at most ten."""
-    from media_io import lossless_parts, native_video
+    from media_io import lossless_parts, native_audio, native_video
     prepared = []
     for index, path in enumerate(files):
         if progress is not None:
@@ -1659,12 +1639,7 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
             delivery_kind = "animation" if kind == "animation" and len(files) == len(parts) == 1 else "video"
             prepared.extend((delivery_kind, part) for part in parts)
         elif kind == "audio":
-            if path.suffix.lower() not in {".mp3", ".m4a"}:
-                folder.mkdir(parents=True, exist_ok=True)
-                final = folder / "audio.mp3"
-                await asyncio.to_thread(ffmpeg, ["ffmpeg", "-nostdin", "-y", "-i", str(path),
-                                                "-vn", "-c:a", "libmp3lame", "-b:a", "320k", str(final)])
-                path = final
+            path = await asyncio.to_thread(native_audio, path, folder)
             parts = await asyncio.to_thread(lossless_parts, path, folder / "parts", MAX_BYTES)
             prepared.extend(("audio", part) for part in parts)
         else:
@@ -1700,6 +1675,7 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                 return await msg.reply_media_group(media=media)
         if progress is not None:
             progress["attempted"] = True
+        mark_state("sending")
         await _retry_telegram(send_once)
         sent += len(batch)
         if progress is not None:
@@ -1830,165 +1806,129 @@ async def send_mp3_album(msg, sources: list[Path], tmp: Path, progress: dict | N
 
 
 async def run_cached_audio_job(msg, context, uid: int, source: Path | list[Path], title: str, status) -> None:
-    """Fast MP3 path using the exact video already downloaded for this button."""
-    lock = job_lock(uid)
-    metric_add("jobs_started", 1)
-    was_queued = lock.locked()
-    if was_queued:
-        metric_add("queued_jobs", 1)
-        await edit_status(status, "⏳ Queued…")
-
-    tmp = Path(tempfile.mkdtemp(prefix="vx_cache_"))
-    async with lock, global_sem():
-        if was_queued:
-            metric_add("queued_jobs", -1)
-        metric_add("active_jobs", 1)
-        try:
-            sources = source if isinstance(source, list) else [source]
-            local_sources = []
-            for index, path in enumerate(sources):
-                if not path.exists():
-                    raise RuntimeError("Cached media expired.")
-                local_source = tmp / (f"source_{index}" + (path.suffix.lower() or ".bin"))
-                await asyncio.to_thread(shutil.copy2, path, local_source)
-                local_sources.append(local_source)
-            sent = await send_mp3_album(msg, local_sources, tmp)
-            if not sent:
-                raise RuntimeError("MP3 conversion failed.")
-            metric_add("jobs_succeeded", 1)
-            try:
-                await status.delete()
-            except TelegramError:
-                await edit_status(status, "✅ Done")
-        except Exception as exc:
-            metric_add("jobs_failed", 1)
-            log.exception("cached MP3 job failed")
-            await edit_status(status, "❌ MP3 conversion failed. Send the link again.")
-        finally:
-            metric_add("active_jobs", -1)
-            shutil.rmtree(tmp, ignore_errors=True)
+    sources = source if isinstance(source, list) else [source]
+    await run_job(msg, context, uid, "", "mp3_320", status,
+                  cached_sources=sources, known_meta={"title": title})
 
 
 async def run_job(
-    msg,
-    context,
-    uid: int,
-    url: str,
-    mode: str,
-    status=None,
+    msg, context, uid: int, url: str, mode: str, status=None,
     selected_audio_index: int | None = None,
     known_meta: dict[str, Any] | None = None,
+    cached_sources: list[Path] | None = None,
 ) -> None:
     lock = job_lock(uid)
-    metric_add("jobs_started", 1)
-    was_queued = lock.locked()
-    if status is None:
-        status = await msg.reply_text("⬇️ Downloading…")
-    if was_queued:
-        metric_add("queued_jobs", 1)
-        await edit_status(status, "⏳ Queued…")
-
-    delivery_progress = {"sent": 0, "phase": "Waiting for a download slot"}
+    progress = {"sent": 0, "phase": "Queued"}
+    status = status if status is not None else DeferredStatus(msg)
     started_at = time.monotonic()
+    tmp = None
+    active = False
+    delivered = False
+    queued = lock.locked() or global_sem().locked()
+    metric_add("jobs_started", 1)
+    if queued:
+        metric_add("queued_jobs", 1)
 
-    async def typing() -> None:
-        try:
-            previous = ""
-            while True:
-                await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
-                phase = delivery_progress["phase"]
-                text = f"⏳ {phase} · {int(time.monotonic() - started_at) // 15 * 15}s"
+    async def typing():
+        previous = ""
+        while True:
+            try:
+                await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT,
+                                                   connect_timeout=8, read_timeout=8)
+                text = f"⏳ {progress['phase']} · {int(time.monotonic() - started_at) // 15 * 15}s"
                 if text != previous:
                     await edit_status(status, text)
                     previous = text
-                await asyncio.sleep(4)
-        except (asyncio.CancelledError, TelegramError):
-            return
+            except TelegramError:
+                pass
+            await asyncio.sleep(4)
 
-    tmp = Path(tempfile.mkdtemp(prefix="vx_"))
-    platform = platform_of(url) or "web"
-    typing_task: asyncio.Task | None = None
-
-    async with lock:
-        if was_queued:
-            metric_add("queued_jobs", -1)
-        metric_add("active_jobs", 1)
-        await edit_status(status, f"⬇️ Downloading from {PLATFORMS.get(platform, {}).get('label', 'Media')}…")
-        typing_task = asyncio.create_task(typing())
-        async with global_sem():
-            try:
-                delivery_progress["phase"] = f"Downloading from {platform_label(url)}"
-                meta = dict(known_meta or {})
+    ticker = asyncio.create_task(typing())
+    try:
+        async with lock, global_sem():
+            if queued:
+                metric_add("queued_jobs", -1)
+                queued = False
+            active = True
+            metric_add("active_jobs", 1)
+            mark_state("downloading")
+            tmp = Path(tempfile.mkdtemp(prefix="vx_"))
+            progress["phase"] = f"Downloading from {platform_label(url)}"
+            meta = dict(known_meta or {})
+            if cached_sources and all(p.is_file() for p in cached_sources):
+                files = []
+                for i, path in enumerate(cached_sources):
+                    local = tmp / f"cached_{i}{path.suffix}"
+                    await asyncio.to_thread(shutil.copy2, path, local)
+                    files.append(local)
+            else:
                 files = await download_in_worker(url, mode, tmp, meta)
-                kinds = await asyncio.to_thread(lambda: [classify(p) for p in files])
-                sent = 0
-                delivered_items = 0
-                caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
-
-                if mode in AUDIO_PRESETS:
-                    if selected_audio_index is not None:
-                        if selected_audio_index < 0 or selected_audio_index >= len(files):
-                            raise RuntimeError("Requested media item is no longer available.")
-                        if kinds[selected_audio_index] not in {"audio", "video", "animation"}:
-                            raise RuntimeError("Requested media item has no audio track.")
-                        sources = [files[selected_audio_index]]
-                    else:
-                        sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
-                    if not sources:
-                        raise RuntimeError("No audio/video stream was found in this post.")
-                    sent = await send_mp3_album(msg, sources, tmp, delivery_progress)
-                else:
-                    sent = await send_album(msg, files, caption, tmp, delivery_progress)
-                    delivered_items = len(files)
-                    sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
-                    try:
-                        markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
-                    except OSError:
-                        log.warning("Media delivered, but MP3 action could not be saved")
-                        markup = None
-                    typing_task.cancel()
-                    await asyncio.gather(typing_task, return_exceptions=True)
-                    # sendMediaGroup has no reply_markup. Reuse the status message
-                    # for a single post-level button instead of one per video.
-                    await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
-
+            if mode in AUDIO_PRESETS:
+                if selected_audio_index is not None:
+                    if selected_audio_index < 0 or selected_audio_index >= len(files):
+                        raise RuntimeError("Requested media item is no longer available")
+                    files = [files[selected_audio_index]]
+                sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
+                sent = await send_mp3_album(msg, sources, tmp, progress)
                 if not sent:
-                    raise RuntimeError("Nothing downloadable was returned.")
-
-                metric_add("jobs_succeeded", 1)
-                if mode in AUDIO_PRESETS:
-                    typing_task.cancel()
-                    await asyncio.gather(typing_task, return_exceptions=True)
-                    try:
-                        await status.delete()
-                    except TelegramError:
-                        await edit_status(status, "✅ Done")
-
-            except Exception as exc:
-                typing_task.cancel()
-                await asyncio.gather(typing_task, return_exceptions=True)
-                metric_add("jobs_failed", 1)
-                log.exception("download job failed")
-                safe_message = (
-                    friendly_error(platform, exc)
-                    if platform in PLATFORMS
-                    else "Download failed. Please try another link."
-                )
-                count = locals().get("delivery_progress", {}).get("sent", 0)
-                progress = f" {count} media parts already delivered; do not resend them blindly." if count else ""
+                    raise RuntimeError("No accessible audio track")
+                delivered = True
+                mark_state("done")
+                ticker.cancel()
+                await asyncio.gather(ticker, return_exceptions=True)
+                try:
+                    await status.delete()
+                except TelegramError:
+                    await edit_status(status, "✅ MP3 delivered")
+            else:
+                caption = f"⚡ Veltrix Downloader · {platform_label(url)}"
+                sent = await send_album(msg, files, caption, tmp, progress)
+                if not sent:
+                    raise RuntimeError("Nothing downloadable was returned")
+                delivered = True
+                # Persist delivery before optional cache/status operations.
+                mark_state("done")
+                sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
                 markup = None
-                if mode == AUTO_MODE and not delivery_progress.get("attempted"):
-                    try:
-                        token = create_action(uid, url)
-                        markup = InlineKeyboardMarkup([[InlineKeyboardButton("Try again", callback_data=f"retry|{token}")]])
-                    except OSError:
-                        pass
-                await edit_status(status, f"❌ {safe_message}{progress}", reply_markup=markup)
-            finally:
-                metric_add("active_jobs", -1)
-                if typing_task is not None:
-                    typing_task.cancel()
-                shutil.rmtree(tmp, ignore_errors=True)
+                try:
+                    markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
+                except OSError:
+                    log.warning("Media delivered; MP3 cache could not be saved")
+                ticker.cancel()
+                await asyncio.gather(ticker, return_exceptions=True)
+                await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
+            metric_add("jobs_succeeded", 1)
+    except Exception as exc:
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+        count = progress["sent"]
+        if delivered:
+            metric_add("jobs_succeeded", 1)
+            log.warning("Delivery completed; follow-up failed: %s", type(exc).__name__)
+            await edit_status(status, "✅ Media delivered. Send the link again if the MP3 action is unavailable.")
+            return
+        metric_add("jobs_failed", 1)
+        uncertain = bool(progress.get("attempted")) and not connection_failed_before_send(exc)
+        mark_state("interrupted" if count or uncertain else "failed")
+        log.error("job failed: %s", type(exc).__name__)
+        markup = None
+        if mode == AUTO_MODE and not count and not uncertain:
+            try:
+                token = create_action(uid, url)
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("Try again", callback_data=f"retry|{token}")]])
+            except OSError:
+                pass
+        detail = f" {count} media parts already delivered." if count else ""
+        await edit_status(status, "❌ " + friendly_error(platform_of(url) or "", exc) + detail, reply_markup=markup)
+    finally:
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+        if active:
+            metric_add("active_jobs", -1)
+        if queued:
+            metric_add("queued_jobs", -1)
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def start_health_server() -> None:
@@ -2000,8 +1940,11 @@ def start_health_server() -> None:
                 free_mb = disk.free // (1024 * 1024)
             except Exception:
                 free_mb = -1
+            from telegram_network import snapshot
+            connectivity = snapshot()
             body = json.dumps({
                 "ok": True,
+                "telegram": connectivity,
                 "service": "veltrix-downloader",
                 "version": VERSION,
                 "platforms": list(PLATFORMS),
@@ -2016,7 +1959,10 @@ def start_health_server() -> None:
                 "pid": os.getpid(),
                 "metrics": metric_snapshot(),
             }).encode()
-            self.send_response(200 if self.path in {"/", "/health", "/healthz", "/readyz"} else 404)
+            code = 200 if self.path in {"/", "/health", "/healthz", "/readyz"} else 404
+            if self.path == "/readyz" and not connectivity['connected_recently']:
+                code = 503
+            self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -2057,9 +2003,19 @@ def check_download_budget(progress: dict) -> None:
 
 
 def fetch_public_page(url: str) -> httpx.Response:
+    for attempt in range(3):
+        try:
+            return _fetch_public_page_once(url)
+        except httpx.TransportError:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+
+
+def _fetch_public_page_once(url: str) -> httpx.Response:
     current = url
     with httpx.Client(headers=request_headers(url), follow_redirects=False, timeout=25,
-                      proxy=PROXY or None) as client:
+                      proxy=PROXY or None, trust_env=False) as client:
         for _ in range(6):
             if not safe_remote_url(current):
                 raise RuntimeError("Unsafe page redirect")
@@ -2163,7 +2119,7 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
 
 
 def telegram_request(pool_size: int = 16):
-    from telegram.request import HTTPXRequest
+    from telegram_network import ConnectFallback, ObservedRequest
     limits = httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
     # IPv4 is opt-in: a successful curl -4 alone does not prove IPv6 is broken.
     ipv4 = os.getenv("TELEGRAM_IPV4", "0") == "1"
@@ -2171,16 +2127,19 @@ def telegram_request(pool_size: int = 16):
     # variables are often stale on Termux and can make a healthy API time out.
     proxy = os.getenv("TELEGRAM_PROXY") or None
     transport = httpx.AsyncHTTPTransport(
-        local_address="0.0.0.0" if ipv4 else None, limits=limits, retries=2, proxy=proxy,
+        local_address="0.0.0.0" if ipv4 else None, limits=limits, retries=1, proxy=proxy,
     )
-    return HTTPXRequest(connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
-                           connect_timeout=30, pool_timeout=30, media_write_timeout=1800,
+    if ipv4 and not proxy:
+        transport = ConnectFallback(transport, httpx.AsyncHTTPTransport(limits=limits, retries=0))
+    return ObservedRequest(connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
+                           connect_timeout=10, pool_timeout=10, media_write_timeout=1800,
                            httpx_kwargs={"transport": transport, "trust_env": False})
 
 
 def application_builder(token: str):
     builder = (Application.builder().token(token).request(telegram_request())
-               .get_updates_request(telegram_request(1)).concurrent_updates(8))
+               .get_updates_request(telegram_request(1)).concurrent_updates(8)
+               .post_init(resume_jobs).post_stop(stop_jobs).post_shutdown(stop_jobs))
     if TELEGRAM_API_BASE:
         builder = builder.base_url(TELEGRAM_API_BASE + "/bot").base_file_url(TELEGRAM_API_BASE + "/file/bot")
         # Upload bytes even when the local server is on a different machine.
@@ -2188,21 +2147,88 @@ def application_builder(token: str):
     return builder
 
 
+async def resume_jobs(app) -> None:
+    log.info("Telegram identity verified: @%s", app.bot.username)
+    manager = job_manager()
+    ready, uncertain = manager.recover()
+    async def execute(row):
+        target = ChatTarget(app.bot, row['chat'], row['thread'])
+        await run_job(target, app, row['uid'], row['url'], row['mode'])
+    for row in ready:
+        manager.launch(row, execute)
+    async def notify_interrupted(row):
+        target = ChatTarget(app.bot, row['chat'], row['thread'])
+        try:
+            await target.reply_text("⚠️ A restart interrupted media delivery. Check the received items before resending the link. /status shows the job state.",
+                                    connect_timeout=8, read_timeout=8)
+        except TelegramError:
+            pass
+    for row in uncertain:
+        manager.launch(row, notify_interrupted)
+    log.info("Job recovery: %s queued, %s interrupted deliveries", len(ready), len(uncertain))
+
+
+async def stop_jobs(app) -> None:
+    from media_process import stop_all
+    stop_all()
+    if _jobs is not None:
+        await _jobs.shutdown()
+
+
+async def on_error(update, context) -> None:
+    exc = context.error
+    if isinstance(exc, Conflict):
+        log.error("Telegram polling conflict: another instance is using this token. Stop the other worker/webhook.")
+    elif isinstance(exc, NetworkError):
+        log.warning("Telegram connection interrupted: %s; polling will reconnect", type(exc).__name__)
+    else:
+        log.error("Update failed: %s", type(exc).__name__)
+
+
+def register_handlers(app) -> None:
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+
+
+def acquire_instance_lock() -> None:
+    global _instance_lock
+    if os.name != "posix":
+        return
+    import fcntl
+    handle = (DATA_DIR / 'worker.lock').open('a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        log.error("Another Veltrix worker is already running in this data directory")
+        raise SystemExit(73)
+    _instance_lock = handle
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is missing")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    acquire_instance_lock()
     cleanup_stale_temp()
     cleanup_media_cache()
     start_health_server()
     app = application_builder(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    log.info("Veltrix Downloader %s started", VERSION)
-    app.run_polling(drop_pending_updates=False)
+    register_handlers(app)
+    log.info("Veltrix Downloader %s connecting to Telegram", VERSION)
+    try:
+        app.run_polling(drop_pending_updates=False, bootstrap_retries=3, timeout=25)
+    except InvalidToken:
+        log.error("BOT_TOKEN is invalid. Correct .env before restarting.")
+        raise SystemExit(78)
+    except NetworkError as exc:
+        log.warning("Telegram startup offline: %s; supervisor will retry", type(exc).__name__)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

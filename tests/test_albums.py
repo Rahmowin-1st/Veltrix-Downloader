@@ -81,6 +81,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                                    reply_audio=AsyncMock(side_effect=receive))
         self.patches = [patch("bot.classify", side_effect=lambda p: {".jpg": "image", ".mp4": "video", ".m4a": "audio"}[p.suffix]),
                         patch("bot.fit_image", side_effect=lambda path, dest: path),
+                        patch("media_io.native_audio", side_effect=lambda path, dest: path),
                         patch("media_io.native_video", side_effect=lambda path, dest: path)]
         for p in self.patches:
             p.start()
@@ -138,11 +139,14 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_expired_post_cache_redownloads_all_items(self):
         query = SimpleNamespace(data="mp3|post", from_user=SimpleNamespace(id=42),
-                                answer=AsyncMock(), message=SimpleNamespace(reply_text=AsyncMock()))
+                                answer=AsyncMock(), message=SimpleNamespace(chat_id=42, reply_text=AsyncMock()))
+        manager = bot.JobManager(self.root / 'jobs.sqlite3')
         with patch("bot.resolve_action_data", side_effect=[
                 {"url": "https://www.instagram.com/p/test/", "post": True, "children": ["a", "b"]},
-                {"cache_path": ""}, {"cache_path": ""}]), patch("bot.run_job", new_callable=AsyncMock) as job:
+                {"cache_path": ""}, {"cache_path": ""}]), patch("bot.run_job", new_callable=AsyncMock) as job, \
+                patch('bot._jobs', manager):
             await bot.on_callback(SimpleNamespace(callback_query=query), None)
+            await asyncio.gather(*list(manager.tasks.values()))
         job.assert_awaited_once()
         self.assertNotIn("selected_audio_index", job.call_args.kwargs)
 
@@ -160,9 +164,11 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
     async def test_both_polling_and_upload_use_ipv4_option(self):
         with patch.dict(os.environ, {"TELEGRAM_IPV4": "1"}), patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
             app = bot.application_builder("123456:dummy-token-for-tests").build()
-            self.assertEqual(transport.call_count, 2)
-            for call in transport.call_args_list:
+            self.assertEqual(transport.call_count, 4)
+            for call in transport.call_args_list[::2]:
                 self.assertEqual(call.kwargs["local_address"], "0.0.0.0")
+            for call in transport.call_args_list[1::2]:
+                self.assertNotIn('local_address', call.kwargs)
             self.assertIsNot(app.bot._request[0], app.bot._request[1])
             for request in app.bot._request:
                 await request.shutdown()

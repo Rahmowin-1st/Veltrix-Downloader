@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+from media_process import run
 from functools import lru_cache
 from pathlib import Path
 
 
 @lru_cache(maxsize=256)
 def _probe(name: str, size: int, mtime: int) -> dict:
-    result = subprocess.run(
+    result = run(
         ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", name],
         capture_output=True, text=True, timeout=30,
     )
@@ -63,7 +64,7 @@ def prepare_video(path: Path, dest: Path) -> Path:
         return path
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / (path.stem + ".mp4")
-    result = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
+    result = run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
                              "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", str(output)],
                             capture_output=True, timeout=900)
     if result.returncode:
@@ -85,7 +86,7 @@ def lossless_parts(path: Path, dest: Path, limit: int) -> list[Path]:
     for attempt in range(5):
         folder = dest / str(attempt)
         folder.mkdir(exist_ok=True)
-        result = subprocess.run([
+        result = run([
             "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
             "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "segment",
             "-segment_time", str(interval), "-reset_timestamps", "1",
@@ -116,11 +117,33 @@ def native_video(path: Path, dest: Path) -> Path:
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
     ]
     audio_options = ["-c:a", "copy"] if audio and audio.get("codec_name") in {"aac", "mp3"} else ["-c:a", "aac", "-b:a", "256k"]
-    result = subprocess.run([
+    result = run([
         "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
         "-map", f"0:{video['index']}", "-map", "0:a:0?", *video_options,
         *audio_options, "-movflags", "+faststart", str(output),
     ], capture_output=True, timeout=1800)
     if result.returncode or not streamable(output):
         raise RuntimeError("Could not prepare playable Telegram video")
+    return output
+
+
+def native_audio(path: Path, dest: Path) -> Path:
+    """Choose the audio container from bytes, never just the CDN filename."""
+    info = probe(path)
+    track = next(s for s in info['streams'] if s.get('codec_type') == 'audio')
+    codec = track.get('codec_name')
+    fmt = info.get('format', {}).get('format_name', '').split(',')
+    if codec == 'mp3' and path.suffix.lower() == '.mp3' and 'mp3' in fmt:
+        return path
+    if codec == 'aac' and path.suffix.lower() == '.m4a' and 'mov' in fmt:
+        return path
+    suffix = '.m4a' if codec == 'aac' else '.mp3'
+    options = ['-c:a', 'copy'] if codec in {'aac', 'mp3'} else ['-c:a', 'libmp3lame', '-b:a', '320k']
+    dest.mkdir(parents=True, exist_ok=True)
+    output = dest / ('audio_native' + suffix)
+    result = run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(path), '-map', '0:a:0', '-vn',
+                  *options, str(output)], capture_output=True, timeout=900)
+    if result.returncode:
+        raise RuntimeError('Could not prepare playable audio')
+    probe(output)
     return output

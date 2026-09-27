@@ -1,4 +1,26 @@
-# Veltrix Downloader v9.2 audit — 2026-09-27
+# Veltrix Downloader v9.3 audit — 2026-09-27
+
+## v9.3 recovery audit
+
+| Confirmed weakness | Implemented fix | Evidence |
+| --- | --- | --- |
+| Long jobs occupied all eight Telegram update slots | Bound and detach work from update processing | 12 pending jobs while `/start` still completes |
+| Restart lost admitted jobs | SQLite journal and bounded recovery before upload | New manager instance reloads queued/downloading work |
+| Restart during upload could cause duplicate delivery | Persist sending intent before API call; mark uncertain work interrupted | Simulated upload timeout, no replay after recovery |
+| A lost acknowledgement dropped a user request | Deferred status creation; job already admitted durably | Failed acknowledgement still invokes downloader |
+| Direct-download disconnect discarded all bytes | Validated Range/If-Range continuation | Interrupted stream resumes exact bytes; changed object never concatenates |
+| Any Telegram timeout was terminal | Retry only proven pre-send connection failures; IPv4/automatic fallback | Connection, read and write error tests |
+| Startup required an online preflight | Move authentication to supervised worker | Shell/compilation check; live phone remains required |
+| Conversion threads could keep shutdown alive | Track, terminate and reap ffmpeg/ffprobe processes | Real child process shutdown test |
+| Cache requests bypassed duplicate admission | Shared durable queue for link and MP3 actions | Queue ownership/cap tests and post-cache fallback test |
+| Empty gallery errors prevented Pinterest fallback | Distinguish no extraction from partial extraction | Empty metadata allows fallback; partial metadata still rejected |
+| Instagram swallowed incomplete metadata errors | Propagate completeness failure | Dedicated parser regression |
+| Audio suffix could misrepresent its codec/container | Prepare audio from probed streams | Real Opus bytes mislabeled M4A become playable MP3 |
+| Health endpoint only reported process existence | Add observed API/poll connectivity and readiness | Request observer plus bounded read-only diagnosis |
+
+101 local tests pass. Compilation, shell syntax, whitespace and dependency integrity checks pass. Source fixtures and Telegram mocks are not production platform certification. A direct Telegram connectivity probe from the editing environment failed at its configured proxy (CONNECT timeout), so it provides no evidence about the phone's current network.
+
+Remaining boundaries: Android can suspend/kill Termux; internet and free storage are required; source blocks and expired/private/unsupported posts can fail. Recovery needs persistent `data/jobs.sqlite3`. In-progress uploads are not resumable or safely replayable without user inspection. No paid extraction service was added. The existing [competitor review](COMPETITOR_REVIEW.md) informed the queue/retry decisions; this release does not establish superiority over those products.
 
 ## v9.2 follow-up
 

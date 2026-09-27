@@ -24,6 +24,11 @@ while true; do
   RUNTIME=$((END_TS - START_TS))
   CHILD_PID=""
 
+  if [ "$CODE" -eq 73 ] || [ "$CODE" -eq 78 ]; then
+    echo "Supervisor stopped: resolve the worker lock or token configuration shown above."
+    exit "$CODE"
+  fi
+
   # Even a clean child exit is unexpected for a 24/7 polling bot. Restart it.
   # The supervisor itself still exits cleanly when termux_start.sh sends TERM.
 
@@ -39,4 +44,3 @@ while true; do
     if [ "$BACKOFF" -gt 30 ]; then BACKOFF=30; fi
   fi
 done
-

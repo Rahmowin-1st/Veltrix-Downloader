@@ -38,7 +38,7 @@ then
   python -c "import hashlib,pathlib; pathlib.Path('.dependencies.sha256').write_text(hashlib.sha256(pathlib.Path('requirements-termux.txt').read_bytes()).hexdigest())"
 fi
 
-python -m compileall -q bot.py media_io.py source_metadata.py download_worker.py
+python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py download_worker.py
 for bin in ffmpeg ffprobe deno; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "Missing required runtime: $bin"
@@ -49,39 +49,20 @@ done
 
 termux-wake-lock || true
 
-# Polling and webhook cannot be active at the same time. Keep pending updates so
-# restarts do not silently lose links users sent while the worker was offline.
-python - <<'PY'
-import asyncio, os
-from telegram.error import NetworkError, TimedOut
-async def main():
-    from bot import application_builder
-    for attempt in range(1, 4):
-        try:
-            bot = application_builder(os.environ['BOT_TOKEN']).build().bot
-            # Bound the whole attempt, including HTTP transport retries.
-            async with asyncio.timeout(45):
-                async with bot:
-                    me = await bot.get_me()
-                    print(f'Telegram identity verified: @{me.username}')
-                    await bot.delete_webhook(drop_pending_updates=False)
-            return
-        except (TimeoutError, TimedOut, NetworkError):
-            if attempt == 3:
-                raise SystemExit(
-                    'Telegram API unreachable after 3 bounded attempts. '
-                    'Run python diagnose.py, check the phone network, then retry bash termux_start.sh.'
-                )
-            print(f'Telegram connection attempt {attempt}/3 failed; retrying...')
-            await asyncio.sleep(attempt * 2)
-asyncio.run(main())
-PY
+# Authentication and webhook cleanup run inside the supervised worker.
+# A temporary outage must not prevent an offline phone from starting recovery.
+echo "Starting supervised Telegram connection; temporary outages will retry automatically."
 
 if [ -f .veltrix.pid ]; then
   OLD_PID="$(cat .veltrix.pid 2>/dev/null || true)"
   if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    OLD_COMMAND="$(ps -p "$OLD_PID" -o args= 2>/dev/null || true)"
+    case "$OLD_COMMAND" in
+      *termux_supervisor.sh*) ;;
+      *) echo "PID file refers to a different process. No process was stopped. Check .veltrix.pid."; exit 1 ;;
+    esac
     kill "$OLD_PID" 2>/dev/null || true
-    for _ in 1 2 3 4 5; do
+    for _ in $(seq 1 20); do
       kill -0 "$OLD_PID" 2>/dev/null || break
       sleep 1
     done

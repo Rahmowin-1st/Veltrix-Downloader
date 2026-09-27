@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.2
+# Veltrix Downloader 9.3
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -33,23 +33,26 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 
 ## Reliability
 
-- Progress messages show the current stage and elapsed time. Duplicate active links in the same chat are coalesced; each user can have at most three pending link requests.
+- Downloads run outside Telegram update handlers, so long jobs do not occupy all command-processing slots. Progress messages show the stage/time and `/status` shows your recent jobs.
+- A SQLite journal admits at most 20 pending jobs overall and 3 per user. Links and MP3 buttons share admission and duplicate checks; Instagram tracking parameters do not create another active job.
+- Queued/downloading jobs are re-extracted after a restart, up to 3 recoveries and within 24 hours. Jobs that had started sending are marked interrupted and never replayed automatically; check received media before retrying.
+- Direct CDN transfers resume within a job using Range/If-Range when the server supplies a stable validator. If a server ignores Range, the file is restarted cleanly. Resume across a process/device restart is not byte-level: the source is extracted again.
 - Download failures offer a retry button before any media upload is attempted. Unsupported input gets a short explanation.
 - Rate limits allow the next source-aware extractor to run; incomplete collections remain failures. MP3 mode accepts audio-only results for video links.
 - H.264 video is copied when only its audio codec needs conversion. Existing MP3 streams are not re-encoded.
-- Termux Telegram startup checks have three attempts bounded to 45 seconds each; connection failure does not stop the existing supervisor.
+- Termux starts its supervisor while offline and retries Telegram initialization as connectivity returns. Invalid tokens and an existing local worker are reported without an endless restart loop.
 - Per-user serialization and bounded global work concurrency.
 - Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
 - ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.
 - Carousel order is retained; failed entries, extractor error records and item caps are reported instead of silently truncating a post.
 - Snapchat will not substitute a recommended item when the requested Spotlight ID is missing.
 - No generic page-wide download fallback: these can return thumbnails, recommendations or unrelated media.
-- Telegram flood-control delays are honored in full. Ambiguous network/upload timeouts are not blindly retried because Telegram may already have accepted the file.
+- Telegram flood-control delays are honored in full. Proven connection-establishment failures may retry; ambiguous read/write/upload timeouts are not replayed because Telegram may already have accepted the file.
 - Long uploads have dedicated timeouts; MP3 conversions share the same resource semaphore.
-- Termux supervisor exits on shutdown signals. Startup refuses to launch a second supervisor while the previous one is still stopping.
+- Conversion processes and download process groups are stopped on shutdown. A local process lock prevents two workers using the same data directory. Separate devices/services must still avoid polling the same token.
 - Dependency changes are detected during normal restart. Pending Telegram updates are preserved.
 
-No program can guarantee zero interruption on sleeping Android/free hosting. In-flight jobs are not durably resumed after power loss. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
+No program can guarantee zero interruption on sleeping Android/free hosting. The SQLite journal must survive the restart for recovery. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
 
 ## Free primary runtime: existing Termux phone
 
@@ -81,7 +84,7 @@ Render with `TERMUX_PRIMARY=1` is health-only and must not poll alongside Termux
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q bot.py media_io.py source_metadata.py diagnose.py download_worker.py render_free.py tests
+python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
 bash -n termux_start.sh termux_setup.sh termux_supervisor.sh
 ```
 
@@ -91,9 +94,9 @@ Direct requests to all four platforms timed out in the editing environment. No l
 
 ## Runtime diagnosis
 
-Run `python diagnose.py` on the phone for package/runtime checks, DNS and authenticated bot identity. It never consumes updates, changes the webhook or prints the token. It does not prove downloader success or exclude a second polling instance.
+Run `python diagnose.py` on the phone for package/runtime checks, parallel DNS checks, free storage, saved job counts, local worker readiness, error categories and a time-bounded authenticated bot identity check. It never consumes updates, changes the webhook or prints raw log lines/tokens. It does not prove downloader success or exclude a second remote polling instance.
 
-Startup prints the authenticated bot username so a wrong token/chat is visible. Termux defaults `TELEGRAM_IPV4=1` for both polling and sends because the deployed phone reached Telegram over IPv4 while the automatic transport timed out. Set `TELEGRAM_IPV4=0` only on a network verified to support the automatic route. Only explicit `TELEGRAM_PROXY` affects Telegram traffic, avoiding stale generic shell proxies.
+The worker log prints the authenticated bot username when initialization succeeds. Termux defaults `TELEGRAM_IPV4=1`: IPv4 is attempted first, with automatic address selection as a fallback only after a connection-establishment failure. `TELEGRAM_IPV4=0` uses automatic selection directly. Only explicit `TELEGRAM_PROXY` affects Telegram traffic. No hardcoded IP, DNS override or disabled TLS verification is used.
 
 Optional owner-supplied cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, and `PINTEREST_COOKIE_FILE`. They do not guarantee access; do not share them in chat or use them to bypass restrictions. Worker failures now include a URL/token-redacted diagnostic in `logs/termux.log`.
 

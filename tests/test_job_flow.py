@@ -50,28 +50,41 @@ class ExtractorFlowTests(unittest.TestCase):
 
 
 class JobFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.manager = bot.JobManager(Path(self.tmp.name) / 'jobs.sqlite3')
+        self.manager_patch = patch('bot._jobs', self.manager)
+        self.manager_patch.start()
+
+    async def asyncTearDown(self):
+        await self.manager.shutdown()
+        self.manager_patch.stop()
+        self.tmp.cleanup()
+
     async def test_duplicate_link_runs_once_and_cleans_up(self):
         started, release = asyncio.Event(), asyncio.Event()
         async def run(*args, **kwargs):
             started.set()
             await release.wait()
+            bot.mark_state('done')
         msg = SimpleNamespace(chat_id=1, reply_text=AsyncMock())
-        with patch('bot._pending_links', set()), patch('bot.run_job', side_effect=run) as job:
+        with patch('bot.run_job', side_effect=run) as job:
             first = asyncio.create_task(bot.dispatch_job(msg, None, 1, 'https://youtu.be/test', 'auto'))
             await asyncio.wait_for(started.wait(), 2)
             await bot.dispatch_job(msg, None, 1, 'https://youtu.be/test', 'auto')
             self.assertIn('already being processed', msg.reply_text.call_args.args[0])
             release.set()
             await first
+            await asyncio.gather(*list(self.manager.tasks.values()))
             job.assert_awaited_once()
-            self.assertFalse(bot._pending_links)
+            self.assertEqual(self.manager.recent(1, 1)[0]['state'], 'done')
 
-    async def test_failed_ack_releases_pending_slot(self):
+    async def test_failed_ack_does_not_lose_the_download(self):
         msg = SimpleNamespace(chat_id=1, reply_text=AsyncMock(side_effect=TimedOut()))
-        with patch('bot._pending_links', set()):
-            with self.assertRaises(TimedOut):
-                await bot.dispatch_job(msg, None, 1, 'https://youtu.be/test', 'auto')
-            self.assertFalse(bot._pending_links)
+        with patch('bot.run_job', new_callable=AsyncMock) as run:
+            await bot.dispatch_job(msg, None, 1, 'https://youtu.be/test', 'auto')
+            await asyncio.gather(*list(self.manager.tasks.values()))
+            run.assert_awaited_once()
 
     async def test_plain_text_receives_guidance(self):
         msg = SimpleNamespace(text='hello', caption=None, reply_text=AsyncMock())

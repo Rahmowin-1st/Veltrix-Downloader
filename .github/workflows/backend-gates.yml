@@ -35,7 +35,7 @@ jobs:
         run: python -m pip check
 
       - name: Compile
-        run: python -m compileall -q bot.py media_io.py source_metadata.py diagnose.py download_worker.py render_free.py tests
+        run: python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
 
       - name: Shell syntax
         run: |

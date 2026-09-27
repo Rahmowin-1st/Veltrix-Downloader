@@ -93,18 +93,14 @@ def main() -> None:
     # In the all-free setup, Termux is the Telegram worker. Render stays health-only
     # and must not recreate a webhook that would steal updates from Termux polling.
     if os.getenv("TERMUX_PRIMARY", "").strip() == "1":
-        asyncio.run(Bot(token).delete_webhook(drop_pending_updates=False))
         bot.start_health_server()
         log.info("TERMUX_PRIMARY=1: Telegram disabled on Render; health-only mode")
         while True:
             time.sleep(3600)
 
     app = bot.application_builder(token).build()
-    app.add_handler(CommandHandler("start", bot.cmd_start))
-    app.add_handler(CommandHandler("help", bot.cmd_help))
-    app.add_handler(CommandHandler("settings", bot.cmd_settings))
-    app.add_handler(CallbackQueryHandler(bot.on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.on_text))
+    bot.acquire_instance_lock()
+    bot.register_handlers(app)
 
     hostname = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
     port = int(os.getenv("PORT", "10000"))
@@ -132,4 +128,3 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         raise
-
