@@ -1,4 +1,17 @@
-# Veltrix Downloader v9 audit — 2026-09-26
+# Veltrix Downloader v9.1 audit — 2026-09-27
+
+## v9.1 follow-up
+
+- Confirmed and removed document-only photo delivery; use ordered native albums.
+- Confirmed upstream Pinterest carousel extraction chooses slot images without checking slot videos. Rebuild the manifest from exact-pin metadata and reject missing video URLs instead of delivering a cover.
+- Added exact-ID embedded-JSON Pinterest fallback, never related/recommended pins.
+- Wrapped the pinned Instagram parser to reject omitted children and preserve exposed background-audio URLs. All-post MP3 actions cache every available source; MP3 conversion and upload are grouped.
+- Made IPv4 optional and configured separate polling and upload transports. The pasted DNS traceback predates the latest successful startup, so it does not prove the current failure or an IPv6 fault.
+- Added read-only diagnostics and authenticated startup identity. Worker error categories survive temporary-directory cleanup with URL/token redaction.
+- Remaining blocker: no current failing media URLs, live bot token or access to the phone was provided. YouTube/Instagram/Snapchat full production recovery is NOT verified.
+- Photos may be recompressed by Telegram. Native playback of incompatible video requires lossy codec conversion; the highest source stream is still requested. Albums have 10-item/type constraints; their MP3 keyboard is on the status message.
+
+## Previous v9 audit (historical)
 
 Baseline: `4c999bbae572e62e308c1633cd27be8853ff7ee3`.
 

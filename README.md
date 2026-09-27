@@ -1,4 +1,4 @@
-# Veltrix Downloader 9
+# Veltrix Downloader 9.1
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -10,7 +10,7 @@ No quality menu, paid downloader API or per-download subscription.
 | YouTube | yt-dlp + yt-dlp-ejs + Deno + ffmpeg | Videos, Shorts, accessible long videos and audio streams |
 | Instagram | parth-dl, then gallery-dl, then yt-dlp | Public Reels, posts, ordered mixed image/video carousels exposed by these extractors |
 | Snapchat | Exact Spotlight ID / public story metadata; dedicated video preload; yt-dlp fallback | Spotlight videos; public story images/videos, selected story item or current public highlight |
-| Pinterest | gallery-dl ordered manifest + direct media/HLS | Pin images, GIFs, video, mixed Idea Pin pages, image carousels and exposed audio blocks |
+| Pinterest | Exact pin metadata from gallery-dl or embedded page JSON + direct media/HLS | Images, GIFs, video, mixed carousels/Idea Pin pages and exposed audio blocks; no poster substitution |
 
 This is an implementation support matrix, **not a claim that every current URL was tested live**.
 Expired/deleted/private posts, unavailable music, DRM, unsupported page schemas and platform blocks can fail.
@@ -21,9 +21,11 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Automatic mode uses `bv*+ba/b` without a resolution ceiling. Instagram ranks available renditions by pixel area.
 - “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
 - Compatible H.264/AAC videos are remuxed to MP4 without re-encoding and sent as playable videos.
-- Other codecs remain original files. The bot does not silently reduce resolution or bitrate.
-- Original photos are sent as documents because Telegram's photo endpoint recompresses them. Set `PRESERVE_ORIGINALS=0` only if a compressed photo display is preferred.
-- MP3 buttons refer to the exact item. On-demand MP3 is encoded at 320 kbps; this does not improve a lower-quality source.
+- Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
+- Photos are always sent as photos, never documents. Telegram may recompress them; the old `PRESERVE_ORIGINALS` setting is no longer used. Oversize/unusual photos are fitted to photo limits.
+- Ordered photo/video collections use albums of at most 10. Longer collections use multiple albums. Audio cannot share a photo/video album and is grouped separately in source order. Animations retain motion; within albums they use playable MP4.
+- One post-level MP3 button remains on the status message because `sendMediaGroup` has no inline-keyboard parameter. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. Cache misses re-extract the whole post, not just its first video.
+- MP3 is encoded at 320 kbps; this cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
 - Files are streamed during upload rather than read entirely into RAM.
 - Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
 - An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081`; it supports uploads up to 2,000,000,000 bytes. A server must actually be installed/configured; setting the variable alone does not create it. Switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
@@ -74,13 +76,21 @@ Render with `TERMUX_PRIMARY=1` is health-only and must not poll alongside Termux
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q bot.py media_io.py download_worker.py render_free.py tests
+python -m compileall -q bot.py media_io.py source_metadata.py diagnose.py download_worker.py render_free.py tests
 bash -n termux_start.sh termux_setup.sh termux_supervisor.sh
 ```
 
-50 tests passed locally on Python 3.12, including generated real MP4/M4A/PNG/GIF media, stream-copy splits with audio/resolution/duration checks, remuxing, extraction manifests and async delivery failures. Source-page tests use controlled fixtures.
+The regression suite includes real generated MP4/M4A/PNG/GIF media, native animation/video conversion, MP3 extraction, stream-copy splits, mixed albums, cache ownership, exact-pin metadata, partial Instagram rejection and async delivery failures. Source-page and Telegram delivery tests use controlled fixtures; passing them is not live-platform certification.
 
 Direct requests to all four platforms timed out in the editing environment. No live Telegram bot token or access to the running Termux session was available here. Therefore this release still needs live URL-to-Telegram acceptance on the actual runtime. See `docs/RELEASE_AUDIT.md`.
+
+## Runtime diagnosis
+
+Run `python diagnose.py` on the phone for package/runtime checks, DNS and authenticated bot identity. It never consumes updates, changes the webhook or prints the token. It does not prove downloader success or exclude a second polling instance.
+
+Startup prints the authenticated bot username so a wrong token/chat is visible. `TELEGRAM_IPV4=1` optionally selects IPv4 for both polling and sends; default is automatic addressing. `TELEGRAM_PROXY` or the existing `HTTPS_PROXY` is honored, not silently removed. A successful `curl -4` does not establish that IPv6 is broken.
+
+Optional owner-supplied cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, and `PINTEREST_COOKIE_FILE`. They do not guarantee access; do not share them in chat or use them to bypass restrictions. Worker failures now include a URL/token-redacted diagnostic in `logs/termux.log`.
 
 ## Upstream references reviewed
 

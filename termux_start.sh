@@ -34,7 +34,7 @@ then
   python -c "import hashlib,pathlib; pathlib.Path('.dependencies.sha256').write_text(hashlib.sha256(pathlib.Path('requirements-termux.txt').read_bytes()).hexdigest())"
 fi
 
-python -m compileall -q bot.py media_io.py download_worker.py
+python -m compileall -q bot.py media_io.py source_metadata.py download_worker.py
 for bin in ffmpeg ffprobe deno; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "Missing required runtime: $bin"
@@ -51,10 +51,12 @@ python - <<'PY'
 import asyncio, os
 from telegram import Bot
 async def main():
-    from bot import TELEGRAM_API_BASE
-    kwargs = {'base_url': TELEGRAM_API_BASE + '/bot'} if TELEGRAM_API_BASE else {}
-    bot = Bot(os.environ['BOT_TOKEN'], **kwargs)
-    await bot.delete_webhook(drop_pending_updates=False)
+    from bot import application_builder
+    bot = application_builder(os.environ['BOT_TOKEN']).build().bot
+    async with bot:
+        me = await bot.get_me()
+        print(f'Telegram identity verified: @{me.username}')
+        await bot.delete_webhook(drop_pending_updates=False)
 asyncio.run(main())
 PY
 
@@ -88,7 +90,7 @@ sleep 3
 
 PID="$(cat .veltrix.pid)"
 if kill -0 "$PID" 2>/dev/null; then
-  echo "Veltrix Downloader running. Supervisor PID=$PID"
+  echo "Veltrix supervisor started. PID=$PID (media delivery still needs a live test)"
   echo "Log: tail -f logs/termux.log"
 else
   echo "Bot failed to start."

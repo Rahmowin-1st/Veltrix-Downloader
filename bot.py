@@ -23,6 +23,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
@@ -32,14 +33,14 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, InputMediaVideo, InputMediaAudio, Update
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "9.0.0"
+VERSION = "9.1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
@@ -47,7 +48,6 @@ TELEGRAM_LOCAL = bool(TELEGRAM_API_BASE)
 API_UPLOAD_LIMIT = 2_000_000_000 if TELEGRAM_LOCAL else 49_000_000
 MAX_BYTES = min(int(os.getenv("TELEGRAM_MAX_BYTES", str(API_UPLOAD_LIMIT))), API_UPLOAD_LIMIT)
 JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "1800"))
-PRESERVE_ORIGINALS = os.getenv("PRESERVE_ORIGINALS", "1") == "1"
 MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(4 * 1024 * 1024 * 1024)))
 MAX_JOB_BYTES = int(os.getenv("MAX_JOB_BYTES", str(6 * 1024 * 1024 * 1024)))
 MAX_PHOTO_BYTES = int(os.getenv("MAX_PHOTO_BYTES", str(9 * 1024 * 1024)))
@@ -620,7 +620,9 @@ def extract_instagram_public(url: str) -> dict[str, Any]:
         quiet=True,
         overwrite=True,
     )
-    info = downloader.get_info(url)
+    from source_metadata import instagram_extractor
+    downloader = instagram_extractor(downloader)
+    info = downloader.get_info(extractor_candidates(url)[0])
     payload = info if isinstance(info, dict) else {}
     metadata_cache_put(cache_key, payload)
     return payload
@@ -659,7 +661,8 @@ def download_instagram_dedicated(
             fmt for fmt in (entry.get("formats") or [])
             if isinstance(fmt, dict) and fmt.get("url")
         ]
-        formats.sort(key=lambda fmt: _instagram_format_score(fmt, kind), reverse=True)
+        formats.sort(key=lambda fmt: (kind != "video" or fmt.get("has_audio", True),
+                                      _instagram_format_score(fmt, kind)), reverse=True)
 
         for fmt in formats:
             media_url = str(fmt.get("url") or "")
@@ -672,11 +675,19 @@ def download_instagram_dedicated(
                 ext = path_ext if path_ext in {".jpg", ".jpeg", ".png", ".webp", ".avif"} else ".jpg"
             out = dest / f"{index:02d}_{kind}{ext}"
             if _download_direct_file(media_url, out, referer="https://www.instagram.com/"):
+                if classify(out) != kind:
+                    out.unlink(missing_ok=True)
+                    continue
                 outputs.append(out)
                 break
 
     if len(outputs) != len(entries):
         raise RuntimeError(f"Incomplete carousel: downloaded {len(outputs)}/{len(entries)} items.")
+    for index, audio_url in enumerate(info.get("audio_urls") or []):
+        audio = Path(tmpdir) / "soundtrack" / f"{index:05d}.m4a"
+        if _download_direct_file(audio_url, audio, referer=url):
+            if not has_audio(audio):
+                audio.unlink(missing_ok=True)
     return validate_media_files(outputs), str(info.get("type") or "").lower()
 
 
@@ -750,7 +761,10 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
     if cached:
         return cached
     for candidate in extractor_candidates(url)[:3]:
-        response = fetch_public_page(candidate)
+        try:
+            response = fetch_public_page(candidate)
+        except (httpx.HTTPError, RuntimeError):
+            continue
         match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', response.text, re.I | re.S)
         if not match:
             if "/spotlight/" in urlparse(candidate).path:
@@ -813,8 +827,8 @@ def video_chain(height: int) -> list[str]:
 
 def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     base = base_ydl_opts(tmpdir)
-    cookie_file = os.getenv("YOUTUBE_COOKIE_FILE", "")
-    if platform_of(url) == "youtube" and cookie_file and Path(cookie_file).is_file():
+    cookie_file = os.getenv(f"{(platform_of(url) or '').upper()}_COOKIE_FILE", "")
+    if cookie_file and Path(cookie_file).is_file():
         base["cookiefile"] = cookie_file
     attempts: list[tuple[str, dict[str, Any]]] = []
     if mode in {AUTO_MODE, "original"}:
@@ -989,6 +1003,9 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
            str(Path(__file__).with_name("gallery-dl.conf")), "--resolve-json", url]
     if PROXY:
         cmd[3:3] = ["--proxy", PROXY]
+    cookie_file = os.getenv(f"{platform_of(url).upper()}_COOKIE_FILE", "")
+    if cookie_file and Path(cookie_file).is_file():
+        cmd[3:3] = ["--cookies", cookie_file]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode:
         raise RuntimeError("Gallery metadata unavailable")
@@ -997,6 +1014,14 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
         raise RuntimeError("Incomplete gallery metadata or unresolved media item")
     entries = [row for row in manifest if isinstance(row, list) and len(row) >= 3 and row[0] == 3
                and not str(row[1]).startswith("text:")]
+    if platform_of(url) == "pinterest":
+        from source_metadata import pinterest_entries
+        pins = [row[-1] for row in manifest if isinstance(row, list) and row and row[0] == 2
+                and isinstance(row[-1], dict) and any(k in row[-1] for k in ("images", "videos", "carousel_data", "story_pin_data"))]
+        if pins:
+            # Reconstruct from full pin metadata: gallery-dl's carousel path
+            # chooses an image even for a video slot.
+            return download_source_entries([entry for pin in pins for entry in pinterest_entries(pin)], dest, url)
     if not entries:
         return []
     if len(entries) > MAX_GALLERY_ITEMS:
@@ -1021,10 +1046,75 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
             ext = str(meta.get("extension") or Path(urlparse(media_url).path).suffix.lstrip(".") or "bin")
             ext = ext if re.fullmatch(r"[a-zA-Z0-9]{1,8}", ext) else "bin"
             out = folder / f"media.{ext}"
-            if not _download_direct_file(media_url, out, referer=url):
+            candidates = [media_url, *(meta.get("_fallback") or [])]
+            if not any(_download_direct_file(candidate, out, referer=url) for candidate in candidates):
                 raise RuntimeError(f"Incomplete carousel: downloaded {len(outputs)}/{len(entries)} items")
             outputs.append(out)
     return validate_media_files(outputs)
+
+
+def download_source_entries(entries: list[dict], dest: Path, referer: str) -> list[Path]:
+    if len(entries) > MAX_GALLERY_ITEMS:
+        raise RuntimeError("Post exceeds configured item limit")
+    outputs = []
+    for index, entry in enumerate(entries):
+        folder = dest / f"source_{index:05d}"
+        folder.mkdir(parents=True, exist_ok=True)
+        completed = None
+        for variant, fmt in enumerate(entry["formats"]):
+            url = fmt.get("url") or ""
+            if not safe_remote_url(url):
+                continue
+            try:
+                if ".m3u8" in url or ".mpd" in url:
+                    opts = base_ydl_opts(str(folder))
+                    opts.update(format="bv*+ba/b", outtmpl=str(folder / f"{variant}.%(ext)s"))
+                    with YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    found = [Path(x["filepath"]) for x in info.get("requested_downloads", []) if x.get("filepath")]
+                    found = found or files_in(folder)
+                    if len(found) != 1:
+                        continue
+                    path = found[0]
+                else:
+                    ext = Path(urlparse(url).path).suffix
+                    ext = ext if re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", ext) else ".bin"
+                    path = folder / f"{variant}{ext}"
+                    if not _download_direct_file(url, path, referer=referer):
+                        continue
+                actual = classify(path)
+                if actual != entry["kind"] and not (entry["kind"] == "image" and actual == "animation"):
+                    continue
+                completed = path
+                break
+            except Exception as exc:
+                log.warning("Source variant failed: %s", type(exc).__name__)
+        if completed is None:
+            raise RuntimeError(f"Incomplete post: item {index + 1}/{len(entries)} unavailable; poster substitution refused")
+        outputs.append(completed)
+    return validate_media_files(outputs)
+
+
+def download_pinterest_page(url: str, tmpdir: str) -> list[Path]:
+    from source_metadata import find_pinterest_pin, pinterest_entries
+    resolved = resolve_public_redirect(url)
+    match = re.search(r"/pin/(?:[\w-]+--)?(\d+)", urlparse(resolved).path)
+    if not match:
+        return []
+    page = fetch_public_page(resolved)
+    matches = []
+    for raw in re.findall(r"<script\b[^>]*>(.*?)</script>", page.text, re.I | re.S):
+        try:
+            document = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        pin = find_pinterest_pin(document, match.group(1))
+        if pin:
+            matches.append(pin)
+    if not matches:
+        return []
+    pin = find_pinterest_pin(matches, match.group(1))
+    return download_source_entries(pinterest_entries(pin), Path(tmpdir) / "pinterest_page", resolved)
 
 
 def og_values(page: str, names: set[str]) -> list[str]:
@@ -1142,6 +1232,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
         return f"{label}: the platform blocked this download request."
     if "429" in low or "too many" in low or "rate-limit" in low:
         return f"{label}: temporarily rate-limited. Try again later."
+    if "no accessible audio" in low or "no audio/video" in low or "no audio track" in low:
+        return "This post has no accessible audio track. A photo alone does not contain its background music."
     if "unsupported url" in low:
         return f"{label}: this link type is not supported yet."
     if "telegram" in low and ("limit" in low or "fit" in low or "over" in low):
@@ -1215,7 +1307,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                    lambda: download_ytdlp(url, mode, tmpdir)]
     elif platform == "pinterest":
         # gallery-dl retains page boundaries, audio blocks and carousel order.
-        engines = [lambda: download_gallery(resolve_public_redirect(url), tmpdir)]
+        engines = [lambda: download_gallery(resolve_public_redirect(url), tmpdir),
+                   lambda: download_pinterest_page(url, tmpdir)]
     else:
         engines = [lambda: download_snapchat_dedicated(url, tmpdir, (prefetched or {}).get("_snap_info")),
                    lambda: download_ytdlp(url, mode, tmpdir)]
@@ -1349,17 +1442,19 @@ def fit_image(path: Path, dest: Path) -> Path:
     """Keep visual media native only when it is guaranteed to fit Telegram photo rules."""
     if telegram_photo_ready(path):
         return path
+    if classify(path) != "image":
+        raise RuntimeError("Refusing to convert video or animation to a photo")
     dest.mkdir(parents=True, exist_ok=True)
     for width, quality in ((4096, 4), (3072, 6), (2048, 8), (1600, 10)):
         out = dest / f"{path.stem}.{width}.jpg"
         ffmpeg([
             "ffmpeg", "-y", "-i", str(path), "-frames:v", "1",
-            "-vf", f"scale='min({width},iw)':-2",
+            "-vf", f"scale='min({width},iw)':'min({width},ih)':force_original_aspect_ratio=decrease,pad='max(iw,ih/19)':'max(ih,iw/19)':(ow-iw)/2:(oh-ih)/2",
             "-q:v", str(quality), str(out),
         ], timeout=180)
-        if out.exists() and out.stat().st_size <= MAX_PHOTO_BYTES:
+        if telegram_photo_ready(out):
             return out
-    return out if out.exists() else path
+    raise RuntimeError("Image could not fit Telegram photo limits")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1429,6 +1524,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await q.answer()
     status = await q.message.reply_text("⬇️ Converting to MP3…")
+    if action.get("post"):
+        rows = [resolve_action_data(uid, child) for child in action.get("children", [])]
+        sources = [Path(row["cache_path"]) for row in rows if row.get("cache_path")]
+        if sources and len(sources) == len(rows):
+            await run_cached_audio_job(q.message, context, uid, sources, str(action.get("title") or ""), status)
+        else:
+            await run_job(q.message, context, uid, url, "mp3_320", status,
+                          known_meta={"title": str(action.get("title") or "")})
+        return
     cache_path = str(action.get("cache_path") or "")
     if cache_path and Path(cache_path).exists():
         await run_cached_audio_job(
@@ -1479,15 +1583,89 @@ async def _retry_telegram(call, attempts: int = 3):
 
 
 async def send_image(msg, path: Path, caption: str, tmp: Path) -> int:
-    if PRESERVE_ORIGINALS:
-        # Telegram photo upload recompresses; document preserves source bytes.
-        return await send_document(msg, path, caption)
     final = await asyncio.to_thread(fit_image, path, tmp / "fit_images")
     async def send_once():
         with final.open("rb") as fh:
             return await msg.reply_photo(photo=InputFile(fh, read_file_handle=False), caption=caption or None)
     await _retry_telegram(send_once)
     return 1
+
+
+def has_audio(path: Path) -> bool:
+    from media_io import probe
+    try:
+        return any(s.get("codec_type") == "audio" for s in probe(path)["streams"])
+    except (RuntimeError, OSError):
+        return False
+
+
+async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None) -> int:
+    """Preserve order; group compatible native types in batches of at most ten."""
+    from media_io import lossless_parts, native_video
+    prepared = []
+    for index, path in enumerate(files):
+        folder = tmp / "delivery" / str(index)
+        kind = classify(path)
+        if kind == "image":
+            prepared.append(("image", await asyncio.to_thread(fit_image, path, folder)))
+        elif kind in {"video", "animation"}:
+            final = await asyncio.to_thread(native_video, path, folder)
+            parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", MAX_BYTES)
+            delivery_kind = "animation" if kind == "animation" and len(files) == len(parts) == 1 else "video"
+            prepared.extend((delivery_kind, part) for part in parts)
+        elif kind == "audio":
+            if path.suffix.lower() not in {".mp3", ".m4a"}:
+                folder.mkdir(parents=True, exist_ok=True)
+                final = folder / "audio.mp3"
+                await asyncio.to_thread(ffmpeg, ["ffmpeg", "-nostdin", "-y", "-i", str(path),
+                                                "-vn", "-c:a", "libmp3lame", "-b:a", "320k", str(final)])
+                path = final
+            parts = await asyncio.to_thread(lossless_parts, path, folder / "parts", MAX_BYTES)
+            prepared.extend(("audio", part) for part in parts)
+        else:
+            raise RuntimeError("Unsupported media type; no photo substitution performed")
+    sent = 0
+    while sent < len(prepared):
+        family = "audio" if prepared[sent][0] == "audio" else "visual"
+        batch = []
+        for kind, path in prepared[sent:sent + 10]:
+            if ("audio" if kind == "audio" else "visual") != family:
+                break
+            batch.append((kind, path))
+        label = caption if not sent else ""
+        async def send_once():
+            with ExitStack() as stack:
+                media = []
+                for offset, (kind, path) in enumerate(batch):
+                    upload = InputFile(stack.enter_context(path.open("rb")), filename=path.name, read_file_handle=False)
+                    item_caption = label if offset == 0 else None
+                    if len(batch) == 1:
+                        if kind == "image":
+                            return await msg.reply_photo(photo=upload, caption=item_caption)
+                        if kind == "video":
+                            return await msg.reply_video(video=upload, caption=item_caption, supports_streaming=True)
+                        if kind == "animation":
+                            return await msg.reply_animation(animation=upload, caption=item_caption)
+                        return await msg.reply_audio(audio=upload, caption=item_caption)
+                    cls = {"image": InputMediaPhoto, "video": InputMediaVideo, "audio": InputMediaAudio}[kind]
+                    kwargs = {"supports_streaming": True} if kind == "video" else {}
+                    media.append(cls(media=upload, caption=item_caption, **kwargs))
+                return await msg.reply_media_group(media=media)
+        await _retry_telegram(send_once)
+        sent += len(batch)
+        if progress is not None:
+            progress["sent"] = sent
+    return sent
+
+
+def post_mp3_button(uid: int, url: str, sources: list[Path], title: str) -> InlineKeyboardMarkup:
+    children = [create_action(uid, url, path, title, index) for index, path in enumerate(sources)]
+    token = create_action(uid, url, title=title)
+    with _action_lock:
+        actions = _load_actions()
+        actions[token].update(post=True, children=children)
+        _save_actions(actions)
+    return InlineKeyboardMarkup([[InlineKeyboardButton("MP3", callback_data=f"mp3|{token}")]])
 
 
 async def send_animation(msg, path: Path, caption: str, tmp: Path) -> int:
@@ -1578,7 +1756,23 @@ async def send_document(msg, path: Path, caption: str, reply_markup=None) -> int
     return 1
 
 
-async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str, status) -> None:
+async def send_mp3_album(msg, sources: list[Path], tmp: Path) -> int:
+    outputs = []
+    for index, source in enumerate(sources):
+        if not has_audio(source):
+            continue
+        folder = tmp / "mp3" / str(index)
+        folder.mkdir(parents=True, exist_ok=True)
+        output = folder / f"audio_{index + 1:02d}.mp3"
+        await asyncio.to_thread(ffmpeg, ["ffmpeg", "-nostdin", "-y", "-i", str(source),
+                                        "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", "320k", str(output)])
+        outputs.append(output)
+    if not outputs:
+        raise RuntimeError("No accessible audio track was found in this post.")
+    return await send_album(msg, outputs, "Veltrix Downloader · MP3", tmp)
+
+
+async def run_cached_audio_job(msg, context, uid: int, source: Path | list[Path], title: str, status) -> None:
     """Fast MP3 path using the exact video already downloaded for this button."""
     lock = job_lock(uid)
     metric_add("jobs_started", 1)
@@ -1593,18 +1787,15 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path, title: str,
             metric_add("queued_jobs", -1)
         metric_add("active_jobs", 1)
         try:
-            if not source.exists():
-                raise RuntimeError("Cached media expired.")
-            local_source = tmp / ("source" + (source.suffix.lower() or ".bin"))
-            await asyncio.to_thread(shutil.copy2, source, local_source)
-            sent = await send_audio(
-                msg,
-                local_source,
-                "⚡ Veltrix Downloader · MP3",
-                "mp3_320",
-                tmp,
-                title,
-            )
+            sources = source if isinstance(source, list) else [source]
+            local_sources = []
+            for index, path in enumerate(sources):
+                if not path.exists():
+                    raise RuntimeError("Cached media expired.")
+                local_source = tmp / (f"source_{index}" + (path.suffix.lower() or ".bin"))
+                await asyncio.to_thread(shutil.copy2, path, local_source)
+                local_sources.append(local_source)
+            sent = await send_mp3_album(msg, local_sources, tmp)
             if not sent:
                 raise RuntimeError("MP3 conversion failed.")
             metric_add("jobs_succeeded", 1)
@@ -1665,6 +1856,7 @@ async def run_job(
                 kinds = [classify(p) for p in files]
                 sent = 0
                 delivered_items = 0
+                delivery_progress = {"sent": 0}
                 caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
 
                 if mode in AUDIO_PRESETS:
@@ -1675,57 +1867,28 @@ async def run_job(
                             raise RuntimeError("Requested media item has no audio track.")
                         sources = [files[selected_audio_index]]
                     else:
-                        sources = [p for p, kind in zip(files, kinds) if kind in {"audio", "video", "animation"}]
+                        sources = [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)]
                     if not sources:
                         raise RuntimeError("No audio/video stream was found in this post.")
-                    for index, source in enumerate(sources):
-                        sent += await send_audio(
-                            msg,
-                            source,
-                            caption if index == 0 else "",
-                            mode,
-                            tmp,
-                            str(meta.get("title") or ""),
-                        )
+                    sent = await send_mp3_album(msg, sources, tmp)
                 else:
-                    requested = 4320 if mode in {"original", AUTO_MODE} else int(VIDEO_PRESETS[mode]["height"])
-                    for index, (path, kind) in enumerate(zip(files, kinds)):
-                        item_caption = caption if sent == 0 else ""
-                        if kind == "image":
-                            sent += await send_image(msg, path, item_caption, tmp)
-                        elif kind == "animation":
-                            sent += await send_animation(msg, path, item_caption, tmp)
-                        elif kind == "video":
-                            markup = mp3_button(
-                                uid,
-                                url,
-                                source_path=path,
-                                title=str(meta.get("title") or ""),
-                                item_index=index,
-                            )
-                            sent += await send_video(
-                                msg,
-                                path,
-                                item_caption,
-                                requested,
-                                tmp,
-                                markup,
-                            )
-                        elif kind == "audio":
-                            sent += await send_audio(msg, path, item_caption, "original", tmp)
-                        else:
-                            # Rare unknown files are kept rather than silently lost.
-                            sent += await send_document(msg, path, item_caption)
-                        delivered_items += 1
+                    sent = await send_album(msg, files, caption, tmp, delivery_progress)
+                    delivered_items = len(files)
+                    sources = [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)]
+                    markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
+                    # sendMediaGroup has no reply_markup. Reuse the status message
+                    # for a single post-level button instead of one per video.
+                    await edit_status(status, "✅ Done · MP3", reply_markup=markup)
 
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned.")
 
                 metric_add("jobs_succeeded", 1)
-                try:
-                    await status.delete()
-                except TelegramError:
-                    await edit_status(status, "✅ Done")
+                if mode in AUDIO_PRESETS:
+                    try:
+                        await status.delete()
+                    except TelegramError:
+                        await edit_status(status, "✅ Done")
 
             except Exception as exc:
                 metric_add("jobs_failed", 1)
@@ -1735,7 +1898,8 @@ async def run_job(
                     if platform in PLATFORMS
                     else "Download failed. Please try another link."
                 )
-                progress = f" {delivered_items}/{len(files)} items delivered." if locals().get("delivered_items", 0) else ""
+                count = locals().get("delivery_progress", {}).get("sent", 0)
+                progress = f" {count} media parts already delivered; do not resend them blindly." if count else ""
                 await edit_status(status, f"❌ {safe_message}{progress}")
             finally:
                 metric_add("active_jobs", -1)
@@ -1907,6 +2071,7 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
         raise RuntimeError("Download worker stopped unexpectedly")
     result = json.loads(result_path.read_text())
     if result.get("error"):
+        log.warning("worker %s: %s", platform_of(url), result.get("diagnostic", "no diagnostic"))
         raise RuntimeError(result["error"])
     files = [Path(p).resolve() for p in result.get("files", [])]
     if not files or any(not p.is_relative_to(tmp) or not p.is_file() for p in files):
@@ -1914,11 +2079,23 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
     return files
 
 
-def application_builder(token: str):
+def telegram_request(pool_size: int = 16):
     from telegram.request import HTTPXRequest
-    request = HTTPXRequest(connection_pool_size=16, read_timeout=120, write_timeout=120,
-                           connect_timeout=30, pool_timeout=30, media_write_timeout=1800)
-    builder = Application.builder().token(token).request(request).concurrent_updates(8)
+    limits = httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
+    # IPv4 is opt-in: a successful curl -4 alone does not prove IPv6 is broken.
+    ipv4 = os.getenv("TELEGRAM_IPV4", "0") == "1"
+    proxy = os.getenv("TELEGRAM_PROXY") or os.getenv("HTTPS_PROXY") or None
+    transport = httpx.AsyncHTTPTransport(
+        local_address="0.0.0.0" if ipv4 else None, limits=limits, retries=2, proxy=proxy,
+    )
+    return HTTPXRequest(connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
+                           connect_timeout=30, pool_timeout=30, media_write_timeout=1800,
+                           httpx_kwargs={"transport": transport, "trust_env": False})
+
+
+def application_builder(token: str):
+    builder = (Application.builder().token(token).request(telegram_request())
+               .get_updates_request(telegram_request(1)).concurrent_updates(8))
     if TELEGRAM_API_BASE:
         builder = builder.base_url(TELEGRAM_API_BASE + "/bot").base_file_url(TELEGRAM_API_BASE + "/file/bot")
         # Upload bytes even when the local server is on a different machine.

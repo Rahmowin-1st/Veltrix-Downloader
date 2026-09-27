@@ -133,6 +133,53 @@ class MediaFixtures(unittest.TestCase):
         self.assertTrue(media_io.streamable(final))
         self.assertAlmostEqual(float(media_io.probe(final)["format"]["duration"]), 6, delta=.3)
 
+    def test_video_can_never_be_fitted_as_photo(self):
+        with self.assertRaisesRegex(RuntimeError, "Refusing"):
+            bot.fit_image(self.video, self.root / "not-a-photo")
+
+    def test_panorama_is_fitted_to_native_photo_limits(self):
+        source = self.root / "panorama.png"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=s=4000x80",
+                        "-frames:v", "1", str(source)], check=True)
+        self.assertFalse(bot.telegram_photo_ready(source))
+        final = bot.fit_image(source, self.root / "fit-panorama")
+        self.assertTrue(bot.telegram_photo_ready(final))
+        self.assertEqual(bot.classify(final), "image")
+
+    def test_non_native_video_keeps_resolution_and_sound(self):
+        source = self.root / "mpeg4.mkv"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(self.video), "-c:v", "mpeg4",
+                        "-c:a", "copy", str(source)], check=True)
+        final = media_io.native_video(source, self.root / "native-video")
+        self.assertTrue(media_io.streamable(final))
+        info = media_io.probe(final)
+        video = next(s for s in info["streams"] if s["codec_type"] == "video")
+        self.assertEqual((video["width"], video["height"]), (320, 240))
+        self.assertTrue(bot.has_audio(final))
+        self.assertAlmostEqual(float(info["format"]["duration"]), 6, delta=.3)
+
+    def test_animation_remains_moving_in_album(self):
+        final = media_io.native_video(self.gif, self.root / "native-animation")
+        self.assertTrue(media_io.streamable(final))
+        info = media_io.probe(final)
+        self.assertGreater(float(info["format"]["duration"]), .5)
+        self.assertGreater(int(info["streams"][0]["nb_frames"]), 1)
+
+    def test_mp3_album_extracts_every_audio_source(self):
+        captured = []
+        async def receive(msg, outputs, caption, tmp):
+            for output in outputs:
+                info = media_io.probe(output)
+                self.assertTrue(all(s["codec_type"] == "audio" for s in info["streams"]))
+                self.assertEqual(info["streams"][0]["codec_name"], "mp3")
+                self.assertAlmostEqual(float(info["format"]["duration"]), 6, delta=.3)
+            captured.extend(outputs)
+            return len(outputs)
+        with patch("bot.send_album", side_effect=receive):
+            count = asyncio.run(bot.send_mp3_album(None, [self.video, self.image, self.audio], self.root / "mp3-test"))
+        self.assertEqual(count, 2)
+        self.assertNotEqual(captured[0], captured[1])
+
 
 class ExtractorRegressionTests(unittest.TestCase):
     def test_youtube_id_on_wrong_host_not_rewritten(self):
@@ -189,16 +236,17 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await bot._retry_telegram(send), "sent")
             sleep.assert_awaited_once_with(2.5)
 
-    async def test_original_image_bytes_sent_as_document(self):
+    async def test_image_sent_as_photo_not_document(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "original.jpg"
             path.write_bytes(b"original-image-bytes")
             seen = []
             async def receive(**kwargs):
-                seen.append(kwargs["document"].input_file_content.read())
-            msg = SimpleNamespace(reply_document=AsyncMock(side_effect=receive))
-            with patch("bot.PRESERVE_ORIGINALS", True):
+                seen.append(kwargs["photo"].input_file_content.read())
+            msg = SimpleNamespace(reply_photo=AsyncMock(side_effect=receive), reply_document=AsyncMock())
+            with patch("bot.fit_image", return_value=path):
                 self.assertEqual(await bot.send_image(msg, path, "", Path(tmp)), 1)
+            msg.reply_document.assert_not_called()
             self.assertEqual(seen, [b"original-image-bytes"])
 
     async def test_worker_timeout_reaps_process(self):

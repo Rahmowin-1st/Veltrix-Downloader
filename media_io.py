@@ -97,3 +97,21 @@ def lossless_parts(path: Path, dest: Path, limit: int) -> list[Path]:
             part.unlink()
         interval /= 2
     raise RuntimeError("Telegram limit: source keyframes are too large. A local Bot API server allows larger original files.")
+
+
+def native_video(path: Path, dest: Path) -> Path:
+    """Prefer remuxing; encode incompatible codecs for Telegram video playback."""
+    final = prepare_video(path, dest)
+    if streamable(final):
+        return final
+    dest.mkdir(parents=True, exist_ok=True)
+    output = dest / (path.stem + "_playable.mp4")
+    result = subprocess.run([
+        "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
+        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "18", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", str(output),
+    ], capture_output=True, timeout=1800)
+    if result.returncode or not streamable(output):
+        raise RuntimeError("Could not prepare playable Telegram video")
+    return output
