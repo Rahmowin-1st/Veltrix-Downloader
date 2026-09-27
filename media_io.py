@@ -34,7 +34,8 @@ def media_kind(path: Path) -> str:
     audio = any(s.get("codec_type") == "audio" for s in streams)
     fmt = info.get("format", {}).get("format_name", "")
     if video:
-        if "gif" in fmt or (video[0].get("codec_name") == "webp" and int(video[0].get("nb_frames", 1) or 1) > 1):
+        frames = str(video[0].get("nb_frames") or "1")
+        if "gif" in fmt or "apng" in fmt or (video[0].get("codec_name") == "webp" and frames.isdigit() and int(frames) > 1):
             return "animation"
         if not audio and ("image2" in fmt or "_pipe" in fmt or video[0].get("codec_name") in {"png", "mjpeg", "webp"}):
             if float(info.get("format", {}).get("duration", 0) or 0) <= 0.1:
@@ -50,7 +51,7 @@ def streamable(path: Path) -> bool:
     videos = [s for s in info["streams"] if s.get("codec_type") == "video"]
     audios = [s for s in info["streams"] if s.get("codec_type") == "audio"]
     return (path.suffix.lower() == ".mp4" and bool(videos)
-            and all(s.get("codec_name") == "h264" for s in videos)
+            and all(s.get("codec_name") == "h264" and s.get("pix_fmt") in {"yuv420p", "yuvj420p"} for s in videos)
             and all(s.get("codec_name") in {"aac", "mp3"} for s in audios))
 
 
@@ -106,11 +107,19 @@ def native_video(path: Path, dest: Path) -> Path:
         return final
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / (path.stem + "_playable.mp4")
+    streams = probe(path)["streams"]
+    video = next(s for s in streams if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic"))
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    copy_video = video.get("codec_name") == "h264" and video.get("pix_fmt") in {"yuv420p", "yuvj420p"}
+    video_options = ["-c:v", "copy"] if copy_video else [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
+    ]
+    audio_options = ["-c:a", "copy"] if audio and audio.get("codec_name") in {"aac", "mp3"} else ["-c:a", "aac", "-b:a", "256k"]
     result = subprocess.run([
         "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
-        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "18", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", str(output),
+        "-map", f"0:{video['index']}", "-map", "0:a:0?", *video_options,
+        *audio_options, "-movflags", "+faststart", str(output),
     ], capture_output=True, timeout=1800)
     if result.returncode or not streamable(output):
         raise RuntimeError("Could not prepare playable Telegram video")

@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.1
+# Veltrix Downloader 9.2
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -25,7 +25,7 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Photos are always sent as photos, never documents. Telegram may recompress them; the old `PRESERVE_ORIGINALS` setting is no longer used. Oversize/unusual photos are fitted to photo limits.
 - Ordered photo/video collections use albums of at most 10. Longer collections use multiple albums. Audio cannot share a photo/video album and is grouped separately in source order. Animations retain motion; within albums they use playable MP4.
 - One post-level MP3 button remains on the status message because `sendMediaGroup` has no inline-keyboard parameter. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. Cache misses re-extract the whole post, not just its first video.
-- MP3 is encoded at 320 kbps; this cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
+- Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
 - Files are streamed during upload rather than read entirely into RAM.
 - Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
 - An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081`; it supports uploads up to 2,000,000,000 bytes. A server must actually be installed/configured; setting the variable alone does not create it. Switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
@@ -33,6 +33,11 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 
 ## Reliability
 
+- Progress messages show the current stage and elapsed time. Duplicate active links in the same chat are coalesced; each user can have at most three pending link requests.
+- Download failures offer a retry button before any media upload is attempted. Unsupported input gets a short explanation.
+- Rate limits allow the next source-aware extractor to run; incomplete collections remain failures. MP3 mode accepts audio-only results for video links.
+- H.264 video is copied when only its audio codec needs conversion. Existing MP3 streams are not re-encoded.
+- Termux Telegram startup checks have three attempts bounded to 45 seconds each; connection failure does not stop the existing supervisor.
 - Per-user serialization and bounded global work concurrency.
 - Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
 - ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.

@@ -40,7 +40,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 
 load_dotenv()
-VERSION = "9.1.0"
+VERSION = "9.2.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
@@ -68,6 +68,7 @@ log = logging.getLogger("veltrix")
 _user_lock = Lock()
 _action_lock = Lock()
 _job_locks: dict[int, asyncio.Lock] = {}
+_pending_links: set[tuple[int, int, str, str]] = set()
 _global_sem: asyncio.Semaphore | None = None
 _metrics_lock = Lock()
 _metrics = {
@@ -837,15 +838,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     elif mode in VIDEO_PRESETS:
         attempts = [(fmt, {}) for fmt in video_chain(int(VIDEO_PRESETS[mode]["height"]))]
     elif mode in AUDIO_PRESETS:
-        preset = AUDIO_PRESETS[mode]
-        pp = {
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": str(preset["codec"]),
-                "preferredquality": str(preset["bitrate"]),
-            }]
-        }
-        attempts = [("bestaudio/ba/best", pp), ("18/best", pp)]
+        # Keep source audio here. The delivery stage converts to MP3 once.
+        attempts = [("bestaudio/ba/best", {})]
     else:
         raise ValueError("Unknown download mode")
 
@@ -894,6 +888,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
                     return validate_media_files(complete)
                 shutil.rmtree(attempt_dir, ignore_errors=True)
             except Exception as exc:
+                if fatal_download_error(exc):
+                    raise
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), str(exc)[:220])
     if last:
@@ -1215,23 +1211,45 @@ def page_media_candidates(page: str, include_images: bool = True) -> list[str]:
     return list(dict.fromkeys(x for x in video_candidates + image_candidates if x))
 
 
+class WorkerFailure(RuntimeError):
+    """A worker's already classified, safe user-facing failure."""
+
+
+def fatal_download_error(exc: Exception) -> bool:
+    low = str(exc).lower()
+    if re.search(r"\bage(?:\b|_)", low) and any(word in low for word in ("restricted", "limit", "confirm", "verify")):
+        return True
+    return any(word in low for word in ("incomplete", "truncated", "storage", "deadline",
+                                        "configured item limit", "configured storage limit", "job storage limit"))
+
+
 def friendly_error(platform: str, exc: Exception) -> str:
     """User-safe errors only. Full extractor details stay in logs."""
+    if isinstance(exc, WorkerFailure):
+        return str(exc)
     if isinstance(exc, (TimedOut, NetworkError)):
         return "Telegram did not confirm delivery. Check the chat before retrying to avoid duplicates."
     text = str(exc)
     low = text.lower()
-    if any(word in low for word in ("incomplete", "limit", "truncated", "storage", "deadline")):
-        return text[:240]
     label = PLATFORMS.get(platform, {}).get("label", "Media")
+    if "429" in low or "too many requests" in low or "rate-limit" in low or "rate limit" in low:
+        return f"{label}: temporarily rate-limited. Please wait before trying again."
+    if "storage" in low or "no space left" in low:
+        return "The download device is low on storage. Free some space and try again."
+    if "deadline" in low or "timed out" in low or "timeout" in low:
+        return f"{label}: the download took too long. Please try again later."
+    if "incomplete" in low or "truncated" in low:
+        return f"{label}: some media could not be retrieved. The incomplete post was not sent."
+    if re.search(r"\bage(?:\b|_)", low) and any(s in low for s in ("restricted", "limit", "confirm", "verify")):
+        return "This age-restricted media is not supported."
+    if "limit" in low:
+        return "This media exceeds the current file size or item limit."
     if any(x in low for x in ("login", "sign in", "cookies", "private", "empty media response")):
         return f"{label}: this post currently requires access the bot does not have."
     if "404" in low or "not found" in low:
         return f"{label}: this link is unavailable, expired, or its public page changed."
     if "403" in low or "forbidden" in low:
         return f"{label}: the platform blocked this download request."
-    if "429" in low or "too many" in low or "rate-limit" in low:
-        return f"{label}: temporarily rate-limited. Try again later."
     if "no accessible audio" in low or "no audio/video" in low or "no audio track" in low:
         return "This post has no accessible audio track. A photo alone does not contain its background music."
     if "unsupported url" in low:
@@ -1322,12 +1340,12 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
             if any(p.stat().st_size > MAX_SOURCE_BYTES for p in files):
                 raise RuntimeError("Source file exceeds configured storage limit")
             files = validate_media_files(files)
-            if is_video_post_url(url) and any(classify(p) != "video" for p in files):
+            if mode not in AUDIO_PRESETS and is_video_post_url(url) and any(classify(p) != "video" for p in files):
                 raise RuntimeError("Video post returned a poster instead of video")
             return files
         except Exception as exc:
             # Never hide a partial collection by falling back to a one-item result.
-            if any(word in str(exc).lower() for word in ("incomplete", "limit", "truncated")):
+            if fatal_download_error(exc):
                 raise
             errors.append(exc)
             log.warning("%s extractor failed: %s", platform, type(exc).__name__)
@@ -1496,14 +1514,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
     url = extract_url(msg.text or msg.caption or "")
     if not url:
+        await msg.reply_text("Send a YouTube, Instagram, Snapchat or Pinterest link to download its media.")
         return
     platform = platform_of(url)
     if not platform:
+        await msg.reply_text("This site is not supported. Send a YouTube, Instagram, Snapchat or Pinterest link.")
         return
     patch_user(uid, last_url=url)
 
-    status = await msg.reply_text(f"⏳ {PLATFORMS[platform]['label']} · queued")
-    await run_job(msg, context, uid, url, AUTO_MODE, status, known_meta={"title": "Media"})
+    await dispatch_job(msg, context, uid, url, AUTO_MODE)
+
+
+async def dispatch_job(msg, context, uid: int, url: str, mode: str) -> None:
+    key = (uid, msg.chat_id, url, mode)
+    if key in _pending_links:
+        await msg.reply_text("This link is already being processed here. Its result will arrive automatically.")
+        return
+    if sum(row[0] == uid for row in _pending_links) >= 3:
+        await msg.reply_text("You already have 3 requests in progress. Please wait for one to finish.")
+        return
+    _pending_links.add(key)
+    try:
+        status = await msg.reply_text(f"⏳ {platform_label(url)} · queued")
+        await run_job(msg, context, uid, url, mode, status, known_meta={"title": "Media"})
+    finally:
+        _pending_links.discard(key)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1511,6 +1546,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     data = q.data or ""
     uid = q.from_user.id
 
+    if data.startswith("retry|"):
+        action = resolve_action_data(uid, data.split("|", 1)[1])
+        if not action.get("url"):
+            await q.answer("This action expired. Send the link again.")
+            return
+        await q.answer()
+        await dispatch_job(q.message, context, uid, action["url"], AUTO_MODE)
+        return
     if not data.startswith("mp3|"):
         await q.answer()
         return
@@ -1604,8 +1647,10 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
     from media_io import lossless_parts, native_video
     prepared = []
     for index, path in enumerate(files):
+        if progress is not None:
+            progress["phase"] = f"Preparing media {index + 1}/{len(files)}"
         folder = tmp / "delivery" / str(index)
-        kind = classify(path)
+        kind = await asyncio.to_thread(classify, path)
         if kind == "image":
             prepared.append(("image", await asyncio.to_thread(fit_image, path, folder)))
         elif kind in {"video", "animation"}:
@@ -1633,6 +1678,8 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                 break
             batch.append((kind, path))
         label = caption if not sent else ""
+        if progress is not None:
+            progress["phase"] = f"Sending {sent + 1}-{sent + len(batch)}/{len(prepared)}"
         async def send_once():
             with ExitStack() as stack:
                 media = []
@@ -1651,6 +1698,8 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                     kwargs = {"supports_streaming": True} if kind == "video" else {}
                     media.append(cls(media=upload, caption=item_caption, **kwargs))
                 return await msg.reply_media_group(media=media)
+        if progress is not None:
+            progress["attempted"] = True
         await _retry_telegram(send_once)
         sent += len(batch)
         if progress is not None:
@@ -1756,20 +1805,28 @@ async def send_document(msg, path: Path, caption: str, reply_markup=None) -> int
     return 1
 
 
-async def send_mp3_album(msg, sources: list[Path], tmp: Path) -> int:
+async def send_mp3_album(msg, sources: list[Path], tmp: Path, progress: dict | None = None) -> int:
     outputs = []
     for index, source in enumerate(sources):
-        if not has_audio(source):
+        if progress is not None:
+            progress["phase"] = f"Extracting audio {index + 1}/{len(sources)}"
+        if not await asyncio.to_thread(has_audio, source):
             continue
         folder = tmp / "mp3" / str(index)
         folder.mkdir(parents=True, exist_ok=True)
         output = folder / f"audio_{index + 1:02d}.mp3"
+        from media_io import probe
+        info = await asyncio.to_thread(probe, source)
+        track = next(s for s in info["streams"] if s.get("codec_type") == "audio")
+        codec_options = ["-c:a", "copy"] if track.get("codec_name") == "mp3" else ["-c:a", "libmp3lame", "-b:a", "320k"]
         await asyncio.to_thread(ffmpeg, ["ffmpeg", "-nostdin", "-y", "-i", str(source),
-                                        "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", "320k", str(output)])
+                                        "-map", "0:a:0", "-vn", *codec_options, str(output)])
         outputs.append(output)
     if not outputs:
         raise RuntimeError("No accessible audio track was found in this post.")
-    return await send_album(msg, outputs, "Veltrix Downloader · MP3", tmp)
+    if progress is None:
+        return await send_album(msg, outputs, "Veltrix Downloader · MP3", tmp)
+    return await send_album(msg, outputs, "Veltrix Downloader · MP3", tmp, progress)
 
 
 async def run_cached_audio_job(msg, context, uid: int, source: Path | list[Path], title: str, status) -> None:
@@ -1831,10 +1888,19 @@ async def run_job(
         metric_add("queued_jobs", 1)
         await edit_status(status, "⏳ Queued…")
 
+    delivery_progress = {"sent": 0, "phase": "Waiting for a download slot"}
+    started_at = time.monotonic()
+
     async def typing() -> None:
         try:
+            previous = ""
             while True:
                 await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
+                phase = delivery_progress["phase"]
+                text = f"⏳ {phase} · {int(time.monotonic() - started_at) // 15 * 15}s"
+                if text != previous:
+                    await edit_status(status, text)
+                    previous = text
                 await asyncio.sleep(4)
         except (asyncio.CancelledError, TelegramError):
             return
@@ -1851,12 +1917,12 @@ async def run_job(
         typing_task = asyncio.create_task(typing())
         async with global_sem():
             try:
+                delivery_progress["phase"] = f"Downloading from {platform_label(url)}"
                 meta = dict(known_meta or {})
                 files = await download_in_worker(url, mode, tmp, meta)
-                kinds = [classify(p) for p in files]
+                kinds = await asyncio.to_thread(lambda: [classify(p) for p in files])
                 sent = 0
                 delivered_items = 0
-                delivery_progress = {"sent": 0}
                 caption = f"⚡ Veltrix Downloader · {PLATFORMS.get(platform, {}).get('label', 'Media')}"
 
                 if mode in AUDIO_PRESETS:
@@ -1867,30 +1933,40 @@ async def run_job(
                             raise RuntimeError("Requested media item has no audio track.")
                         sources = [files[selected_audio_index]]
                     else:
-                        sources = [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)]
+                        sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
                     if not sources:
                         raise RuntimeError("No audio/video stream was found in this post.")
-                    sent = await send_mp3_album(msg, sources, tmp)
+                    sent = await send_mp3_album(msg, sources, tmp, delivery_progress)
                 else:
                     sent = await send_album(msg, files, caption, tmp, delivery_progress)
                     delivered_items = len(files)
-                    sources = [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)]
-                    markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
+                    sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
+                    try:
+                        markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
+                    except OSError:
+                        log.warning("Media delivered, but MP3 action could not be saved")
+                        markup = None
+                    typing_task.cancel()
+                    await asyncio.gather(typing_task, return_exceptions=True)
                     # sendMediaGroup has no reply_markup. Reuse the status message
                     # for a single post-level button instead of one per video.
-                    await edit_status(status, "✅ Done · MP3", reply_markup=markup)
+                    await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
 
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned.")
 
                 metric_add("jobs_succeeded", 1)
                 if mode in AUDIO_PRESETS:
+                    typing_task.cancel()
+                    await asyncio.gather(typing_task, return_exceptions=True)
                     try:
                         await status.delete()
                     except TelegramError:
                         await edit_status(status, "✅ Done")
 
             except Exception as exc:
+                typing_task.cancel()
+                await asyncio.gather(typing_task, return_exceptions=True)
                 metric_add("jobs_failed", 1)
                 log.exception("download job failed")
                 safe_message = (
@@ -1900,7 +1976,14 @@ async def run_job(
                 )
                 count = locals().get("delivery_progress", {}).get("sent", 0)
                 progress = f" {count} media parts already delivered; do not resend them blindly." if count else ""
-                await edit_status(status, f"❌ {safe_message}{progress}")
+                markup = None
+                if mode == AUTO_MODE and not delivery_progress.get("attempted"):
+                    try:
+                        token = create_action(uid, url)
+                        markup = InlineKeyboardMarkup([[InlineKeyboardButton("Try again", callback_data=f"retry|{token}")]])
+                    except OSError:
+                        pass
+                await edit_status(status, f"❌ {safe_message}{progress}", reply_markup=markup)
             finally:
                 metric_add("active_jobs", -1)
                 if typing_task is not None:
@@ -2072,7 +2155,7 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
     result = json.loads(result_path.read_text())
     if result.get("error"):
         log.warning("worker %s: %s", platform_of(url), result.get("diagnostic", "no diagnostic"))
-        raise RuntimeError(result["error"])
+        raise WorkerFailure(result["error"])
     files = [Path(p).resolve() for p in result.get("files", [])]
     if not files or any(not p.is_relative_to(tmp) or not p.is_file() for p in files):
         raise RuntimeError("Invalid download worker result")

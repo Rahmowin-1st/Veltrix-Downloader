@@ -1,4 +1,21 @@
-# Veltrix Downloader v9.1 audit — 2026-09-27
+# Veltrix Downloader v9.2 audit — 2026-09-27
+
+## v9.2 follow-up
+
+| Problem | Fix | Verification |
+| --- | --- | --- |
+| Video-link guard rejected MP3-mode audio | Apply poster guard only to visual downloads | Reel audio fallback regression |
+| Generic `limit` check stopped fallback on rate limits | Separate resource/incomplete failures from rate limits | Fallback and incomplete-carousel regressions |
+| MP3 encoded twice | Keep source audio until delivery; copy existing MP3 | Real encoded-packet hash comparison |
+| H.264 video re-encoded for incompatible audio | Choose copy/encode independently per track | H.264 packet hashes equal before/after Opus-to-AAC conversion |
+| Worker error lost its category | Preserve sanitized worker failure type | Safe category/message regression |
+| Duplicate link requests repeated work | Active link deduplication and three-request per-user cap | Concurrent requests and failed-ack cleanup tests |
+| Silent input rejection and unclear waiting | Guidance, stage/elapsed status and pre-upload retry action | Input and ambiguous-upload regressions |
+| Nested startup connection retries could stall | Whole-attempt timeout, three bounded attempts | Python heredoc compilation and shell syntax |
+
+81 local tests pass, including generated media and async error paths. Compilation, shell syntax, whitespace and dependency integrity checks pass. See [competitor review](COMPETITOR_REVIEW.md) for the researched product decisions.
+
+No new live URL-to-Telegram success is claimed: the actual failing source links and the phone runtime are still unavailable. The research is a focused comparison, not an exhaustive benchmark of every downloader.
 
 ## v9.1 follow-up
 
@@ -58,7 +75,7 @@ Use public posts you own or are authorized to download. Send links normally to t
 2. Instagram: photo, Reel and mixed carousel; compare source item count and order, check every video's sound.
 3. Snapchat: Spotlight, exact public story photo, exact public story video, public story sequence. Confirm no recommendation is substituted for an expired item.
 4. Pinterest: image, GIF, video, mixed Idea Pin; compare every page and available audio block.
-5. Queue two requests; confirm both finish in request order. Tap an MP3 button on the second carousel video and confirm it uses that video.
+5. Queue two requests; confirm both finish in request order. Resend an active link and confirm only one job runs. Tap the post-level MP3 button and confirm all exposed audio sources are included.
 6. Restart when idle; confirm a single polling worker and normal `/start`. Inspect `logs/termux.log` for real failures without sharing the bot token.
 
 A release should be called production-verified only after these checks pass on the actual network/runtime.
