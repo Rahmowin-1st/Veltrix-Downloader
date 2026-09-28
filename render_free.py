@@ -141,19 +141,19 @@ def probe_webhook(token: str, expected: str) -> None:
 
 
 def probe_youtube_access() -> None:
-    """Bounded metadata check for a public short previously sent by the owner."""
+    """Bounded cloud-egress check using an established public YouTube video."""
     from yt_dlp import YoutubeDL
 
     try:
         with YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True,
                         'socket_timeout': 10, 'retries': 0, 'extractor_retries': 0,
-                        'noplaylist': True}) as ydl:
-            info = ydl.extract_info('https://www.youtube.com/shorts/2Yhba6asmwg', download=False)
+                        'noplaylist': True, 'js_runtimes': {'deno': {}}}) as ydl:
+            info = ydl.extract_info('https://www.youtube.com/watch?v=dQw4w9WgXcQ', download=False)
         log.info('Render YouTube metadata: %s', 'OK' if info and info.get('formats') else 'no formats')
     except Exception as exc:
         detail = str(exc).lower()
         reason = ('HTTP403' if '403' in detail else 'login-required' if 'sign in' in detail
-                  else 'unavailable' if 'not available' in detail or '404' in detail
+                  else 'unavailable' if 'unavailable' in detail or 'not available' in detail or '404' in detail
                   else type(exc).__name__)
         log.warning('Render YouTube metadata: %s', reason)
 
