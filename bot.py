@@ -41,7 +41,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.3.0"
+VERSION = "9.3.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
@@ -1945,6 +1945,10 @@ def start_health_server() -> None:
             body = json.dumps({
                 "ok": True,
                 "telegram": connectivity,
+                "telegram_route": {
+                    "ipv4_first": os.getenv("TELEGRAM_IPV4", "0") == "1",
+                    "proxy_configured": bool(os.getenv("TELEGRAM_PROXY")),
+                },
                 "service": "veltrix-downloader",
                 "version": VERSION,
                 "platforms": list(PLATFORMS),
@@ -2121,7 +2125,8 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
 def telegram_request(pool_size: int = 16):
     from telegram_network import ConnectFallback, ObservedRequest
     limits = httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
-    # IPv4 is opt-in: a successful curl -4 alone does not prove IPv6 is broken.
+    # Prefer the selected route; retry through the other route only when no
+    # request bytes were sent (connect error/timeout).
     ipv4 = os.getenv("TELEGRAM_IPV4", "0") == "1"
     # Only an explicit Telegram proxy may affect polling. Generic shell proxy
     # variables are often stale on Termux and can make a healthy API time out.
@@ -2129,8 +2134,11 @@ def telegram_request(pool_size: int = 16):
     transport = httpx.AsyncHTTPTransport(
         local_address="0.0.0.0" if ipv4 else None, limits=limits, retries=1, proxy=proxy,
     )
-    if ipv4 and not proxy:
-        transport = ConnectFallback(transport, httpx.AsyncHTTPTransport(limits=limits, retries=0))
+    if not proxy:
+        alternate = httpx.AsyncHTTPTransport(
+            local_address=None if ipv4 else "0.0.0.0", limits=limits, retries=0,
+        )
+        transport = ConnectFallback(transport, alternate)
     return ObservedRequest(connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
                            connect_timeout=10, pool_timeout=10, media_write_timeout=1800,
                            httpx_kwargs={"transport": transport, "trust_env": False})

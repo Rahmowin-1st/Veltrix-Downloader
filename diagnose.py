@@ -16,6 +16,22 @@ import httpx
 import bot
 
 
+async def probe_telegram_route(token: str, label: str, local_address: str | None) -> str:
+    """Exercise an authenticated, read-only API method through one address route."""
+    transport = httpx.AsyncHTTPTransport(local_address=local_address, retries=0)
+    try:
+        async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=httpx.Timeout(8.0)) as client:
+            # Never include the authenticated URL or response body in output.
+            response = await client.post(f"https://api.telegram.org/bot{token}/getMe")
+            if response.status_code == 200:
+                return f"{label}: OK (getMe HTTP 200)"
+            if response.status_code == 401:
+                return f"{label}: invalid bot token (HTTP 401)"
+            return f"{label}: HTTP {response.status_code}"
+    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+        return f"{label}: {type(exc).__name__}"
+
+
 async def main():
     print(f"Veltrix {bot.VERSION} runtime check")
     print(f"Free temp storage: {shutil.disk_usage('/data/data/com.termux/files/usr/tmp' if Path('/data/data/com.termux/files/usr/tmp').exists() else '/tmp').free // (1024 * 1024)} MiB")
@@ -57,25 +73,39 @@ async def main():
         async with httpx.AsyncClient(trust_env=False, timeout=3) as local:
             response = await local.get(f"http://127.0.0.1:{os.getenv('PORT', '10000')}/readyz")
             info = response.json()
-            print(f"Local worker: version={info.get('version')}, ready={response.status_code == 200}, telegram={info.get('telegram')}")
+            state = info.get('telegram') or {}
+            stage = ('connected' if response.status_code == 200 else
+                     'initializing' if not state.get('last_api_ok') and not state.get('last_error') else 'disconnected')
+            print(f"Local worker: version={info.get('version')}, status={stage}, telegram={state}, route={info.get('telegram_route')}")
     except Exception as exc:
         print(f"Local worker health unavailable: {type(exc).__name__}")
-    print(f"Telegram IPv4 option: {os.getenv('TELEGRAM_IPV4', '0')}")
+    print(f"Diagnostic IPv4 preference: {os.getenv('TELEGRAM_IPV4', '0')}; Telegram proxy configured: {bool(os.getenv('TELEGRAM_PROXY'))}")
     if not bot.BOT_TOKEN:
         print("BOT_TOKEN: MISSING")
         return
+    if bot.TELEGRAM_API_BASE:
+        print("Direct Telegram route checks skipped: custom Bot API endpoint configured")
+    elif os.getenv('TELEGRAM_PROXY'):
+        print("Direct Telegram route checks skipped: explicit Telegram proxy configured")
+    else:
+        routes = await asyncio.gather(
+            probe_telegram_route(bot.BOT_TOKEN, "Telegram automatic route", None),
+            probe_telegram_route(bot.BOT_TOKEN, "Telegram IPv4 route", "0.0.0.0"),
+        )
+        for route in routes:
+            print(route)
     try:
         client = bot.application_builder(bot.BOT_TOKEN).build().bot
-        async with asyncio.timeout(30):
+        async with asyncio.timeout(18):
             async with client:
                 me = await client.get_me()
-                webhook = await client.get_webhook_info()
                 print(f"Telegram identity: @{me.username}")
+                webhook = await client.get_webhook_info()
                 print(f"Webhook enabled: {bool(webhook.url)}; pending updates: {webhook.pending_update_count}")
     except Exception as exc:
         # Exception text may contain a token-bearing request URL.
         print(f"Telegram API: {type(exc).__name__}")
-    print("This checks connectivity, not live media downloads or polling conflicts.")
+    print("HTTP route checks use getMe; they do not consume updates or test media delivery.")
 
 
 if __name__ == "__main__":

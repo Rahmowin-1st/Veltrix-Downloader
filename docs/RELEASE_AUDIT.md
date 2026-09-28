@@ -1,4 +1,14 @@
-# Veltrix Downloader v9.3 audit — 2026-09-27
+# Veltrix Downloader v9.3 audit — 2026-09-28
+
+## v9.3.1 phone connectivity follow-up
+
+The reported Termux check showed `ready=False`, no successful Bot API call yet, and a `TimedOut` during `getMe`. DNS and a previous unauthenticated `curl -4 -I` do not establish Bot API connectivity. The worker may have still been initializing when the local health endpoint was read.
+
+- Both address preferences now retain the other route as a connect-only fallback when no Telegram proxy is configured. Read/write failures cannot be replayed safely.
+- A one-run `TELEGRAM_IPV4=1 bash termux_start.sh` setting takes precedence over `.env` for that worker; the local health endpoint exposes the effective setting without exposing the proxy or token.
+- `diagnose.py` makes bounded, read-only authenticated `getMe` requests on both address routes and reports only HTTP status or error type. It also distinguishes an initializing worker from a disconnected one. It skips direct route tests when a custom API base or explicit proxy is configured.
+
+105 local tests, shell parsing and compilation verify this change. The phone's Bot API response and end-to-end source downloads require a live follow-up; no connection fix is claimed if both phone route probes time out.
 
 ## v9.3 recovery audit
 

@@ -7,6 +7,9 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
+# An explicit per-command setting takes precedence over the saved .env value.
+# This allows a one-run network comparison without editing a secret-bearing file.
+START_IPV4_OVERRIDE="${TELEGRAM_IPV4-}"
 set -a
 . ./.env
 set +a
@@ -14,6 +17,9 @@ set +a
 # Use IPv4 by default on Termux; explicit TELEGRAM_IPV4=0 is still respected.
 # A successful curl -4 alone does not diagnose the cause of a Python timeout.
 export TELEGRAM_IPV4="${TELEGRAM_IPV4:-1}"
+if [ -n "$START_IPV4_OVERRIDE" ]; then
+  export TELEGRAM_IPV4="$START_IPV4_OVERRIDE"
+fi
 
 if [ -z "${BOT_TOKEN:-}" ]; then
   echo "BOT_TOKEN missing in .env"

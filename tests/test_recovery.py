@@ -219,6 +219,18 @@ class ConnectivityTests(unittest.IsolatedAsyncioTestCase):
             first.aclose.assert_awaited_once()
             second.aclose.assert_awaited_once()
 
+    async def test_route_fallback_keeps_the_working_route(self):
+        first = SimpleNamespace(handle_async_request=AsyncMock(side_effect=httpx.ConnectTimeout('connect')),
+                                aclose=AsyncMock())
+        second = SimpleNamespace(handle_async_request=AsyncMock(return_value=httpx.Response(200)),
+                                 aclose=AsyncMock())
+        transport = ConnectFallback(first, second)
+        for _ in range(2):
+            self.assertEqual((await transport.handle_async_request(httpx.Request('POST', 'https://api.test'))).status_code, 200)
+        self.assertEqual(first.handle_async_request.await_count, 1)
+        self.assertEqual(second.handle_async_request.await_count, 2)
+        await transport.aclose()
+
     async def test_safe_upload_retry_and_uncertain_timeout(self):
         error = NetworkError('offline')
         error.__cause__ = httpx.ConnectError('dns')

@@ -168,8 +168,19 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
             for call in transport.call_args_list[::2]:
                 self.assertEqual(call.kwargs["local_address"], "0.0.0.0")
             for call in transport.call_args_list[1::2]:
-                self.assertNotIn('local_address', call.kwargs)
+                self.assertIsNone(call.kwargs['local_address'])
             self.assertIsNot(app.bot._request[0], app.bot._request[1])
+            for request in app.bot._request:
+                await request.shutdown()
+
+    async def test_automatic_preference_keeps_ipv4_fallback_for_both_requests(self):
+        with patch.dict(os.environ, {"TELEGRAM_IPV4": "0"}), patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
+            app = bot.application_builder("123456:dummy-token-for-tests").build()
+            self.assertEqual(transport.call_count, 4)
+            for call in transport.call_args_list[::2]:
+                self.assertIsNone(call.kwargs["local_address"])
+            for call in transport.call_args_list[1::2]:
+                self.assertEqual(call.kwargs["local_address"], "0.0.0.0")
             for request in app.bot._request:
                 await request.shutdown()
 
@@ -178,5 +189,5 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
             os.environ.pop("TELEGRAM_PROXY", None)
             request = bot.telegram_request()
-            self.assertIsNone(transport.call_args.kwargs["proxy"])
+            self.assertIsNone(transport.call_args_list[0].kwargs["proxy"])
             await request.shutdown()
