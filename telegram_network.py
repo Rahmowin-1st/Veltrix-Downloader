@@ -7,7 +7,8 @@ from urllib.request import getproxies, proxy_bypass
 import httpx
 from telegram.request import HTTPXRequest
 
-health = {'last_api_ok': 0.0, 'last_poll_ok': 0.0, 'last_error': None}
+health = {'last_api_ok': 0.0, 'last_poll_ok': 0.0, 'last_error': None,
+          'last_poll_start': 0.0, 'last_poll_error': None}
 
 
 def environment_proxy() -> str | None:
@@ -66,23 +67,31 @@ class ObservedRequest(HTTPXRequest):
                 url = self.relay_base + '/relay/file/' + url[len(encoded_file):]
             else:
                 raise ValueError('Unexpected Telegram relay target')
+        polling = url.rsplit('/', 1)[-1].lower() == 'getupdates'
+        if polling:
+            health['last_poll_start'] = time.time()
         try:
             result = await super().do_request(url, method, **kwargs)
         except Exception as exc:
             health['last_error'] = type(exc).__name__
+            if polling:
+                health['last_poll_error'] = type(exc).__name__
             raise
         if result[0] == 200:
             health['last_api_ok'] = time.time()
             health['last_error'] = None
-            if url.rsplit('/', 1)[-1].lower() == 'getupdates':
+            if polling:
                 health['last_poll_ok'] = time.time()
+                health['last_poll_error'] = None
         elif result[0] == 409:
             health['last_error'] = 'PollingConflict'
+        if polling and result[0] != 200:
+            health['last_poll_error'] = 'PollingConflict' if result[0] == 409 else f'HTTP {result[0]}'
         return result
 
 
 def snapshot():
     result = dict(health)
     result['connected_recently'] = bool(result['last_error'] is None and result['last_api_ok'] and time.time() - result['last_api_ok'] < 180)
-    result['polling_recently'] = bool(result['last_error'] is None and result['last_poll_ok'] and time.time() - result['last_poll_ok'] < 180)
+    result['polling_recently'] = bool(result['last_poll_error'] is None and result['last_poll_ok'] and time.time() - result['last_poll_ok'] < 180)
     return result

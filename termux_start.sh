@@ -90,8 +90,43 @@ sleep 3
 
 PID="$(cat .veltrix.pid)"
 if kill -0 "$PID" 2>/dev/null; then
-  echo "Veltrix supervisor started. PID=$PID (media delivery still needs a live test)"
-  echo "Log: tail -f logs/termux.log"
+  echo "Veltrix supervisor started. PID=$PID. Waiting for Telegram polling..."
+  for ((attempt=1; attempt<=90; attempt++)); do
+    if python - <<'PY'
+import os
+from urllib.request import build_opener, ProxyHandler
+try:
+    with build_opener(ProxyHandler({})).open(
+            f"http://127.0.0.1:{os.getenv('PORT', '10000')}/readyz", timeout=1) as response:
+        raise SystemExit(0 if response.status == 200 else 1)
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+      echo "Telegram polling verified. Send /start and a media link to the bot."
+      exit 0
+    fi
+    if ! kill -0 "$PID" 2>/dev/null; then
+      echo "Supervisor stopped before Telegram polling started."
+      exit 1
+    fi
+    sleep 1
+  done
+  python - <<'PY'
+import json
+import os
+from urllib.request import build_opener, ProxyHandler
+try:
+    with build_opener(ProxyHandler({})).open(
+            f"http://127.0.0.1:{os.getenv('PORT', '10000')}/healthz", timeout=2) as response:
+        state = json.load(response)['telegram']
+    error = state.get('last_poll_error') or state.get('last_error') or 'first poll not completed'
+    print(f"Polling not verified after 90s: {error}; last_poll_start={bool(state.get('last_poll_start'))}")
+except Exception as exc:
+    print(f"Worker health unavailable: {type(exc).__name__}")
+PY
+  echo "Supervisor will keep retrying; log: tail -f logs/termux.log"
+  exit 1
 else
   echo "Bot failed to start."
   tail -n 60 logs/termux.log || true

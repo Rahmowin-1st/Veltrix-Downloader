@@ -41,7 +41,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.4.1"
+VERSION = "9.5.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -2254,7 +2254,10 @@ def main() -> None:
     register_handlers(app)
     log.info("Veltrix Downloader %s connecting to Telegram", VERSION)
     try:
-        app.run_polling(drop_pending_updates=False, bootstrap_retries=3, timeout=25)
+        # Short polls finish within the relay's HTTP path and expose dead links
+        # promptly; they still keep the free relay awake while the phone runs.
+        app.run_polling(drop_pending_updates=False, bootstrap_retries=3,
+                        timeout=5 if TELEGRAM_RELAY_BASE else 25)
     except InvalidToken:
         log.error("BOT_TOKEN is invalid. Correct .env before restarting.")
         raise SystemExit(78)

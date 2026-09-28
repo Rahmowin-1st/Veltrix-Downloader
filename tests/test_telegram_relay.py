@@ -10,8 +10,10 @@ from unittest.mock import patch
 import httpx
 
 import bot
+from telegram import Bot
+from telegram.error import Conflict
 from telegram_relay import relay_handler
-from telegram_network import health, snapshot
+from telegram_network import ObservedRequest, health, snapshot
 
 
 TOKEN = '123456:relay-test-token'
@@ -23,7 +25,8 @@ class RelayServerTests(unittest.TestCase):
         def respond(req):
             self.received.append((req.method, str(req.url), req.headers, req.read()))
             data = (b'\x00video\xff' if '/file/bot' in req.url.path else
-                    b'{"ok":true,"result":{"id":123456}}')
+                    b'{"ok":true,"result":[]}' if '/getUpdates' in req.url.path else
+                    b'{"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"Veltrix"}}')
             return httpx.Response(200, headers={'Content-Length': str(len(data))}, stream=httpx.ByteStream(data))
         handler = relay_handler(TOKEN, upstream='https://api.telegram.org',
                                 client_factory=lambda: httpx.Client(transport=httpx.MockTransport(respond)))
@@ -79,6 +82,28 @@ class RelayServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(TOKEN, response.text)
 
+    def test_real_ptb_poll_through_http_relay(self):
+        async def check():
+            request = ObservedRequest(relay_base=self.base, relay_token=TOKEN,
+                                      httpx_kwargs={'headers': {'X-Veltrix-Token': TOKEN}, 'trust_env': False})
+            telegram = Bot(TOKEN, base_url=self.base + '/bot', request=request,
+                           get_updates_request=ObservedRequest(
+                               relay_base=self.base, relay_token=TOKEN,
+                               httpx_kwargs={'transport': httpx.AsyncHTTPTransport(),
+                                             'headers': {'X-Veltrix-Token': TOKEN},
+                                             'trust_env': False}))
+            with patch.dict(health, {'last_api_ok': 0.0, 'last_poll_ok': 0.0,
+                                     'last_error': None, 'last_poll_start': 0.0,
+                                     'last_poll_error': None}):
+                async with telegram:
+                    self.assertEqual(await telegram.get_updates(timeout=0), ())
+                    self.assertTrue(snapshot()['polling_recently'])
+        asyncio.run(check())
+        poll = [row for row in self.received if row[1].endswith('/getUpdates')]
+        self.assertEqual(len(poll), 1)
+        self.assertEqual(poll[0][0], 'POST')
+        self.assertNotIn(TOKEN, str(poll[0][2]))
+
 
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_updates_marks_polling_ready_only_after_success(self):
@@ -98,6 +123,26 @@ class RelayClientTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(snapshot()['polling_recently'])
                     health['last_poll_ok'] = time.time() - 181
                     self.assertFalse(snapshot()['polling_recently'])
+
+    async def test_polling_conflict_remains_visible_after_other_api_success(self):
+        def respond(req):
+            if req.url.path.endswith('/getUpdates'):
+                return httpx.Response(409, json={'ok': False, 'error_code': 409,
+                                                 'description': 'Conflict: another getUpdates is running'})
+            return httpx.Response(200, json={'ok': True, 'result': {
+                'id': 123456, 'is_bot': True, 'first_name': 'Veltrix'}})
+        with patch('bot.TELEGRAM_RELAY_BASE', 'https://veltrix-downloader.onrender.com'), \
+                patch('httpx.AsyncHTTPTransport', return_value=httpx.MockTransport(respond)), \
+                patch.dict(health, {'last_api_ok': 0.0, 'last_poll_ok': 0.0,
+                                    'last_error': None, 'last_poll_start': 0.0,
+                                    'last_poll_error': None}):
+            client = bot.application_builder(TOKEN).build().bot
+            async with client:
+                with self.assertRaises(Conflict):
+                    await client.get_updates(timeout=0)
+                await client.get_me()
+                self.assertEqual(snapshot()['last_poll_error'], 'PollingConflict')
+                self.assertFalse(snapshot()['polling_recently'])
 
     async def test_ptb_api_url_rewritten_and_token_sent_only_as_header(self):
         calls = []

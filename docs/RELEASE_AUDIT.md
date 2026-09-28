@@ -1,4 +1,14 @@
-# Veltrix Downloader v9.3 audit — 2026-09-28
+# Veltrix Downloader release audit — 2026-09-28
+
+## v9.5.0 polling recovery
+
+- Phone report: `getMe` succeeded through Render, while `last_poll_ok` remained zero. The relay emitted a fresh startup after hours without traffic; a nine-second health probe timed out during its cold wake. That probe cannot establish failure when authenticated `getMe` later succeeds.
+- Relay polling uses five-second Telegram long polls to avoid long HTTP holds and report failures sooner. Render records the first `getUpdates`, the upstream status periodically and failures by exception class; it never logs request bodies or credentials.
+- The phone now records the beginning and error category of each poll separately from other API requests. A later successful `getMe` cannot erase a polling conflict.
+- The launcher waits up to 90 seconds for a successful Telegram poll before reporting ready. On failure it leaves the supervisor running and prints only a safe error category and whether polling was attempted. The standalone diagnostic no longer sends a redundant nine-second relay health request.
+- Tests cover PTB → local HTTP relay → upstream mock → empty `getUpdates`, multipart/file transfer, polling conflict and temporary network state. A real phone `/start` and source download still have not been observed.
+
+Render's free service sleeps after 15 minutes without inbound traffic, and phone background execution depends on Android battery policy. The free plan cannot guarantee an always-on bot.
 
 ## v9.4.1 polling readiness
 

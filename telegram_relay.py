@@ -11,7 +11,8 @@ import os
 import re
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import BoundedSemaphore
+from threading import BoundedSemaphore, Lock
+from time import monotonic
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -25,6 +26,8 @@ API_METHOD = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,63}\Z')
 def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client_factory=None):
     """Build an isolated handler; upstream override is solely for local tests."""
     slots = BoundedSemaphore(16)
+    poll_lock = Lock()
+    poll_log = {'seen': False, 'last': 0.0}
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -103,10 +106,17 @@ def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client
             target = self._destination()
             if not target or (self.command == 'GET' and '/relay/file/' not in self.path):
                 return self._answer(404, b'{"ok":false}')
+            polling = self.command == 'POST' and urlsplit(self.path).path == '/relay/api/getUpdates'
             if not slots.acquire(blocking=False):
                 return self._answer(503, b'{"ok":false,"description":"Relay busy"}')
             response_started = False
+            started = monotonic()
             try:
+                if polling:
+                    with poll_lock:
+                        if not poll_log['seen']:
+                            log.info('Relay received first getUpdates request')
+                            poll_log['seen'] = True
                 self.connection.settimeout(120)
                 length = self.headers.get('Content-Length')
                 transfer_encoding = self.headers.get('Transfer-Encoding', '').lower()
@@ -125,6 +135,12 @@ def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client
                     body = (self._body() if length is not None or self.headers.get('Transfer-Encoding')
                             else b'') if self.command == 'POST' else None
                     with client.stream(self.command, target, headers=headers, content=body) as response:
+                        if polling:
+                            now = monotonic()
+                            with poll_lock:
+                                if response.status_code != 200 or now - poll_log['last'] >= 300:
+                                    log.info('Relay getUpdates: HTTP %s after %.1fs', response.status_code, now - started)
+                                    poll_log['last'] = now
                         self.send_response(response.status_code)
                         for name in ('Content-Type', 'Content-Length', 'Content-Encoding',
                                      'Content-Disposition', 'Retry-After'):
@@ -138,7 +154,7 @@ def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client
                         for chunk in response.iter_raw(chunk_size=65536):
                             self.wfile.write(chunk)
             except (httpx.HTTPError, OSError, ValueError, socket.timeout) as exc:
-                log.warning('Telegram relay transfer: %s', type(exc).__name__)
+                log.warning('Telegram relay %s: %s', 'getUpdates' if polling else 'transfer', type(exc).__name__)
                 if not response_started and not self.wfile.closed:
                     try:
                         self._answer(502, b'{"ok":false,"description":"Relay transfer failed"}')

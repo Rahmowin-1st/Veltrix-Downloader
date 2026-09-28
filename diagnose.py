@@ -59,6 +59,7 @@ async def worker_health(label: str) -> None:
             info = response.json()
             state = info.get('telegram') or {}
             stage = ('polling' if response.status_code == 200 else
+                     'poll failing' if state.get('last_poll_error') else
                      'waiting for first poll' if state.get('connected_recently') and not state.get('last_poll_ok') else
                      'initializing' if not state.get('last_api_ok') and not state.get('last_error') else 'disconnected')
             print(f"{label}: version={info.get('version')}, status={stage}, telegram={state}, route={info.get('telegram_route')}")
@@ -110,12 +111,7 @@ async def main():
         print("BOT_TOKEN: MISSING")
         return
     if bot.TELEGRAM_RELAY_BASE:
-        try:
-            async with httpx.AsyncClient(trust_env=False, timeout=9) as remote:
-                response = await remote.get(bot.TELEGRAM_RELAY_BASE + '/healthz')
-                print(f'Render relay HTTPS: HTTP {response.status_code}')
-        except (httpx.HTTPError, TimeoutError, OSError) as exc:
-            print(f'Render relay HTTPS: {type(exc).__name__}')
+        print('Relay verified by the authenticated Telegram identity request below')
     elif bot.TELEGRAM_API_BASE:
         print("Direct Telegram route checks skipped: custom Bot API endpoint configured")
     elif os.getenv('TELEGRAM_PROXY'):
