@@ -1,5 +1,12 @@
 # Veltrix Downloader release audit — 2026-09-28
 
+## v9.7.0 Render worker and verified carousel root cause
+
+- Live Render log for the owner's new test: Instagram downloaded **15** carousel entries, then Telegram rejected the first `sendMediaGroup` with HTTP **400**. Source extraction was successful. `bot.send_album` wrapped already constructed `InputFile` objects without `attach=True`; python-telegram-bot serialized each album entry without the required `media: attach://...` value. Set `attach=True` only for group uploads; a regression test checks the actual encoded Telegram parameter and multipart parts. An explicit HTTP 400 is treated as a rejected upload eligible for retry, while read/write timeouts remain uncertain.
+- A subsequent Snapchat job failed in the extraction process (`WorkerFailure`) before upload. The isolated worker now reports a bounded source error category to Render, without link or chat text. Exact Snapchat Spotlight detection supports a matching canonical `<link>` and a matching `__NEXT_DATA__` query when a unique preload exists. Actual owner Spotlight links still need a new live run.
+- Render logs confirmed `ffmpeg=True ffprobe=True deno=True` before switching receivers. The webhook runtime has a signed Telegram secret header and an independent read-only `getWebhookInfo` registration probe. Render stores active media files locally for the duration of a job, and processes updates for other bot users while the phone is off.
+- Render Free's filesystem and SQLite journal are ephemeral. After a restart, an MP3 callback can reconstruct the exact source URL from the bot's Original button using an HMAC tied to the requesting user, then re-extract available audio. Pending jobs, user history and source bytes cannot survive Render restarts on this plan; Telegram's pending webhook updates are subject to its retention window. Free Render cannot provide a strict always-on SLA or guarantee source downloads from datacenter IPs. Private posts require authorized source access.
+
 ## v9.6.0 screenshot-driven fixes
 
 - Owner screenshots: YouTube and Instagram Reels delivered, while a Pinterest short link and an Instagram carousel reported unconfirmed Telegram delivery; Snapchat Spotlight returned unavailable. Render emitted a `BrokenPipeError` near the Pinterest attempts. Render did not retain the Telegram chat or the phone's worker log, so that log line alone cannot identify an exact post.

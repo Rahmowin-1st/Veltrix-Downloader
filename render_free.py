@@ -120,6 +120,26 @@ def probe_relay_loopback(token: str) -> None:
         log.info('Render relay loopback: %s', 'OK' if ready else 'unavailable')
 
 
+def probe_webhook(token: str, expected: str) -> None:
+    """Verify Telegram's registered webhook without reading any chat updates."""
+    async def check():
+        client = bot.application_builder(token).build().bot
+        async with client:
+            for _ in range(8):
+                await asyncio.sleep(3)
+                info = await client.get_webhook_info()
+                if info.url == expected:
+                    return True
+        return False
+
+    try:
+        ready = asyncio.run(check())
+    except Exception as exc:
+        log.warning('Render webhook verification: %s', type(exc).__name__)
+    else:
+        log.info('Render webhook registered: %s', ready)
+
+
 # Pass the local path to isolated workers; cookie values are never logged.
 if YOUTUBE_COOKIE_FILE:
     os.environ["YOUTUBE_COOKIE_FILE"] = str(YOUTUBE_COOKIE_FILE)
@@ -132,8 +152,9 @@ def main() -> None:
         raise SystemExit("BOT_TOKEN is missing")
     bot.BOT_TOKEN = token
     bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    log.info('Media tools: ffmpeg=%s ffprobe=%s deno=%s',
-             bool(shutil.which('ffmpeg')), bool(shutil.which('ffprobe')), bool(shutil.which('deno')))
+    log.info('Media tools: ffmpeg=%s ffprobe=%s deno=%s source_proxy=%s',
+             bool(shutil.which('ffmpeg')), bool(shutil.which('ffprobe')),
+             bool(shutil.which('deno')), bool(bot.PROXY))
 
     # Termux remains the only worker. This service is a credential-protected
     # transport bridge and never starts polling or sets a webhook.
@@ -165,6 +186,7 @@ def main() -> None:
 
     webhook_url = f"https://{hostname}/telegram"
     log.info("webhook :%s -> %s", port, webhook_url)
+    threading.Thread(target=probe_webhook, args=(token, webhook_url), daemon=True).start()
     app.run_webhook(
         listen="0.0.0.0",
         port=port,

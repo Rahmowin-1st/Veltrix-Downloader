@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.6
+# Veltrix Downloader 9.7
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -24,7 +24,7 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
 - Photos are always sent as photos, never documents. Telegram may recompress them; the old `PRESERVE_ORIGINALS` setting is no longer used. Oversize/unusual photos are fitted to photo limits.
 - Ordered photo/video collections use albums of at most 10. Longer collections use multiple albums. Audio cannot share a photo/video album and is grouped separately in source order. Animations retain motion; within albums they use playable MP4.
-- One post-level MP3 button remains on the status message because `sendMediaGroup` has no inline-keyboard parameter. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. Cache misses re-extract the whole post, not just its first video.
+- One post-level MP3 button remains on the status message because `sendMediaGroup` has no inline-keyboard parameter. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. The adjacent Original button stores the source link in Telegram; if Render restarts and loses its cache, the bot verifies a signed callback and re-extracts the post for MP3.
 - Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
 - Files are streamed during upload rather than read entirely into RAM.
 - Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
@@ -40,7 +40,7 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Download failures offer a retry button before any media upload is attempted. Unsupported input gets a short explanation.
 - Rate limits allow the next source-aware extractor to run; incomplete collections remain failures. MP3 mode accepts audio-only results for video links.
 - H.264 video is copied when only its audio codec needs conversion. Existing MP3 streams are not re-encoded.
-- Termux starts its supervisor while offline and retries Telegram initialization as connectivity returns. If the phone cannot reach Telegram, the owner's existing Render service relays authenticated Bot API traffic; media downloads and the SQLite journal remain on the phone. Invalid tokens and an existing local worker are reported without an endless restart loop.
+- Render can run the bot with a Telegram webhook and download media without Termux. The webhook authenticates Telegram's secret header. Termux remains available as an optional, mutually exclusive runtime when Render is configured only as a relay.
 - Per-user serialization and bounded global work concurrency.
 - Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
 - ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.
@@ -48,14 +48,21 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Snapchat will not substitute a recommended item when the requested Spotlight ID is missing.
 - No generic page-wide download fallback: these can return thumbnails, recommendations or unrelated media.
 - Telegram flood-control delays are honored in full. Proven connection-establishment failures may retry. For relay uploads, a unique request ID lets the phone retrieve a cached Telegram result after a lost reply; when the result is still unknown, the upload is not replayed.
+- The carousel previously produced Telegram HTTP 400: multipart album files lacked their `attach://` names. Attachments now receive a unique name and the serialized Telegram request is checked in tests. Telegram's explicit HTTP 400 is reported as a rejection and allows a safe retry; uncertain timeouts still require inspection.
 - If the album arrives but editing the status to add the MP3 button fails, the bot sends a small fallback button message. Render records only a short job ID, platform, stage, item count and error class, without chat contents or links; historic chat messages and the phone's local log are not available from Render.
 - Long uploads have dedicated timeouts; MP3 conversions share the same resource semaphore.
 - Conversion processes and download process groups are stopped on shutdown. A local process lock prevents two workers using the same data directory. Separate devices/services must still avoid polling the same token.
 - Dependency changes are detected during normal restart. Pending Telegram updates are preserved.
 
-No program can guarantee zero interruption on sleeping Android/free hosting. The SQLite journal must survive the restart for recovery. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
+Render Free sleeps after 15 minutes without inbound traffic and has a 750-hour shared monthly limit; webhook traffic wakes it, with a possible cold-start delay. Its local files, MP3 cache and SQLite job journal vanish on a restart or sleep, so admitted or unfinished work is not recoverable on that tier. A paid persistent runtime or a separately provisioned durable database is needed for strict always-on and crash recovery. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
 
-## Free primary runtime: existing Termux phone
+## Primary runtime: Render webhook
+
+The existing `veltrix-downloader` Render service runs `python render_free.py` with `TERMUX_PRIMARY=0`. Telegram sends new links to its webhook; Render extracts and uploads media for any Telegram user who can message the bot. Media files live in Render's temporary job directory during extraction, conversion and upload. No phone process is required. Set one active receiver per bot token; switching to the webhook makes the old Termux poller receive a conflict until it is stopped.
+
+The free service can sleep or restart during long jobs, cannot retain its local SQLite/cache, and has limited CPU/disk/network resources. This setup does **not** promise permanent 24/7 availability, every private post, or success from Render's IP when a platform blocks cloud hosts. Existing authorized cookie files on a phone are not silently copied to Render.
+
+## Optional phone runtime: Termux
 
 Update:
 
@@ -73,15 +80,15 @@ cd Veltrix-Downloader
 bash termux_setup.sh
 ```
 
-Keep Termux battery optimization disabled. Normal startup installs a missing reboot script; reboot startup also requires Termux:Boot to be installed from the same source as Termux and opened once. The wake lock and supervisor improve background survival, but Android can still terminate the process. Device storage, internet and power remain required; no paid API is used.
+If operating in phone mode, set `TERMUX_PRIMARY=1` on Render and use Termux. Keep Termux battery optimization disabled. Normal startup installs a missing reboot script; reboot startup also requires Termux:Boot to be installed from the same source as Termux and opened once. Android can still terminate the process.
 
 `.env.example` documents normal settings. Default caps: 100 items, 4 GiB per source, 6 GiB total download workspace, 128 MiB disk reserve, one concurrent job. Remuxing/splitting also needs additional free disk space.
 
-`BOT_TOKEN` stays in `.env`. Never commit tokens, cookies, sessions or proxy credentials. Existing optional authorized YouTube cookie configuration on Render is passed to the isolated worker; age restrictions remain enforced.
+`BOT_TOKEN` stays in `.env` on the phone and in Render's secret environment for cloud mode. Never commit tokens, cookies, sessions or proxy credentials. Existing optional authorized YouTube cookie configuration on Render is passed to the isolated worker; age restrictions remain enforced.
 
 With `TERMUX_PRIMARY=1`, Render only relays Telegram API traffic; it never polls, sets a webhook or downloads source media. The relay verifies the bot token in an HTTPS request header. Public Render URLs and access logs never contain the token. Existing Termux installs add `TELEGRAM_RELAY_BASE=https://veltrix-downloader.onrender.com` once on startup if no custom Bot API server or relay setting is present; `TELEGRAM_RELAY_BASE=0` disables that default. **Do not expose your `.env` or relay authorization header.**
 
-The relay uses the existing free Render web service; a request stream needs working connectivity from the phone to Render and from Render to Telegram. Render free instances have [monthly shared instance-hour limits, network usage limits and spin-down behavior](https://render.com/docs/free). Long uploads, platform extraction, and uninterrupted operation on the free plan still require live acceptance. Render does not store downloads or the job journal.
+In phone mode, a relay request needs connectivity from the phone to Render and from Render to Telegram. Render free instances have [monthly shared instance-hour limits, network usage limits and spin-down behavior](https://render.com/docs/free). The free Render filesystem is temporary.
 
 `bash termux_start.sh` now waits for the first successful Telegram update poll (up to 90 seconds, including relay wake time). It prints `Telegram polling verified` only when the bot can fetch updates; a startup timeout leaves the supervised worker retrying and reports the safe poll error. After a verified start, send `/start` and a public media link for the first live delivery check. On phones with aggressive battery management, exempt Termux from battery restrictions so Android does not suspend polling.
 

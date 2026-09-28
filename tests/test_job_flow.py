@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 import media_io
-from telegram.error import TimedOut
+from telegram.error import TimedOut, BadRequest
 
 
 class ExtractorFlowTests(unittest.TestCase):
@@ -111,6 +111,24 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
                     await bot.run_job(msg, context, 1, 'https://youtu.be/test', 'auto', status)
                 markup = status.edit_text.call_args.kwargs['reply_markup']
                 self.assertEqual(markup is None, attempted)
+
+    async def test_rejected_album_can_be_retried_without_duplicate_warning(self):
+        status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
+                                 edit_text=AsyncMock(), delete=AsyncMock())
+        msg = SimpleNamespace(chat_id=1)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with tempfile.TemporaryDirectory() as folder:
+            clip = Path(folder) / 'clip.mp4'
+            clip.write_bytes(b'fixture')
+            async def reject(msg, files, caption, tmp, progress):
+                progress['attempted'] = True
+                raise BadRequest("can't parse media JSON object")
+            with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=[clip]), \
+                    patch('bot.send_album', side_effect=reject), patch('bot.create_action', return_value='retry-token'), \
+                    patch('bot._job_locks', {}), patch('bot._global_sem', None):
+                await bot.run_job(msg, context, 1, 'https://www.instagram.com/p/test/', 'auto', status)
+        self.assertIsNotNone(status.edit_text.call_args.kwargs['reply_markup'])
+        self.assertIn('Telegram rejected', status.edit_text.call_args.args[0])
 
     async def test_mp3_source_is_copied_without_reencoding(self):
         with tempfile.TemporaryDirectory() as folder:

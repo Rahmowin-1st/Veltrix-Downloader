@@ -117,6 +117,12 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(info['entries'][0]['kind'], 'video')
             self.assertEqual(bot._snap_info_from_exact_page(page, 'https://www.snapchat.com/spotlight/other'), {})
 
+    def test_snapchat_preload_requires_its_own_canonical_page(self):
+        page = ('<link href="/spotlight/wanted" rel="canonical">'
+                '<link rel="preload" as="video" href="https://cf-st.sc-cdn.net/d/wanted.mp4">')
+        self.assertTrue(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/wanted'))
+        self.assertFalse(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/other'))
+
     def test_classify_real_media_types(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

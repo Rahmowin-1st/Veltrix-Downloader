@@ -784,6 +784,20 @@ def _snap_info_from_exact_page(page: str, page_url: str) -> dict[str, Any]:
             'id': requested, 'page_url': page_url}
 
 
+def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
+    """A preload belongs to this post only if the page names its exact ID."""
+    requested = _snap_requested_id(page_url, {})
+    if not requested:
+        return False
+    canonical = og_values(page, {'og:url'})
+    for tag in re.findall(r'<link\b[^>]*>', page, flags=re.I):
+        fields = dict(re.findall(r'([\w:-]+)\s*=\s*["\']([^"\']*)["\']', tag, flags=re.I))
+        if 'canonical' in fields.get('rel', '').lower().split() and fields.get('href'):
+            canonical.append(urljoin(page_url, html.unescape(fields['href'])))
+    return any(platform_of(value) == 'snapchat' and _snap_requested_id(value, {}) == requested
+               for value in canonical)
+
+
 def extract_snapchat_public(url: str) -> dict[str, Any]:
     cached = metadata_cache_get(f"snapchat:{url}")
     if cached:
@@ -797,8 +811,7 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
         if not match:
             if "/spotlight/" in urlparse(candidate).path:
                 info = _snap_info_from_exact_page(response.text, candidate)
-                if not info and any(_snap_requested_id(value, {}) == _snap_requested_id(candidate, {})
-                                    for value in og_values(response.text, {'og:url'})):
+                if not info and _snap_page_owns_spotlight(response.text, candidate):
                     info = snapchat_preload(response.text)
                 if info:
                     metadata_cache_put(f"snapchat:{url}", info)
@@ -809,6 +822,8 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
             info = _snap_info_from_doc(doc, candidate)
             if info:
                 info["entries"] = [{"url": info["url"], "kind": "video"}]
+            elif str(_dig_dict(doc, 'query').get('snapID') or '') == _snap_requested_id(candidate, {}):
+                info = snapchat_preload(response.text)
         else:
             entries = snapchat_story_entries(doc, candidate)
             info = {"entries": entries, "title": "Snapchat story"} if entries else {}
@@ -1197,6 +1212,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     """User-safe errors only. Full extractor details stay in logs."""
     if isinstance(exc, WorkerFailure):
         return str(exc)
+    if isinstance(exc, BadRequest):
+        return "Telegram rejected this media. The rejected album was not delivered; try again."
     if connection_failed_before_send(exc):
         return "Could not connect to Telegram. The failed upload was not sent; try again when the connection returns."
     if isinstance(exc, (TimedOut, NetworkError)):
@@ -1998,7 +2015,7 @@ async def run_job(
             await edit_status(status, "✅ Media delivered. Send the link again if the MP3 action is unavailable.")
             return
         metric_add("jobs_failed", 1)
-        uncertain = bool(progress.get("attempted")) and not connection_failed_before_send(exc)
+        uncertain = bool(progress.get("attempted")) and not isinstance(exc, BadRequest) and not connection_failed_before_send(exc)
         mark_state("interrupted" if count or uncertain else "failed")
         log.error("job %s failed during %s: %s", event_id, progress['phase'], type(exc).__name__)
         await report_job_event(event_id, source, 'interrupted' if uncertain or count else 'failed',
