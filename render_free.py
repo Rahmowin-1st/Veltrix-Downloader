@@ -107,11 +107,16 @@ def main() -> None:
     bot.BOT_TOKEN = token
     bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # In the all-free setup, Termux is the Telegram worker. Render stays health-only
-    # and must not recreate a webhook that would steal updates from Termux polling.
+    # Termux remains the only worker. This service is a credential-protected
+    # transport bridge and never starts polling or sets a webhook.
     if os.getenv("TERMUX_PRIMARY", "").strip() == "1":
-        bot.start_health_server()
-        log.info("TERMUX_PRIMARY=1: Telegram disabled on Render; health-only mode")
+        if os.getenv('RELAY_ENABLED', '1') == '1':
+            from telegram_relay import serve_relay
+            threading.Thread(target=serve_relay, args=(token,), daemon=True).start()
+            log.info('TERMUX_PRIMARY=1: Telegram relay enabled; no Render polling')
+        else:
+            bot.start_health_server()
+            log.info('TERMUX_PRIMARY=1: Telegram disabled on Render; health-only mode')
         threading.Thread(target=probe_telegram_egress, args=(token,), daemon=True).start()
         while True:
             time.sleep(3600)

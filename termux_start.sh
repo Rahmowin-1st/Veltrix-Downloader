@@ -26,6 +26,14 @@ if [ -z "${BOT_TOKEN:-}" ]; then
   exit 1
 fi
 
+# This owner's Render service has a verified Telegram API route. The phone
+# retains the worker, downloads and SQLite journal; Render only relays HTTPS.
+# A deliberate TELEGRAM_RELAY_BASE=0 or a custom Bot API base opts out.
+if [ -z "${TELEGRAM_RELAY_BASE+x}" ] && [ -z "${TELEGRAM_API_BASE:-}" ]; then
+  export TELEGRAM_RELAY_BASE="https://veltrix-downloader.onrender.com"
+  printf '\nTELEGRAM_RELAY_BASE=%s\n' "$TELEGRAM_RELAY_BASE" >> .env
+fi
+
 echo "Veltrix preflight..."
 if ! python - <<'PY'
 import importlib

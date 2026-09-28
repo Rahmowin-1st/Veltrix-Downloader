@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.3
+# Veltrix Downloader 9.4
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -40,7 +40,7 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Download failures offer a retry button before any media upload is attempted. Unsupported input gets a short explanation.
 - Rate limits allow the next source-aware extractor to run; incomplete collections remain failures. MP3 mode accepts audio-only results for video links.
 - H.264 video is copied when only its audio codec needs conversion. Existing MP3 streams are not re-encoded.
-- Termux starts its supervisor while offline and retries Telegram initialization as connectivity returns. Invalid tokens and an existing local worker are reported without an endless restart loop.
+- Termux starts its supervisor while offline and retries Telegram initialization as connectivity returns. If the phone cannot reach Telegram, the owner's existing Render service relays authenticated Bot API traffic; media downloads and the SQLite journal remain on the phone. Invalid tokens and an existing local worker are reported without an endless restart loop.
 - Per-user serialization and bounded global work concurrency.
 - Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
 - ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.
@@ -78,13 +78,15 @@ Keep Termux battery optimization disabled. Reboot startup additionally requires 
 
 `BOT_TOKEN` stays in `.env`. Never commit tokens, cookies, sessions or proxy credentials. Existing optional authorized YouTube cookie configuration on Render is passed to the isolated worker; age restrictions remain enforced.
 
-Render with `TERMUX_PRIMARY=1` is health-only and must not poll alongside Termux.
+With `TERMUX_PRIMARY=1`, Render only relays Telegram API traffic; it never polls, sets a webhook or downloads source media. The relay verifies the bot token in an HTTPS request header. Public Render URLs and access logs never contain the token. Existing Termux installs add `TELEGRAM_RELAY_BASE=https://veltrix-downloader.onrender.com` once on startup if no custom Bot API server or relay setting is present; `TELEGRAM_RELAY_BASE=0` disables that default. **Do not expose your `.env` or relay authorization header.**
+
+The relay uses the existing free Render web service; a request stream needs working connectivity from the phone to Render and from Render to Telegram. Render free instances have [monthly shared instance-hour limits, network usage limits and spin-down behavior](https://render.com/docs/free). Long uploads, platform extraction, and uninterrupted operation on the free plan still require live acceptance. Render does not store downloads or the job journal.
 
 ## Validation
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
+python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py telegram_relay.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
 bash -n termux_start.sh termux_setup.sh termux_supervisor.sh termux_process.sh
 ```
 

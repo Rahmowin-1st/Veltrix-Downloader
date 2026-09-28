@@ -41,8 +41,11 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.3.3"
+VERSION = "9.4.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
+if TELEGRAM_RELAY_BASE == '0':
+    TELEGRAM_RELAY_BASE = ''
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
 TELEGRAM_LOCAL = bool(TELEGRAM_API_BASE)
@@ -1948,7 +1951,8 @@ def start_health_server() -> None:
                 "telegram_route": {
                     "ipv4_first": os.getenv("TELEGRAM_IPV4", "0") == "1",
                     "proxy_configured": bool(os.getenv("TELEGRAM_PROXY")),
-                    "environment_proxy_available": bool(not TELEGRAM_API_BASE and environment_proxy()),
+                    "environment_proxy_available": bool(not (TELEGRAM_API_BASE or TELEGRAM_RELAY_BASE) and environment_proxy()),
+                    "relay_enabled": bool(TELEGRAM_RELAY_BASE),
                 },
                 "service": "veltrix-downloader",
                 "version": VERSION,
@@ -2123,8 +2127,15 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
     return files
 
 
-def telegram_request(pool_size: int = 16):
+def telegram_request(pool_size: int = 16, token: str | None = None):
     from telegram_network import ConnectFallback, ObservedRequest, environment_proxy
+    from urllib.parse import urlsplit
+    token = token or BOT_TOKEN
+    if TELEGRAM_RELAY_BASE:
+        address = urlsplit(TELEGRAM_RELAY_BASE)
+        if (address.scheme != 'https' or not address.hostname or address.username
+                or address.password or address.query or address.fragment or address.path not in {'', '/'}):
+            raise ValueError('TELEGRAM_RELAY_BASE must be a clean HTTPS host')
     limits = httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
     # Prefer the selected route; retry through the other route only when no
     # request bytes were sent (connect error/timeout).
@@ -2143,21 +2154,25 @@ def telegram_request(pool_size: int = 16):
         transport = ConnectFallback(transport, alternate)
         # A custom Bot API base may be local HTTP: never send that URL through
         # a generic system proxy chosen for api.telegram.org.
-        backup_proxy = environment_proxy() if not TELEGRAM_API_BASE else None
+        backup_proxy = environment_proxy() if not (TELEGRAM_API_BASE or TELEGRAM_RELAY_BASE) else None
         if backup_proxy:
             transport = ConnectFallback(
                 transport, httpx.AsyncHTTPTransport(limits=limits, retries=0, proxy=backup_proxy),
             )
-    return ObservedRequest(connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
+    headers = {'X-Veltrix-Token': token} if TELEGRAM_RELAY_BASE else None
+    return ObservedRequest(relay_base=TELEGRAM_RELAY_BASE, relay_token=token,
+                           connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
                            connect_timeout=10, pool_timeout=10, media_write_timeout=1800,
-                           httpx_kwargs={"transport": transport, "trust_env": False})
+                           httpx_kwargs={"transport": transport, "trust_env": False, **({'headers': headers} if headers else {})})
 
 
 def application_builder(token: str):
-    builder = (Application.builder().token(token).request(telegram_request())
-               .get_updates_request(telegram_request(1)).concurrent_updates(8)
+    builder = (Application.builder().token(token).request(telegram_request(token=token))
+               .get_updates_request(telegram_request(1, token=token)).concurrent_updates(8)
                .post_init(resume_jobs).post_stop(stop_jobs).post_shutdown(stop_jobs))
-    if TELEGRAM_API_BASE:
+    if TELEGRAM_RELAY_BASE:
+        builder = builder.base_url(TELEGRAM_RELAY_BASE + '/bot').base_file_url(TELEGRAM_RELAY_BASE + '/file/bot')
+    elif TELEGRAM_API_BASE:
         builder = builder.base_url(TELEGRAM_API_BASE + "/bot").base_file_url(TELEGRAM_API_BASE + "/file/bot")
         # Upload bytes even when the local server is on a different machine.
         builder = builder.local_mode(False)

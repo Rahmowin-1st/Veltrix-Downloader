@@ -1,5 +1,11 @@
 # Veltrix Downloader v9.3 audit — 2026-09-28
 
+## v9.4.0 authenticated Render relay
+
+The phone's direct Telegram routes and a proxy-free curl call all timed out; the existing free Frankfurt Render service successfully authenticated `getMe` with Telegram while staying health-only. Termux now configures the owner's Render URL once when no custom API target exists. Render routes Bot API methods and file downloads to Telegram while the phone remains the only polling/downloading worker. Bot credentials travel in an HTTPS header and are compared to the service's existing token; public paths never include the token. The relay streams request/response bytes, bounds concurrent calls and request size, never redirects upstream and restricts its destination to the official Telegram Bot API host.
+
+This is a route around the phone's blocked direct Telegram connection, not a claim that source platform downloads or end-to-end Telegram media delivery are certified. Free Render instance hours and inbound/outbound usage are limited, and Render may sleep or redeploy. Termux still needs access to the Render URL; synthetic upload tests cannot establish phone-to-Render reachability or the behavior of actual large uploads at the platform edge.
+
 ## v9.3.3 Telegram connectivity follow-up
 
 Phone evidence: v9.3.2 started its supervisor, DNS worked, but authenticated direct automatic and IPv4 Bot API `getMe` each ended in `ConnectTimeout`; the direct client also timed out. The worker was still initializing at the first health read. This establishes no successful Telegram connection and therefore cannot establish live media delivery.

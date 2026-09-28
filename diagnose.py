@@ -104,11 +104,18 @@ async def main():
         print(f"Recent log error counts (may include older runs): {dict(counts)}")
     await worker_health('Local worker')
     configured_proxy = environment_proxy()
-    print(f"Diagnostic IPv4 preference: {os.getenv('TELEGRAM_IPV4', '0')}; Telegram proxy configured: {bool(os.getenv('TELEGRAM_PROXY'))}; environment proxy available: {bool(configured_proxy)}")
+    print(f"Diagnostic IPv4 preference: {os.getenv('TELEGRAM_IPV4', '0')}; Telegram proxy configured: {bool(os.getenv('TELEGRAM_PROXY'))}; environment proxy available: {bool(configured_proxy)}; relay enabled: {bool(bot.TELEGRAM_RELAY_BASE)}")
     if not bot.BOT_TOKEN:
         print("BOT_TOKEN: MISSING")
         return
-    if bot.TELEGRAM_API_BASE:
+    if bot.TELEGRAM_RELAY_BASE:
+        try:
+            async with httpx.AsyncClient(trust_env=False, timeout=9) as remote:
+                response = await remote.get(bot.TELEGRAM_RELAY_BASE + '/healthz')
+                print(f'Render relay HTTPS: HTTP {response.status_code}')
+        except (httpx.HTTPError, TimeoutError, OSError) as exc:
+            print(f'Render relay HTTPS: {type(exc).__name__}')
+    elif bot.TELEGRAM_API_BASE:
         print("Direct Telegram route checks skipped: custom Bot API endpoint configured")
     elif os.getenv('TELEGRAM_PROXY'):
         print("Direct Telegram route checks skipped: explicit Telegram proxy configured")

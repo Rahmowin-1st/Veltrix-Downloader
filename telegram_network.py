@@ -1,5 +1,6 @@
 """Observe connectivity and fall back only before any request bytes are sent."""
 import time
+from urllib.parse import quote
 from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
@@ -47,7 +48,24 @@ class ConnectFallback(httpx.AsyncBaseTransport):
 
 
 class ObservedRequest(HTTPXRequest):
+    def __init__(self, *, relay_base: str = '', relay_token: str = '', **kwargs):
+        super().__init__(**kwargs)
+        self.relay_base = relay_base
+        self.relay_token = relay_token
+
     async def do_request(self, url, method, **kwargs):
+        if self.relay_base:
+            api = f'{self.relay_base}/bot{self.relay_token}/'
+            file = f'{self.relay_base}/file/bot{self.relay_token}/'
+            encoded_file = f'{self.relay_base}/file/bot{quote(self.relay_token, safe="")}/'
+            if url.startswith(api):
+                url = self.relay_base + '/relay/api/' + url[len(api):]
+            elif url.startswith(file):
+                url = self.relay_base + '/relay/file/' + url[len(file):]
+            elif url.startswith(encoded_file):
+                url = self.relay_base + '/relay/file/' + url[len(encoded_file):]
+            else:
+                raise ValueError('Unexpected Telegram relay target')
         try:
             result = await super().do_request(url, method, **kwargs)
         except Exception as exc:
