@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -77,6 +78,22 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
 
 
+def probe_telegram_egress(token: str) -> None:
+    """Read-only connectivity check; never logs the token or a request URL."""
+    async def check():
+        client = bot.application_builder(token).build().bot
+        async with asyncio.timeout(36):
+            async with client:
+                await client.get_me()
+
+    try:
+        asyncio.run(check())
+    except Exception as exc:
+        log.warning("Render Telegram API egress: %s", type(exc).__name__)
+    else:
+        log.info("Render Telegram API egress: OK")
+
+
 # Pass the local path to isolated workers; cookie values are never logged.
 if YOUTUBE_COOKIE_FILE:
     os.environ["YOUTUBE_COOKIE_FILE"] = str(YOUTUBE_COOKIE_FILE)
@@ -95,6 +112,7 @@ def main() -> None:
     if os.getenv("TERMUX_PRIMARY", "").strip() == "1":
         bot.start_health_server()
         log.info("TERMUX_PRIMARY=1: Telegram disabled on Render; health-only mode")
+        threading.Thread(target=probe_telegram_egress, args=(token,), daemon=True).start()
         while True:
             time.sleep(3600)
 
