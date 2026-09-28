@@ -1895,6 +1895,10 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path | list[Path]
 async def report_job_event(job: str, platform: str, stage: str, *, items: int = 0,
                            error: str = 'none') -> None:
     """Expose safe progress on Render without copying a chat or media URL."""
+    if os.getenv('TERMUX_PRIMARY') == '0':
+        log.info('Job %s platform=%s stage=%s items=%s error=%s', job, platform, stage,
+                 min(items, 100), error)
+        return
     if not TELEGRAM_RELAY_BASE or not BOT_TOKEN:
         return
     try:
