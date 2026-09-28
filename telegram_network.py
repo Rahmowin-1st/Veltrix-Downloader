@@ -1,10 +1,30 @@
 """Observe connectivity and fall back only before any request bytes are sent."""
 import time
+from urllib.parse import urlsplit
+from urllib.request import getproxies, proxy_bypass
 
 import httpx
 from telegram.request import HTTPXRequest
 
 health = {'last_api_ok': 0.0, 'last_poll_ok': 0.0, 'last_error': None}
+
+
+def environment_proxy() -> str | None:
+    """Use an operator-configured HTTP tunnel only if this host is not excluded."""
+    if proxy_bypass('api.telegram.org'):
+        return None
+    configured = getproxies()
+    proxy = configured.get('https') or configured.get('all')
+    if not proxy:
+        return None
+    try:
+        parsed = urlsplit(proxy)
+        parsed.port  # Reject invalid/non-numeric ports before constructing a transport.
+    except ValueError:
+        return None
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return None
+    return proxy
 
 
 class ConnectFallback(httpx.AsyncBaseTransport):

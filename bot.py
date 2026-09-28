@@ -41,7 +41,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.3.2"
+VERSION = "9.3.3"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PROXY = (os.getenv("PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
 TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
@@ -1940,7 +1940,7 @@ def start_health_server() -> None:
                 free_mb = disk.free // (1024 * 1024)
             except Exception:
                 free_mb = -1
-            from telegram_network import snapshot
+            from telegram_network import snapshot, environment_proxy
             connectivity = snapshot()
             body = json.dumps({
                 "ok": True,
@@ -1948,6 +1948,7 @@ def start_health_server() -> None:
                 "telegram_route": {
                     "ipv4_first": os.getenv("TELEGRAM_IPV4", "0") == "1",
                     "proxy_configured": bool(os.getenv("TELEGRAM_PROXY")),
+                    "environment_proxy_available": bool(not TELEGRAM_API_BASE and environment_proxy()),
                 },
                 "service": "veltrix-downloader",
                 "version": VERSION,
@@ -2123,22 +2124,30 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
 
 
 def telegram_request(pool_size: int = 16):
-    from telegram_network import ConnectFallback, ObservedRequest
+    from telegram_network import ConnectFallback, ObservedRequest, environment_proxy
     limits = httpx.Limits(max_connections=pool_size, max_keepalive_connections=pool_size)
     # Prefer the selected route; retry through the other route only when no
     # request bytes were sent (connect error/timeout).
     ipv4 = os.getenv("TELEGRAM_IPV4", "0") == "1"
-    # Only an explicit Telegram proxy may affect polling. Generic shell proxy
-    # variables are often stale on Termux and can make a healthy API time out.
+    # An explicit Telegram proxy takes precedence. A generic shell proxy is
+    # attempted only after both direct connections failed before sending bytes.
     proxy = os.getenv("TELEGRAM_PROXY") or None
     transport = httpx.AsyncHTTPTransport(
-        local_address="0.0.0.0" if ipv4 else None, limits=limits, retries=1, proxy=proxy,
+        local_address="0.0.0.0" if ipv4 else None, limits=limits,
+        retries=1 if proxy else 0, proxy=proxy,
     )
     if not proxy:
         alternate = httpx.AsyncHTTPTransport(
             local_address=None if ipv4 else "0.0.0.0", limits=limits, retries=0,
         )
         transport = ConnectFallback(transport, alternate)
+        # A custom Bot API base may be local HTTP: never send that URL through
+        # a generic system proxy chosen for api.telegram.org.
+        backup_proxy = environment_proxy() if not TELEGRAM_API_BASE else None
+        if backup_proxy:
+            transport = ConnectFallback(
+                transport, httpx.AsyncHTTPTransport(limits=limits, retries=0, proxy=backup_proxy),
+            )
     return ObservedRequest(connection_pool_size=pool_size, read_timeout=120, write_timeout=120,
                            connect_timeout=10, pool_timeout=10, media_write_timeout=1800,
                            httpx_kwargs={"transport": transport, "trust_env": False})

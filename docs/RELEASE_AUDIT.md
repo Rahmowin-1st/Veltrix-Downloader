@@ -1,5 +1,11 @@
 # Veltrix Downloader v9.3 audit — 2026-09-28
 
+## v9.3.3 Telegram connectivity follow-up
+
+Phone evidence: v9.3.2 started its supervisor, DNS worked, but authenticated direct automatic and IPv4 Bot API `getMe` each ended in `ConnectTimeout`; the direct client also timed out. The worker was still initializing at the first health read. This establishes no successful Telegram connection and therefore cannot establish live media delivery.
+
+The worker now attempts a configured standard HTTPS proxy only if both direct routes fail while establishing a connection, respects `NO_PROXY` and keeps normal TLS certificate verification. It does not replay requests after read or write errors. The diagnostic contrasts direct authenticated requests, the environment proxy if one exists, and an unauthenticated direct curl homepage HEAD; it rereads worker health after probes. Private proxy details and the token are never printed. Unnecessary direct connection retries were removed to avoid delaying fallback. If the phone has no reachable Telegram route or configured working proxy, this code cannot make it connect; a working network route is required. No live phone acceptance has been observed yet.
+
 ## v9.3.2 restart follow-up
 
 Termux reported `The previous worker is still finishing its shutdown. No second worker was started.` after a fast-forward update. The old launcher waited only 20 seconds and stopped; the supervisor's exit trap can wait on the Python child without a deadline. The new launcher detects unreaped zombie supervisors, signals only the previous supervisor's verified direct `python bot.py` child after a grace period, and bounds that child's shutdown before deciding whether a new worker is safe to start. It still refuses to launch a second worker if the old supervisor remains active or the PID points to an unrelated process. A forced restart during media upload has uncertain delivery; the durable job journal records interrupted uploads for user inspection. A synthetic hanging-child integration test runs in CI; this editing sandbox has a mismatched `/proc` PID namespace and skips that subprocess integration test locally.

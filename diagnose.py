@@ -14,12 +14,15 @@ from pathlib import Path
 import httpx
 
 import bot
+from telegram_network import environment_proxy
 
 
-async def probe_telegram_route(token: str, label: str, local_address: str | None) -> str:
+async def probe_telegram_route(token: str, label: str, local_address: str | None,
+                               proxy: str | None = None) -> str:
     """Exercise an authenticated, read-only API method through one address route."""
-    transport = httpx.AsyncHTTPTransport(local_address=local_address, retries=0)
     try:
+        transport = (httpx.AsyncHTTPTransport(proxy=proxy, retries=0) if proxy else
+                     httpx.AsyncHTTPTransport(local_address=local_address, retries=0))
         async with httpx.AsyncClient(transport=transport, trust_env=False, timeout=httpx.Timeout(8.0)) as client:
             # Never include the authenticated URL or response body in output.
             response = await client.post(f"https://api.telegram.org/bot{token}/getMe")
@@ -28,8 +31,38 @@ async def probe_telegram_route(token: str, label: str, local_address: str | None
             if response.status_code == 401:
                 return f"{label}: invalid bot token (HTTP 401)"
             return f"{label}: HTTP {response.status_code}"
-    except (httpx.HTTPError, TimeoutError, OSError) as exc:
+    except (httpx.HTTPError, TimeoutError, OSError, ValueError) as exc:
         return f"{label}: {type(exc).__name__}"
+
+
+def probe_curl_direct() -> str:
+    """Compare with curl without putting the bot credential on a command line."""
+    if not shutil.which('curl'):
+        return 'curl direct IPv4 homepage: curl missing'
+    try:
+        result = subprocess.run(
+            ['curl', '--noproxy', '*', '-4', '-I', '--silent', '--output', '/dev/null',
+             '--write-out', '%{http_code}', '--connect-timeout', '7', '--max-time', '9',
+             'https://api.telegram.org'], capture_output=True, text=True, timeout=11,
+        )
+        if result.returncode:
+            return f'curl direct IPv4 homepage: curl exit {result.returncode}'
+        return f'curl direct IPv4 homepage: HTTP {result.stdout.strip()[:3]}'
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f'curl direct IPv4 homepage: {type(exc).__name__}'
+
+
+async def worker_health(label: str) -> None:
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=3) as local:
+            response = await local.get(f"http://127.0.0.1:{os.getenv('PORT', '10000')}/readyz")
+            info = response.json()
+            state = info.get('telegram') or {}
+            stage = ('connected' if response.status_code == 200 else
+                     'initializing' if not state.get('last_api_ok') and not state.get('last_error') else 'disconnected')
+            print(f"{label}: version={info.get('version')}, status={stage}, telegram={state}, route={info.get('telegram_route')}")
+    except Exception as exc:
+        print(f"{label} unavailable: {type(exc).__name__}")
 
 
 async def main():
@@ -69,17 +102,9 @@ async def main():
         # Only categories are printed, never raw request URLs/credentials.
         counts = Counter(re.findall(r'\b(?:ConnectError|ConnectTimeout|ReadTimeout|TimedOut|Conflict|InvalidToken|WorkerFailure|PollingConflict)\b', tail))
         print(f"Recent log error counts (may include older runs): {dict(counts)}")
-    try:
-        async with httpx.AsyncClient(trust_env=False, timeout=3) as local:
-            response = await local.get(f"http://127.0.0.1:{os.getenv('PORT', '10000')}/readyz")
-            info = response.json()
-            state = info.get('telegram') or {}
-            stage = ('connected' if response.status_code == 200 else
-                     'initializing' if not state.get('last_api_ok') and not state.get('last_error') else 'disconnected')
-            print(f"Local worker: version={info.get('version')}, status={stage}, telegram={state}, route={info.get('telegram_route')}")
-    except Exception as exc:
-        print(f"Local worker health unavailable: {type(exc).__name__}")
-    print(f"Diagnostic IPv4 preference: {os.getenv('TELEGRAM_IPV4', '0')}; Telegram proxy configured: {bool(os.getenv('TELEGRAM_PROXY'))}")
+    await worker_health('Local worker')
+    configured_proxy = environment_proxy()
+    print(f"Diagnostic IPv4 preference: {os.getenv('TELEGRAM_IPV4', '0')}; Telegram proxy configured: {bool(os.getenv('TELEGRAM_PROXY'))}; environment proxy available: {bool(configured_proxy)}")
     if not bot.BOT_TOKEN:
         print("BOT_TOKEN: MISSING")
         return
@@ -88,15 +113,21 @@ async def main():
     elif os.getenv('TELEGRAM_PROXY'):
         print("Direct Telegram route checks skipped: explicit Telegram proxy configured")
     else:
-        routes = await asyncio.gather(
+        checks = [
             probe_telegram_route(bot.BOT_TOKEN, "Telegram automatic route", None),
             probe_telegram_route(bot.BOT_TOKEN, "Telegram IPv4 route", "0.0.0.0"),
-        )
+            asyncio.to_thread(probe_curl_direct),
+        ]
+        if configured_proxy:
+            checks.append(probe_telegram_route(bot.BOT_TOKEN, 'Telegram environment proxy', None,
+                                               proxy=configured_proxy))
+        routes = await asyncio.gather(*checks)
         for route in routes:
             print(route)
     try:
         client = bot.application_builder(bot.BOT_TOKEN).build().bot
-        async with asyncio.timeout(18):
+        # The worker may need two 10s direct connects before an optional proxy.
+        async with asyncio.timeout(40 if configured_proxy else 28):
             async with client:
                 me = await client.get_me()
                 print(f"Telegram identity: @{me.username}")
@@ -105,6 +136,7 @@ async def main():
     except Exception as exc:
         # Exception text may contain a token-bearing request URL.
         print(f"Telegram API: {type(exc).__name__}")
+    await worker_health('Worker after probes')
     print("HTTP route checks use getMe; they do not consume updates or test media delivery.")
 
 

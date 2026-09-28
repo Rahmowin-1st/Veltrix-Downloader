@@ -162,7 +162,8 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(Path(bot.resolve_action_data(42, child)["cache_path"]).is_file())
 
     async def test_both_polling_and_upload_use_ipv4_option(self):
-        with patch.dict(os.environ, {"TELEGRAM_IPV4": "1"}), patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
+        with patch.dict(os.environ, {"TELEGRAM_IPV4": "1"}), patch("telegram_network.environment_proxy", return_value=None), \
+                patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
             app = bot.application_builder("123456:dummy-token-for-tests").build()
             self.assertEqual(transport.call_count, 4)
             for call in transport.call_args_list[::2]:
@@ -174,7 +175,8 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 await request.shutdown()
 
     async def test_automatic_preference_keeps_ipv4_fallback_for_both_requests(self):
-        with patch.dict(os.environ, {"TELEGRAM_IPV4": "0"}), patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
+        with patch.dict(os.environ, {"TELEGRAM_IPV4": "0"}), patch("telegram_network.environment_proxy", return_value=None), \
+                patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
             app = bot.application_builder("123456:dummy-token-for-tests").build()
             self.assertEqual(transport.call_count, 4)
             for call in transport.call_args_list[::2]:
@@ -183,6 +185,27 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(call.kwargs["local_address"], "0.0.0.0")
             for request in app.bot._request:
                 await request.shutdown()
+
+    async def test_environment_proxy_only_after_direct_routes(self):
+        with patch.dict(os.environ, {"TELEGRAM_IPV4": "1"}), \
+                patch("telegram_network.environment_proxy", return_value="http://proxy.test:3128"), \
+                patch("httpx.AsyncHTTPTransport", wraps=bot.httpx.AsyncHTTPTransport) as transport:
+            request = bot.telegram_request()
+            self.assertEqual(transport.call_count, 3)
+            self.assertEqual(transport.call_args_list[0].kwargs['local_address'], '0.0.0.0')
+            self.assertEqual(transport.call_args_list[0].kwargs['retries'], 0)
+            self.assertIsNone(transport.call_args_list[0].kwargs['proxy'])
+            self.assertIsNone(transport.call_args_list[1].kwargs['local_address'])
+            self.assertEqual(transport.call_args_list[2].kwargs['proxy'], 'http://proxy.test:3128')
+            await request.shutdown()
+
+    async def test_custom_bot_api_does_not_fall_back_to_system_proxy(self):
+        with patch('bot.TELEGRAM_API_BASE', 'http://127.0.0.1:8081'), \
+                patch('telegram_network.environment_proxy', return_value='http://proxy.test:3128'), \
+                patch('httpx.AsyncHTTPTransport', wraps=bot.httpx.AsyncHTTPTransport) as transport:
+            request = bot.telegram_request()
+            self.assertEqual(transport.call_count, 2)
+            await request.shutdown()
 
     async def test_generic_proxy_does_not_hijack_telegram(self):
         with patch.dict(os.environ, {"HTTPS_PROXY": "http://broken.invalid:9999"}, clear=False), \
