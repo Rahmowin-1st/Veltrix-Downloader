@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import httpx
 
 import bot
 from telegram_relay import relay_handler
+from telegram_network import health, snapshot
 
 
 TOKEN = '123456:relay-test-token'
@@ -79,6 +81,24 @@ class RelayServerTests(unittest.TestCase):
 
 
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_updates_marks_polling_ready_only_after_success(self):
+        def respond(req):
+            if req.url.path.endswith('/getUpdates'):
+                return httpx.Response(200, json={'ok': True, 'result': []})
+            return httpx.Response(200, json={'ok': True, 'result': {
+                'id': 123456, 'is_bot': True, 'first_name': 'Veltrix'}})
+        with patch('bot.TELEGRAM_RELAY_BASE', 'https://veltrix-downloader.onrender.com'), \
+                patch('httpx.AsyncHTTPTransport', return_value=httpx.MockTransport(respond)):
+            client = bot.application_builder(TOKEN).build().bot
+            with patch.dict(health, {'last_api_ok': 0.0, 'last_poll_ok': 0.0, 'last_error': None}):
+                async with client:
+                    self.assertTrue(snapshot()['connected_recently'])
+                    self.assertFalse(snapshot()['polling_recently'])
+                    self.assertEqual(await client.get_updates(timeout=1), ())
+                    self.assertTrue(snapshot()['polling_recently'])
+                    health['last_poll_ok'] = time.time() - 181
+                    self.assertFalse(snapshot()['polling_recently'])
+
     async def test_ptb_api_url_rewritten_and_token_sent_only_as_header(self):
         calls = []
         def respond(req):

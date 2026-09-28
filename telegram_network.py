@@ -84,4 +84,5 @@ class ObservedRequest(HTTPXRequest):
 def snapshot():
     result = dict(health)
     result['connected_recently'] = bool(result['last_error'] is None and result['last_api_ok'] and time.time() - result['last_api_ok'] < 180)
+    result['polling_recently'] = bool(result['last_error'] is None and result['last_poll_ok'] and time.time() - result['last_poll_ok'] < 180)
     return result

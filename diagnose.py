@@ -58,7 +58,8 @@ async def worker_health(label: str) -> None:
             response = await local.get(f"http://127.0.0.1:{os.getenv('PORT', '10000')}/readyz")
             info = response.json()
             state = info.get('telegram') or {}
-            stage = ('connected' if response.status_code == 200 else
+            stage = ('polling' if response.status_code == 200 else
+                     'waiting for first poll' if state.get('connected_recently') and not state.get('last_poll_ok') else
                      'initializing' if not state.get('last_api_ok') and not state.get('last_error') else 'disconnected')
             print(f"{label}: version={info.get('version')}, status={stage}, telegram={state}, route={info.get('telegram_route')}")
     except Exception as exc:

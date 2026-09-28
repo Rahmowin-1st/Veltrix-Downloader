@@ -41,7 +41,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.4.0"
+VERSION = "9.4.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1969,7 +1969,7 @@ def start_health_server() -> None:
                 "metrics": metric_snapshot(),
             }).encode()
             code = 200 if self.path in {"/", "/health", "/healthz", "/readyz"} else 404
-            if self.path == "/readyz" and not connectivity['connected_recently']:
+            if self.path == "/readyz" and not connectivity['polling_recently']:
                 code = 503
             self.send_response(code)
             self.send_header("Content-Type", "application/json")

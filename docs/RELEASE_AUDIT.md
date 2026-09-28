@@ -1,5 +1,11 @@
 # Veltrix Downloader v9.3 audit — 2026-09-28
 
+## v9.4.1 polling readiness
+
+- `/readyz` now reports ready only after a successful `getUpdates` response. A successful `getMe` confirms API access but cannot prove that the bot is receiving messages.
+- `diagnose.py` distinguishes a verified polling worker from one still waiting for its first poll; the relay polling path has an isolated client test.
+- Live `/start` replies and public platform media delivery still require a phone and Telegram chat check; unit tests cannot establish those outcomes.
+
 ## v9.4.0 authenticated Render relay
 
 The phone's direct Telegram routes and a proxy-free curl call all timed out; the existing free Frankfurt Render service successfully authenticated `getMe` with Telegram while staying health-only. Termux now configures the owner's Render URL once when no custom API target exists. Render routes Bot API methods and file downloads to Telegram while the phone remains the only polling/downloading worker. Bot credentials travel in an HTTPS header and are compared to the service's existing token; public paths never include the token. The relay streams request/response bytes, bounds concurrent calls and request size, never redirects upstream and restricts its destination to the official Telegram Bot API host.
