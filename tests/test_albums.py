@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -70,6 +71,11 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         async def receive(**kwargs):
             media = kwargs.get("media")
             if media:
+                from telegram.request._requestparameter import RequestParameter
+                encoded = RequestParameter.from_input("media", media)
+                self.assertEqual(len(encoded.multipart_data), len(media))
+                self.assertTrue(all(item["media"].startswith("attach://")
+                                    for item in json.loads(encoded.json_value)))
                 self.messages.append([item.type for item in media])
                 for item in media:
                     self.assertTrue(item.media.input_file_content.read())
@@ -170,13 +176,34 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
     async def test_post_button_caches_all_tracks_and_checks_owner(self):
         with patch("bot.DATA_DIR", self.root), patch("bot.CACHE_DIR", self.root / "cache"), patch("bot.ACTIONS_FILE", self.root / "actions.json"):
             markup = bot.post_mp3_button(42, "https://www.instagram.com/p/abc/", self.files([".mp4", ".m4a"]), "title")
-            token = markup.inline_keyboard[0][0].callback_data.split("|", 1)[1]
+            token = markup.inline_keyboard[0][0].callback_data.split("|")[2]
             row = bot.resolve_action_data(42, token)
             self.assertTrue(row["post"])
             self.assertEqual(len(row["children"]), 2)
             self.assertEqual(bot.resolve_action_data(43, token), {})
             for child in row["children"]:
                 self.assertTrue(Path(bot.resolve_action_data(42, child)["cache_path"]).is_file())
+
+    async def test_mp3_recovers_after_render_loses_action_files(self):
+        url = "https://www.instagram.com/p/abc/"
+        with patch("bot.DATA_DIR", self.root), patch("bot.CACHE_DIR", self.root / "cache"), \
+                patch("bot.ACTIONS_FILE", self.root / "actions.json"), patch("bot.BOT_TOKEN", "test-bot-token"):
+            markup = bot.post_mp3_button(42, url, [], "title")
+            data = markup.inline_keyboard[0][0].callback_data
+            bot.ACTIONS_FILE.unlink()
+            query = SimpleNamespace(data=data, from_user=SimpleNamespace(id=42),
+                                    answer=AsyncMock(), message=SimpleNamespace(
+                                        chat_id=42, reply_markup=markup,
+                                        reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock()))))
+            manager = bot.JobManager(self.root / "restarted.sqlite3")
+            with patch("bot._jobs", manager), patch("bot.safe_remote_url", return_value=True), \
+                    patch("bot.run_job", new_callable=AsyncMock) as job:
+                await bot.on_callback(SimpleNamespace(callback_query=query), None)
+                await asyncio.gather(*list(manager.tasks.values()))
+            job.assert_awaited_once()
+            self.assertEqual(job.call_args.args[3], url)
+            unauthorized = SimpleNamespace(message=query.message)
+            self.assertEqual(bot.recover_mp3_action(unauthorized, 43, data), {})
 
     async def test_both_polling_and_upload_use_ipv4_option(self):
         with patch.dict(os.environ, {"TELEGRAM_IPV4": "1"}), patch("telegram_network.environment_proxy", return_value=None), \

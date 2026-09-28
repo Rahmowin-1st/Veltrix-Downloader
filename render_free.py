@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -131,6 +132,8 @@ def main() -> None:
         raise SystemExit("BOT_TOKEN is missing")
     bot.BOT_TOKEN = token
     bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log.info('Media tools: ffmpeg=%s ffprobe=%s deno=%s',
+             bool(shutil.which('ffmpeg')), bool(shutil.which('ffprobe')), bool(shutil.which('deno')))
 
     # Termux remains the only worker. This service is a credential-protected
     # transport bridge and never starts polling or sets a webhook.
@@ -147,6 +150,8 @@ def main() -> None:
         while True:
             time.sleep(3600)
 
+    if not shutil.which('ffprobe'):
+        raise SystemExit('ffprobe is required for video/photo validation on Render')
     app = bot.application_builder(token).build()
     bot.acquire_instance_lock()
     bot.register_handlers(app)
@@ -166,6 +171,7 @@ def main() -> None:
         url_path="telegram",
         webhook_url=webhook_url,
         drop_pending_updates=False,
+        secret_token=hashlib.sha256(('veltrix-webhook:' + token).encode()).hexdigest(),
     )
 
 

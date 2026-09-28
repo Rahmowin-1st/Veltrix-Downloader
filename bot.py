@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import html
 import ipaddress
 import json
@@ -42,7 +43,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.6.0"
+VERSION = "9.7.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1179,6 +1180,10 @@ def page_media_candidates(page: str, include_images: bool = True) -> list[str]:
 class WorkerFailure(RuntimeError):
     """A worker's already classified, safe user-facing failure."""
 
+    def __init__(self, message: str, category: str = "ExtractionFailed"):
+        super().__init__(message)
+        self.category = category if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", category) else "ExtractionFailed"
+
 
 def fatal_download_error(exc: Exception) -> bool:
     low = str(exc).lower()
@@ -1578,8 +1583,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer()
         return
 
-    token = data.split("|", 1)[1]
-    action = resolve_action_data(uid, token)
+    parts = data.split("|")
+    token = parts[2] if len(parts) == 4 else parts[1] if len(parts) == 2 else ""
+    action = resolve_action_data(uid, token) if token else {}
+    if not action.get("url"):
+        action = recover_mp3_action(q, uid, data)
     url = str(action.get("url") or "")
     if not url:
         await q.answer("This MP3 action expired. Send the media link again.", show_alert=False)
@@ -1687,7 +1695,8 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
             with ExitStack() as stack:
                 media = []
                 for offset, (kind, path) in enumerate(batch):
-                    upload = InputFile(stack.enter_context(path.open("rb")), filename=path.name, read_file_handle=False)
+                    upload = InputFile(stack.enter_context(path.open("rb")), filename=path.name,
+                                       attach=len(batch) > 1, read_file_handle=False)
                     item_caption = label if offset == 0 else None
                     if len(batch) == 1:
                         if kind == "image":
@@ -1718,7 +1727,34 @@ def post_mp3_button(uid: int, url: str, sources: list[Path], title: str) -> Inli
         actions = _load_actions()
         actions[token].update(post=True, children=children)
         _save_actions(actions)
-    return InlineKeyboardMarkup([[InlineKeyboardButton("MP3", callback_data=f"mp3|{token}")]])
+    # Render's free filesystem disappears on a cold restart. Keep the URL in
+    # Telegram's own button and authenticate its owner so MP3 can re-extract
+    # the post even after the temporary audio cache has vanished.
+    signature = hmac.new(BOT_TOKEN.encode(), f"{uid}:{token}:{url}".encode(), hashlib.sha256).hexdigest()[:16]
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("MP3", callback_data=f"mp3|{uid}|{token}|{signature}"),
+        InlineKeyboardButton("Original", url=url),
+    ]])
+
+
+def recover_mp3_action(query, uid: int, data: str) -> dict[str, Any]:
+    parts = data.split("|")
+    if len(parts) != 4 or parts[0] != "mp3" or parts[1] != str(uid):
+        return {}
+    token, signature = parts[2:]
+    if not re.fullmatch(r"[a-f0-9]{20}", token) or not re.fullmatch(r"[a-f0-9]{16}", signature):
+        return {}
+    markup = getattr(query.message, "reply_markup", None)
+    buttons = [b for row in getattr(markup, "inline_keyboard", ()) for b in row]
+    if not any(b.callback_data == data for b in buttons):
+        return {}
+    url = next((b.url for b in buttons if b.text == "Original" and b.url), "")
+    if not platform_of(url) or not safe_remote_url(url):
+        return {}
+    expected = hmac.new(BOT_TOKEN.encode(), f"{uid}:{token}:{url}".encode(), hashlib.sha256).hexdigest()[:16]
+    if not hmac.compare_digest(signature, expected):
+        return {}
+    return {"uid": uid, "url": url, "post": True, "children": []}
 
 
 async def send_animation(msg, path: Path, caption: str, tmp: Path) -> int:
@@ -1966,7 +2002,7 @@ async def run_job(
         mark_state("interrupted" if count or uncertain else "failed")
         log.error("job %s failed during %s: %s", event_id, progress['phase'], type(exc).__name__)
         await report_job_event(event_id, source, 'interrupted' if uncertain or count else 'failed',
-                               items=count, error=type(exc).__name__)
+                               items=count, error=exc.category if isinstance(exc, WorkerFailure) else type(exc).__name__)
         markup = None
         if mode == AUTO_MODE and not count and not uncertain:
             try:
@@ -2173,7 +2209,7 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
     result = json.loads(result_path.read_text())
     if result.get("error"):
         log.warning("worker %s: %s", platform_of(url), result.get("diagnostic", "no diagnostic"))
-        raise WorkerFailure(result["error"])
+        raise WorkerFailure(result["error"], str(result.get("category") or "ExtractionFailed"))
     files = [Path(p).resolve() for p in result.get("files", [])]
     if not files or any(not p.is_relative_to(tmp) or not p.is_file() for p in files):
         raise RuntimeError("Invalid download worker result")
