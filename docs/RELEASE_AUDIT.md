@@ -1,5 +1,9 @@
 # Veltrix Downloader v9.3 audit — 2026-09-28
 
+## v9.3.2 restart follow-up
+
+Termux reported `The previous worker is still finishing its shutdown. No second worker was started.` after a fast-forward update. The old launcher waited only 20 seconds and stopped; the supervisor's exit trap can wait on the Python child without a deadline. The new launcher detects unreaped zombie supervisors, signals only the previous supervisor's verified direct `python bot.py` child after a grace period, and bounds that child's shutdown before deciding whether a new worker is safe to start. It still refuses to launch a second worker if the old supervisor remains active or the PID points to an unrelated process. A forced restart during media upload has uncertain delivery; the durable job journal records interrupted uploads for user inspection. A synthetic hanging-child integration test runs in CI; this editing sandbox has a mismatched `/proc` PID namespace and skips that subprocess integration test locally.
+
 ## v9.3.1 phone connectivity follow-up
 
 The reported Termux check showed `ready=False`, no successful Bot API call yet, and a `TimedOut` during `getMe`. DNS and a previous unauthenticated `curl -4 -I` do not establish Bot API connectivity. The worker may have still been initializing when the local health endpoint was read.

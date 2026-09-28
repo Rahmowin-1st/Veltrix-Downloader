@@ -85,7 +85,7 @@ Render with `TERMUX_PRIMARY=1` is health-only and must not poll alongside Termux
 ```bash
 python -m unittest discover -s tests -v
 python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
-bash -n termux_start.sh termux_setup.sh termux_supervisor.sh
+bash -n termux_start.sh termux_setup.sh termux_supervisor.sh termux_process.sh
 ```
 
 The regression suite includes real generated MP4/M4A/PNG/GIF media, native animation/video conversion, MP3 extraction, stream-copy splits, mixed albums, cache ownership, exact-pin metadata, partial Instagram rejection and async delivery failures. Source-page and Telegram delivery tests use controlled fixtures; passing them is not live-platform certification.
@@ -97,6 +97,8 @@ Direct requests to all four platforms timed out in the editing environment. No l
 Run `python diagnose.py` on the phone for package/runtime checks, parallel DNS checks, free storage, saved job counts, local worker readiness and error categories. It independently tests authenticated `getMe` over the automatic and IPv4 routes before checking the bot identity and webhook. These checks are skipped when an explicit Telegram proxy or custom Bot API server is configured. It never consumes updates, changes the webhook or prints raw log lines/tokens. It does not prove downloader success or exclude a second remote polling instance. `Local worker: status=initializing` means the supervisor started but no Bot API request has succeeded or failed yet.
 
 The worker log prints the authenticated bot username when initialization succeeds. Termux defaults `TELEGRAM_IPV4=1`: IPv4 is attempted first, with automatic address selection as a fallback only after a connection-establishment failure. `TELEGRAM_IPV4=0` prefers automatic selection, with IPv4 as a fallback on connection failure. A command setting such as `TELEGRAM_IPV4=1 bash termux_start.sh` overrides `.env` for that run. The worker health response reports the effective preference without revealing secrets. Only explicit `TELEGRAM_PROXY` affects Telegram traffic. No hardcoded IP, DNS override or disabled TLS verification is used. A 302 response to `curl -4 -I https://api.telegram.org` checks the homepage, not the authenticated Bot API request; `getMe` is the relevant test.
+
+Restarting Termux waits for the previous supervisor to finish, identifies its direct `python bot.py` child and signals that child if graceful shutdown stalls. After a further bounded wait it terminates only that verified child. Restart never starts a second bot while the previous supervisor remains active. An upload interrupted by restart may need manual inspection before retrying; check `/status` rather than resending the same link blindly. `python diagnose.py` can be run on its own even when startup reports a shutdown delay.
 
 Optional owner-supplied cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, and `PINTEREST_COOKIE_FILE`. They do not guarantee access; do not share them in chat or use them to bypass restrictions. Worker failures now include a URL/token-redacted diagnostic in `logs/termux.log`.
 

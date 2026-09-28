@@ -42,6 +42,7 @@ jobs:
           bash -n termux_setup.sh
           bash -n termux_start.sh
           bash -n termux_supervisor.sh
+          bash -n termux_process.sh
 
       - name: Unit tests
         run: python -m unittest discover -s tests -v

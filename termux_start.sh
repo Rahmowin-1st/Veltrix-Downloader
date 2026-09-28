@@ -44,7 +44,7 @@ then
   python -c "import hashlib,pathlib; pathlib.Path('.dependencies.sha256').write_text(hashlib.sha256(pathlib.Path('requirements-termux.txt').read_bytes()).hexdigest())"
 fi
 
-python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py download_worker.py
+python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py transfer.py source_metadata.py download_worker.py diagnose.py
 for bin in ffmpeg ffprobe deno; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "Missing required runtime: $bin"
@@ -61,21 +61,9 @@ echo "Starting supervised Telegram connection; temporary outages will retry auto
 
 if [ -f .veltrix.pid ]; then
   OLD_PID="$(cat .veltrix.pid 2>/dev/null || true)"
-  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    OLD_COMMAND="$(ps -p "$OLD_PID" -o args= 2>/dev/null || true)"
-    case "$OLD_COMMAND" in
-      *termux_supervisor.sh*) ;;
-      *) echo "PID file refers to a different process. No process was stopped. Check .veltrix.pid."; exit 1 ;;
-    esac
-    kill "$OLD_PID" 2>/dev/null || true
-    for _ in $(seq 1 20); do
-      kill -0 "$OLD_PID" 2>/dev/null || break
-      sleep 1
-    done
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-      echo "The previous worker is still finishing its shutdown. No second worker was started."
-      exit 1
-    fi
+  if [ -n "$OLD_PID" ]; then
+    . ./termux_process.sh
+    veltrix_stop_previous "$OLD_PID"
   fi
 fi
 
