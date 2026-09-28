@@ -63,6 +63,18 @@ done
 
 termux-wake-lock || true
 
+# Existing installations that only used git pull + termux_start.sh did not
+# receive the reboot hook created by termux_setup.sh. Install it on normal
+# start as well. Termux:Boot still has to be installed/opened on the device.
+BOOT_HOOK="$HOME/.termux/boot/veltrix-downloader"
+if [ ! -e "$BOOT_HOOK" ]; then
+  mkdir -p "$(dirname "$BOOT_HOOK")"
+  REPO_SHELL_PATH="$(printf '%q' "$(pwd)")"
+  printf '#!/data/data/com.termux/files/usr/bin/bash\nsleep 15\ncd %s\nbash ./termux_start.sh\n' "$REPO_SHELL_PATH" > "$BOOT_HOOK"
+  chmod 700 "$BOOT_HOOK"
+  echo "Reboot hook installed. Open Termux:Boot once to enable it."
+fi
+
 # Authentication and webhook cleanup run inside the supervised worker.
 # A temporary outage must not prevent an offline phone from starting recovery.
 echo "Starting supervised Telegram connection; temporary outages will retry automatically."

@@ -97,6 +97,26 @@ class BackendTests(unittest.TestCase):
         info = bot._snap_info_from_doc(doc, "https://www.snapchat.com/spotlight/wanted")
         self.assertEqual(info["url"], "https://cf-st.sc-cdn.net/d/right")
 
+    def test_snapchat_page_target_not_lost_to_recommendations(self):
+        page = {"query": {"snapID": "wanted"}, "props": {"pageProps": {
+            "videoMetadata": {"contentUrl": "https://cf-st.sc-cdn.net/d/wanted"},
+            "spotlightFeed": {"spotlightStories": [{
+                "story": {"storyId": {"value": "unrelated"}},
+                "metadata": {"videoMetadata": {"contentUrl": "https://cf-st.sc-cdn.net/d/unrelated"}},
+            }]},
+        }}}
+        selected = bot._snap_info_from_doc(page, "https://www.snapchat.com/spotlight/wanted")
+        self.assertEqual(selected["url"], "https://cf-st.sc-cdn.net/d/wanted")
+        self.assertEqual(bot._snap_info_from_doc(page, "https://www.snapchat.com/spotlight/other"), {})
+
+    def test_snapchat_page_video_requires_exact_canonical_id(self):
+        page = ('<meta property="og:url" content="https://www.snapchat.com/spotlight/wanted">'
+                '<meta property="og:video" content="https://cf-st.sc-cdn.net/d/wanted">')
+        with patch('bot.safe_remote_url', return_value=True):
+            info = bot._snap_info_from_exact_page(page, 'https://www.snapchat.com/spotlight/wanted')
+            self.assertEqual(info['entries'][0]['kind'], 'video')
+            self.assertEqual(bot._snap_info_from_exact_page(page, 'https://www.snapchat.com/spotlight/other'), {})
+
     def test_classify_real_media_types(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -224,4 +244,3 @@ class BackendTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

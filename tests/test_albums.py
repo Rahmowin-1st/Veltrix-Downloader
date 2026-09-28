@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from source_metadata import instagram_audio_urls, instagram_extractor, pinterest_entries, find_pinterest_pin
-from telegram.error import TimedOut
+from telegram.error import TimedOut, BadRequest
 
 
 class MetadataTests(unittest.TestCase):
@@ -136,6 +136,23 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.call_count, 1)
         self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"], markup)
         status.delete.assert_not_called()
+
+    async def test_mp3_button_is_sent_when_status_edit_fails_after_album(self):
+        files = self.files([".jpg", ".mp4"])
+        status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
+                                 edit_text=AsyncMock(side_effect=BadRequest('status unavailable')),
+                                 delete=AsyncMock())
+        self.msg.chat_id = 42
+        self.msg.reply_text = AsyncMock()
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        markup = bot.InlineKeyboardMarkup([[bot.InlineKeyboardButton("MP3", callback_data="mp3|test")]])
+        with patch("bot.download_in_worker", new_callable=AsyncMock, return_value=files), \
+                patch("bot.has_audio", side_effect=lambda p: p.suffix == ".mp4"), \
+                patch("bot.post_mp3_button", return_value=markup), \
+                patch("bot._global_sem", None), patch("bot._job_locks", {}):
+            await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "auto", status)
+        self.assertEqual(self.messages, [["photo", "video"]])
+        self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
 
     async def test_expired_post_cache_redownloads_all_items(self):
         query = SimpleNamespace(data="mp3|post", from_user=SimpleNamespace(id=42),

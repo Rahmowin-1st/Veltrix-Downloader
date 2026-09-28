@@ -10,10 +10,11 @@ from unittest.mock import patch
 import httpx
 
 import bot
-from telegram import Bot
+from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.error import Conflict
 from telegram_relay import relay_handler
 from telegram_network import ObservedRequest, health, snapshot
+from telegram_network import RequestIDTransport
 
 
 TOKEN = '123456:relay-test-token'
@@ -26,6 +27,10 @@ class RelayServerTests(unittest.TestCase):
             self.received.append((req.method, str(req.url), req.headers, req.read()))
             data = (b'\x00video\xff' if '/file/bot' in req.url.path else
                     b'{"ok":true,"result":[]}' if '/getUpdates' in req.url.path else
+                    b'{"ok":true,"result":[{"message_id":17,"date":1700000000,"chat":{"id":123,"type":"private"}},{"message_id":18,"date":1700000000,"chat":{"id":123,"type":"private"}}]}'
+                    if '/sendMediaGroup' in req.url.path else
+                    b'{"ok":true,"result":{"message_id":17,"date":1700000000,"chat":{"id":123,"type":"private"}}}'
+                    if '/sendPhoto' in req.url.path else
                     b'{"ok":true,"result":{"id":123456,"is_bot":true,"first_name":"Veltrix"}}')
             return httpx.Response(200, headers={'Content-Length': str(len(data))}, stream=httpx.ByteStream(data))
         handler = relay_handler(TOKEN, upstream='https://api.telegram.org',
@@ -103,6 +108,89 @@ class RelayServerTests(unittest.TestCase):
         self.assertEqual(len(poll), 1)
         self.assertEqual(poll[0][0], 'POST')
         self.assertNotIn(TOKEN, str(poll[0][2]))
+
+    def test_lost_upload_reply_is_recovered_without_sending_twice(self):
+        class DropReply(httpx.AsyncBaseTransport):
+            request_id = None
+            async def handle_async_request(self, request):
+                transport = httpx.AsyncHTTPTransport()
+                try:
+                    response = await transport.handle_async_request(request)
+                    contents = await response.aread()
+                    if request.url.path.endswith('/sendPhoto'):
+                        self.request_id = request.headers['X-Veltrix-Request-ID']
+                        raise httpx.ReadTimeout('phone lost response after Telegram accepted media')
+                    return httpx.Response(response.status_code, headers=response.headers,
+                                          content=contents, request=request)
+                finally:
+                    await transport.aclose()
+        lost = DropReply()
+        async def check():
+            request = ObservedRequest(relay_base=self.base, relay_token=TOKEN,
+                                      httpx_kwargs={'transport': RequestIDTransport(lost),
+                                                    'headers': {'X-Veltrix-Token': TOKEN},
+                                                    'trust_env': False})
+            telegram = Bot(TOKEN, base_url=self.base + '/bot', request=request,
+                           get_updates_request=ObservedRequest(
+                               relay_base=self.base, relay_token=TOKEN,
+                               httpx_kwargs={'transport': httpx.AsyncHTTPTransport(),
+                                             'headers': {'X-Veltrix-Token': TOKEN},
+                                             'trust_env': False}))
+            async with telegram:
+                message = await telegram.send_photo(123, photo=io.BytesIO(b'photo-fixture'))
+                self.assertEqual(message.message_id, 17)
+        asyncio.run(check())
+        self.assertIsNotNone(lost.request_id)
+        self.assertEqual(sum('/sendPhoto' in row[1] for row in self.received), 1)
+        with httpx.Client(trust_env=False) as client:
+            receipt = client.get(self.base + '/relay/result/' + lost.request_id,
+                                 headers={'X-Veltrix-Token': TOKEN}).json()
+        self.assertEqual(receipt['state'], 'done')
+
+    def test_lost_carousel_reply_recovers_album_without_duplicate(self):
+        class DropAlbum(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                transport = httpx.AsyncHTTPTransport()
+                try:
+                    response = await transport.handle_async_request(request)
+                    content = await response.aread()
+                    if request.url.path.endswith('/sendMediaGroup'):
+                        raise httpx.ReadTimeout('lost album acknowledgement')
+                    return httpx.Response(response.status_code, content=content, request=request)
+                finally:
+                    await transport.aclose()
+
+        async def check():
+            request = ObservedRequest(relay_base=self.base, relay_token=TOKEN,
+                                      httpx_kwargs={'transport': RequestIDTransport(DropAlbum()),
+                                                    'headers': {'X-Veltrix-Token': TOKEN},
+                                                    'trust_env': False})
+            telegram = Bot(TOKEN, base_url=self.base + '/bot', request=request,
+                           get_updates_request=ObservedRequest(
+                               relay_base=self.base, relay_token=TOKEN,
+                               httpx_kwargs={'headers': {'X-Veltrix-Token': TOKEN},
+                                             'trust_env': False}))
+            async with telegram:
+                result = await telegram.send_media_group(123, [
+                    InputMediaPhoto(io.BytesIO(b'first photo')),
+                    InputMediaVideo(io.BytesIO(b'second video')),
+                ])
+                self.assertEqual([message.message_id for message in result], [17, 18])
+
+        asyncio.run(check())
+        self.assertEqual(sum('/sendMediaGroup' in row[1] for row in self.received), 1)
+
+    def test_relay_event_rejects_raw_chat_text(self):
+        headers = {'X-Veltrix-Token': TOKEN}
+        with httpx.Client(trust_env=False) as client:
+            good = client.post(self.base + '/relay/event', headers=headers, json={
+                'job': 'abcdef123456', 'platform': 'snapchat', 'stage': 'failed',
+                'items': 0, 'error': 'WorkerFailure'})
+            bad = client.post(self.base + '/relay/event', headers=headers, json={
+                'job': 'abcdef123456', 'platform': 'snapchat', 'stage': 'failed',
+                'items': 0, 'error': 'WorkerFailure', 'text': 'private message'})
+        self.assertEqual(good.status_code, 200)
+        self.assertEqual(bad.status_code, 400)
 
 
 class RelayClientTests(unittest.IsolatedAsyncioTestCase):

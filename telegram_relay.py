@@ -6,6 +6,8 @@ never contain the credential; the upstream host is fixed and TLS is verified.
 from __future__ import annotations
 
 import hmac
+import base64
+import json
 import logging
 import os
 import re
@@ -21,6 +23,12 @@ import httpx
 log = logging.getLogger('veltrix.relay')
 MAX_BODY = 550_000_000  # Up to ten cloud-Bot-API-sized items in one album.
 API_METHOD = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,63}\Z')
+REQUEST_ID = re.compile(r'[a-f0-9]{24}\Z')
+JOB_ID = re.compile(r'[a-f0-9]{12}\Z')
+ERROR_CLASS = re.compile(r'[A-Za-z][A-Za-z0-9_]{0,63}\Z')
+MEDIA_METHODS = {'sendPhoto', 'sendVideo', 'sendMediaGroup', 'sendAudio',
+                 'sendAnimation', 'sendDocument', 'sendVoice'}
+MAX_RECEIPT_BYTES = 2_000_000
 
 
 def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client_factory=None):
@@ -28,6 +36,15 @@ def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client
     slots = BoundedSemaphore(16)
     poll_lock = Lock()
     poll_log = {'seen': False, 'last': 0.0}
+    receipt_lock = Lock()
+    receipts = {}
+
+    def record(request_id, state, code=0, data=b''):
+        with receipt_lock:
+            receipts[request_id] = (monotonic(), state, code, data)
+            if len(receipts) > 512:
+                oldest = min(receipts, key=lambda key: receipts[key][0])
+                receipts.pop(oldest, None)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -103,15 +120,61 @@ def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client
                 return self._answer(200, b'{"ok":true,"service":"veltrix-relay"}')
             if not hmac.compare_digest(self.headers.get('X-Veltrix-Token', ''), token):
                 return self._answer(403, b'{"ok":false}')
+            if self.path == '/relay/event' and self.command == 'POST':
+                size = self.headers.get('Content-Length', '')
+                if not size.isdecimal() or not 0 < int(size) <= 512:
+                    return self._answer(413, b'{"ok":false}')
+                try:
+                    event = json.loads(self.rfile.read(int(size)))
+                    if not isinstance(event, dict) or set(event) - {'job', 'platform', 'stage', 'items', 'error'}:
+                        raise ValueError('unexpected event data')
+                    ident, platform, stage = event['job'], event['platform'], event['stage']
+                    error, items = event.get('error', 'none'), event.get('items', 0)
+                    if (not JOB_ID.fullmatch(ident)
+                            or platform not in {'youtube', 'instagram', 'snapchat', 'pinterest', 'unknown'}
+                            or stage not in {'downloading', 'prepared', 'uploading', 'delivered', 'failed', 'interrupted'}
+                            or not isinstance(error, str) or not ERROR_CLASS.fullmatch(error)
+                            or not isinstance(items, int) or not 0 <= items <= 100):
+                        raise ValueError('invalid event')
+                except (KeyError, ValueError, TypeError, UnicodeDecodeError):
+                    return self._answer(400, b'{"ok":false}')
+                log.info('Job %s platform=%s stage=%s items=%s error=%s', ident, platform, stage, items, error)
+                return self._answer(200, b'{"ok":true}')
+            if self.command == 'GET' and self.path.startswith('/relay/result/'):
+                request_id = self.path.removeprefix('/relay/result/')
+                if not REQUEST_ID.fullmatch(request_id):
+                    return self._answer(404, b'{"ok":false}')
+                with receipt_lock:
+                    receipt = receipts.get(request_id)
+                if not receipt or monotonic() - receipt[0] > 1800:
+                    return self._answer(404, b'{"state":"missing"}')
+                _, state, code, data = receipt
+                if state == 'pending':
+                    return self._answer(202, b'{"state":"pending"}')
+                if state != 'done':
+                    return self._answer(200, b'{"state":"uncertain"}')
+                payload = json.dumps({'state': 'done', 'status': code,
+                                      'body': base64.b64encode(data).decode('ascii')}).encode()
+                return self._answer(200, payload)
             target = self._destination()
             if not target or (self.command == 'GET' and '/relay/file/' not in self.path):
                 return self._answer(404, b'{"ok":false}')
             polling = self.command == 'POST' and urlsplit(self.path).path == '/relay/api/getUpdates'
+            method_name = urlsplit(self.path).path.removeprefix('/relay/api/')
+            request_id = self.headers.get('X-Veltrix-Request-ID', '')
+            receipt_enabled = bool(self.command == 'POST' and method_name in MEDIA_METHODS
+                                   and REQUEST_ID.fullmatch(request_id))
             if not slots.acquire(blocking=False):
                 return self._answer(503, b'{"ok":false,"description":"Relay busy"}')
             response_started = False
             started = monotonic()
             try:
+                if receipt_enabled:
+                    with receipt_lock:
+                        existing = receipts.get(request_id)
+                        if existing and monotonic() - existing[0] <= 1800:
+                            return self._answer(409, b'{"ok":false,"description":"Duplicate relay request"}')
+                        receipts[request_id] = (monotonic(), 'pending', 0, b'')
                 if polling:
                     with poll_lock:
                         if not poll_log['seen']:
@@ -141,19 +204,45 @@ def relay_handler(token: str, upstream: str = 'https://api.telegram.org', client
                                 if response.status_code != 200 or now - poll_log['last'] >= 300:
                                     log.info('Relay getUpdates: HTTP %s after %.1fs', response.status_code, now - started)
                                     poll_log['last'] = now
-                        self.send_response(response.status_code)
-                        for name in ('Content-Type', 'Content-Length', 'Content-Encoding',
-                                     'Content-Disposition', 'Retry-After'):
-                            if name in response.headers:
-                                self.send_header(name, response.headers[name])
-                        if 'Content-Length' not in response.headers:
-                            self.send_header('Connection', 'close')
+                        downstream_open = True
+                        try:
+                            self.send_response(response.status_code)
+                            for name in ('Content-Type', 'Content-Length', 'Content-Encoding',
+                                         'Content-Disposition', 'Retry-After'):
+                                if name in response.headers:
+                                    self.send_header(name, response.headers[name])
+                            if 'Content-Length' not in response.headers:
+                                self.send_header('Connection', 'close')
+                                self.close_connection = True
+                            self.end_headers()
+                            response_started = True
+                        except (BrokenPipeError, ConnectionResetError):
+                            downstream_open = False
                             self.close_connection = True
-                        self.end_headers()
-                        response_started = True
+                        saved = bytearray()
                         for chunk in response.iter_raw(chunk_size=65536):
-                            self.wfile.write(chunk)
+                            if receipt_enabled and len(saved) + len(chunk) <= MAX_RECEIPT_BYTES:
+                                saved.extend(chunk)
+                            elif receipt_enabled:
+                                saved = None
+                                receipt_enabled = False
+                                record(request_id, 'uncertain')
+                            if downstream_open:
+                                try:
+                                    self.wfile.write(chunk)
+                                except (BrokenPipeError, ConnectionResetError):
+                                    downstream_open = False
+                                    self.close_connection = True
+                        if receipt_enabled:
+                            record(request_id, 'done', response.status_code, bytes(saved))
+                            if not downstream_open:
+                                log.info('Relay %s response cached after phone disconnect', method_name)
+                        if method_name in MEDIA_METHODS:
+                            log.info('Relay %s: HTTP %s after %.1fs', method_name, response.status_code,
+                                     monotonic() - started)
             except (httpx.HTTPError, OSError, ValueError, socket.timeout) as exc:
+                if receipt_enabled:
+                    record(request_id, 'uncertain')
                 log.warning('Telegram relay %s: %s', 'getUpdates' if polling else 'transfer', type(exc).__name__)
                 if not response_started and not self.wfile.closed:
                     try:

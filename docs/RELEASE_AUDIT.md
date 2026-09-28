@@ -1,5 +1,13 @@
 # Veltrix Downloader release audit — 2026-09-28
 
+## v9.6.0 screenshot-driven fixes
+
+- Owner screenshots: YouTube and Instagram Reels delivered, while a Pinterest short link and an Instagram carousel reported unconfirmed Telegram delivery; Snapchat Spotlight returned unavailable. Render emitted a `BrokenPipeError` near the Pinterest attempts. Render did not retain the Telegram chat or the phone's worker log, so that log line alone cannot identify an exact post.
+- Media uploads through the relay now carry a random request ID. The relay retains a bounded response receipt after the phone disconnects; on a read timeout, the phone queries that receipt instead of sending the media again. If the result cannot be confirmed, the job remains interrupted for manual inspection. Controlled test drops a response after Telegram accepts a photo and verifies a single upload and recovered message ID.
+- Snapchat exact Spotlight lookup accepts the page's own top-level video when its query ID matches, even if recommendations are present. HTML fallback accepts one video tag only when the canonical Open Graph URL names the requested Spotlight ID; it refuses recommendation pages.
+- If Telegram rejects an edit to the album status, the MP3 button is sent in a separate text message. Readable failure class replaces the formerly hidden status-edit error. Authenticated Render job events record stage/item count/error class only; chat text, links and tokens are rejected. A missing Termux reboot script is now installed at normal startup.
+- Limitations: the exact Pinterest/Snapchat/Instagram URLs could not be fetched from this editing environment or from the phone; end-to-end platform acceptance remains unverified. The phone remains the only downloader and poller. Free Render sleeps and loses local state on restart, so it cannot provide guaranteed 24/7 service while the phone is off; an always-on host with durable storage and a single polling worker is required for that guarantee. Private account media needs valid authorized access, and no extractor guarantees all private posts.
+
 ## v9.5.0 polling recovery
 
 - Phone report: `getMe` succeeded through Render, while `last_poll_ok` remained zero. The relay emitted a fresh startup after hours without traffic; a nine-second health probe timed out during its cold wake. That probe cannot establish failure when authenticated `getMe` later succeeds.

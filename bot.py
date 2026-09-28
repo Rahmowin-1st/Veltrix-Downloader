@@ -16,6 +16,7 @@ import math
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import socket
 import sys
@@ -41,7 +42,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.5.0"
+VERSION = "9.6.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -732,12 +733,15 @@ def _snap_target_metadata(doc: dict[str, Any], requested_id: str) -> dict[str, A
                 if isinstance(meta, dict):
                     return meta
 
-    if requested_id and stories:
-        return {}  # Never substitute a recommendation for the requested item.
     query_id = str(_dig_dict(doc, "query").get("snapID") or "")
+    top = props.get("videoMetadata")
+    # Spotlight pages can expose the selected clip at the top level while
+    # spotlightStories contains only unrelated recommendations. Trust the top
+    # level only when the page's own snapID matches the requested clip.
+    if requested_id and stories and query_id != requested_id:
+        return {}
     if requested_id and query_id and requested_id != query_id:
         return {}
-    top = props.get("videoMetadata")
     if isinstance(top, dict) and str(top.get("contentUrl") or ""):
         return {"videoMetadata": top}
 
@@ -764,6 +768,21 @@ def _snap_info_from_doc(doc: dict[str, Any], page_url: str) -> dict[str, str]:
     }
 
 
+def _snap_info_from_exact_page(page: str, page_url: str) -> dict[str, Any]:
+    """Use page-owned video tags only after checking the exact Spotlight ID."""
+    requested = _snap_requested_id(page_url, {})
+    canonical = og_values(page, {'og:url'})
+    if not requested or not any(_snap_requested_id(value, {}) == requested for value in canonical):
+        return {}
+    videos = list(dict.fromkeys(og_values(page, {
+        'og:video', 'og:video:url', 'og:video:secure_url', 'twitter:player:stream',
+    })))
+    if len(videos) != 1 or not safe_remote_url(videos[0]):
+        return {}
+    return {'url': videos[0], 'entries': [{'url': videos[0], 'kind': 'video'}],
+            'id': requested, 'page_url': page_url}
+
+
 def extract_snapchat_public(url: str) -> dict[str, Any]:
     cached = metadata_cache_get(f"snapchat:{url}")
     if cached:
@@ -776,8 +795,12 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
         match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', response.text, re.I | re.S)
         if not match:
             if "/spotlight/" in urlparse(candidate).path:
-                info = snapchat_preload(response.text)
+                info = _snap_info_from_exact_page(response.text, candidate)
+                if not info and any(_snap_requested_id(value, {}) == _snap_requested_id(candidate, {})
+                                    for value in og_values(response.text, {'og:url'})):
+                    info = snapchat_preload(response.text)
                 if info:
+                    metadata_cache_put(f"snapchat:{url}", info)
                     return info
             continue
         doc = json.loads(match.group(1))
@@ -1440,7 +1463,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text("⚙️ Quality is automatic. No setup needed.")
 
 
-async def edit_status(status, text: str, reply_markup=None) -> None:
+async def edit_status(status, text: str, reply_markup=None) -> bool:
     try:
         captionable = any(
             getattr(status, field, None)
@@ -1450,8 +1473,10 @@ async def edit_status(status, text: str, reply_markup=None) -> None:
             await status.edit_caption(caption=text, reply_markup=reply_markup, connect_timeout=8, read_timeout=8)
         else:
             await status.edit_text(text, reply_markup=reply_markup, connect_timeout=8, read_timeout=8)
-    except TelegramError:
-        pass
+        return True
+    except TelegramError as exc:
+        log.info("Status update failed: %s", type(exc).__name__)
+        return False
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1814,6 +1839,21 @@ async def run_cached_audio_job(msg, context, uid: int, source: Path | list[Path]
                   cached_sources=sources, known_meta={"title": title})
 
 
+async def report_job_event(job: str, platform: str, stage: str, *, items: int = 0,
+                           error: str = 'none') -> None:
+    """Expose safe progress on Render without copying a chat or media URL."""
+    if not TELEGRAM_RELAY_BASE or not BOT_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=4) as client:
+            await client.post(TELEGRAM_RELAY_BASE + '/relay/event',
+                              headers={'X-Veltrix-Token': BOT_TOKEN},
+                              json={'job': job, 'platform': platform or 'unknown',
+                                    'stage': stage, 'items': min(items, 100), 'error': error})
+    except (httpx.HTTPError, OSError):
+        pass
+
+
 async def run_job(
     msg, context, uid: int, url: str, mode: str, status=None,
     selected_audio_index: int | None = None,
@@ -1822,6 +1862,8 @@ async def run_job(
 ) -> None:
     lock = job_lock(uid)
     progress = {"sent": 0, "phase": "Queued"}
+    event_id = secrets.token_hex(6)
+    source = platform_of(url) or 'unknown'
     status = status if status is not None else DeferredStatus(msg)
     started_at = time.monotonic()
     tmp = None
@@ -1855,6 +1897,7 @@ async def run_job(
             active = True
             metric_add("active_jobs", 1)
             mark_state("downloading")
+            await report_job_event(event_id, source, 'downloading')
             tmp = Path(tempfile.mkdtemp(prefix="vx_"))
             progress["phase"] = f"Downloading from {platform_label(url)}"
             meta = dict(known_meta or {})
@@ -1866,6 +1909,8 @@ async def run_job(
                     files.append(local)
             else:
                 files = await download_in_worker(url, mode, tmp, meta)
+            await report_job_event(event_id, source, 'prepared', items=len(files))
+            await report_job_event(event_id, source, 'uploading', items=len(files))
             if mode in AUDIO_PRESETS:
                 if selected_audio_index is not None:
                     if selected_audio_index < 0 or selected_audio_index >= len(files):
@@ -1899,21 +1944,29 @@ async def run_job(
                     log.warning("Media delivered; MP3 cache could not be saved")
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
-                await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
+                updated = await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
+                if markup is not None and not updated:
+                    # An album cannot carry an inline keyboard. If editing its
+                    # status fails, still deliver the saved audio action.
+                    await msg.reply_text("🎵 MP3", reply_markup=markup)
             metric_add("jobs_succeeded", 1)
+            await report_job_event(event_id, source, 'delivered', items=sent)
     except Exception as exc:
         ticker.cancel()
         await asyncio.gather(ticker, return_exceptions=True)
         count = progress["sent"]
         if delivered:
             metric_add("jobs_succeeded", 1)
-            log.warning("Delivery completed; follow-up failed: %s", type(exc).__name__)
+            log.warning("Job %s media delivered; follow-up failed: %s", event_id, type(exc).__name__)
+            await report_job_event(event_id, source, 'delivered', items=progress['sent'], error=type(exc).__name__)
             await edit_status(status, "✅ Media delivered. Send the link again if the MP3 action is unavailable.")
             return
         metric_add("jobs_failed", 1)
         uncertain = bool(progress.get("attempted")) and not connection_failed_before_send(exc)
         mark_state("interrupted" if count or uncertain else "failed")
-        log.error("job failed: %s", type(exc).__name__)
+        log.error("job %s failed during %s: %s", event_id, progress['phase'], type(exc).__name__)
+        await report_job_event(event_id, source, 'interrupted' if uncertain or count else 'failed',
+                               items=count, error=type(exc).__name__)
         markup = None
         if mode == AUTO_MODE and not count and not uncertain:
             try:
@@ -2128,7 +2181,7 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
 
 
 def telegram_request(pool_size: int = 16, token: str | None = None):
-    from telegram_network import ConnectFallback, ObservedRequest, environment_proxy
+    from telegram_network import ConnectFallback, ObservedRequest, RequestIDTransport, environment_proxy
     from urllib.parse import urlsplit
     token = token or BOT_TOKEN
     if TELEGRAM_RELAY_BASE:
@@ -2159,6 +2212,8 @@ def telegram_request(pool_size: int = 16, token: str | None = None):
             transport = ConnectFallback(
                 transport, httpx.AsyncHTTPTransport(limits=limits, retries=0, proxy=backup_proxy),
             )
+    if TELEGRAM_RELAY_BASE:
+        transport = RequestIDTransport(transport)
     headers = {'X-Veltrix-Token': token} if TELEGRAM_RELAY_BASE else None
     return ObservedRequest(relay_base=TELEGRAM_RELAY_BASE, relay_token=token,
                            connection_pool_size=pool_size, read_timeout=120, write_timeout=120,

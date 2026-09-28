@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.4
+# Veltrix Downloader 9.6
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -47,7 +47,8 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Carousel order is retained; failed entries, extractor error records and item caps are reported instead of silently truncating a post.
 - Snapchat will not substitute a recommended item when the requested Spotlight ID is missing.
 - No generic page-wide download fallback: these can return thumbnails, recommendations or unrelated media.
-- Telegram flood-control delays are honored in full. Proven connection-establishment failures may retry; ambiguous read/write/upload timeouts are not replayed because Telegram may already have accepted the file.
+- Telegram flood-control delays are honored in full. Proven connection-establishment failures may retry. For relay uploads, a unique request ID lets the phone retrieve a cached Telegram result after a lost reply; when the result is still unknown, the upload is not replayed.
+- If the album arrives but editing the status to add the MP3 button fails, the bot sends a small fallback button message. Render records only a short job ID, platform, stage, item count and error class, without chat contents or links; historic chat messages and the phone's local log are not available from Render.
 - Long uploads have dedicated timeouts; MP3 conversions share the same resource semaphore.
 - Conversion processes and download process groups are stopped on shutdown. A local process lock prevents two workers using the same data directory. Separate devices/services must still avoid polling the same token.
 - Dependency changes are detected during normal restart. Pending Telegram updates are preserved.
@@ -72,7 +73,7 @@ cd Veltrix-Downloader
 bash termux_setup.sh
 ```
 
-Keep Termux battery optimization disabled. Reboot startup additionally requires Termux:Boot to be installed and opened once. Device storage, internet and power remain required; no paid API is used.
+Keep Termux battery optimization disabled. Normal startup installs a missing reboot script; reboot startup also requires Termux:Boot to be installed from the same source as Termux and opened once. The wake lock and supervisor improve background survival, but Android can still terminate the process. Device storage, internet and power remain required; no paid API is used.
 
 `.env.example` documents normal settings. Default caps: 100 items, 4 GiB per source, 6 GiB total download workspace, 128 MiB disk reserve, one concurrent job. Remuxing/splitting also needs additional free disk space.
 
@@ -104,7 +105,7 @@ The worker log prints the authenticated bot username when initialization succeed
 
 Restarting Termux waits for the previous supervisor to finish, identifies its direct `python bot.py` child and signals that child if graceful shutdown stalls. After a further bounded wait it terminates only that verified child. Restart never starts a second bot while the previous supervisor remains active. An upload interrupted by restart may need manual inspection before retrying; check `/status` rather than resending the same link blindly. `python diagnose.py` can be run on its own even when startup reports a shutdown delay.
 
-Optional owner-supplied cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, and `PINTEREST_COOKIE_FILE`. They do not guarantee access; do not share them in chat or use them to bypass restrictions. Worker failures now include a URL/token-redacted diagnostic in `logs/termux.log`.
+Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, `PINTEREST_COOKIE_FILE`, and `SNAPCHAT_COOKIE_FILE`. They can help access accounts you are authorized to view, when supported by the applicable extractor; a link alone does not grant access to private accounts and cookies do not guarantee extraction. Keep them on the phone, outside chat and GitHub. Worker failures include a URL/token-redacted diagnostic in `logs/termux.log`.
 
 ## Upstream references reviewed
 
