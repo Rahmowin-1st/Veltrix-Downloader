@@ -94,6 +94,31 @@ def probe_telegram_egress(token: str) -> None:
         log.info("Render Telegram API egress: OK")
 
 
+def probe_relay_loopback(token: str) -> None:
+    """Verify the authenticated relay and Telegram together without polling."""
+    import httpx
+
+    async def check():
+        for _ in range(8):
+            try:
+                async with httpx.AsyncClient(trust_env=False, timeout=15) as client:
+                    response = await client.post(
+                        f"http://127.0.0.1:{os.getenv('PORT', '10000')}/relay/api/getMe",
+                        headers={'X-Veltrix-Token': token},
+                    )
+                    return response.status_code == 200 and response.json().get('ok') is True
+            except httpx.ConnectError:
+                await asyncio.sleep(0.25)
+        return False
+
+    try:
+        ready = asyncio.run(check())
+    except Exception as exc:
+        log.warning('Render relay loopback: %s', type(exc).__name__)
+    else:
+        log.info('Render relay loopback: %s', 'OK' if ready else 'unavailable')
+
+
 # Pass the local path to isolated workers; cookie values are never logged.
 if YOUTUBE_COOKIE_FILE:
     os.environ["YOUTUBE_COOKIE_FILE"] = str(YOUTUBE_COOKIE_FILE)
@@ -114,6 +139,7 @@ def main() -> None:
             from telegram_relay import serve_relay
             threading.Thread(target=serve_relay, args=(token,), daemon=True).start()
             log.info('TERMUX_PRIMARY=1: Telegram relay enabled; no Render polling')
+            threading.Thread(target=probe_relay_loopback, args=(token,), daemon=True).start()
         else:
             bot.start_health_server()
             log.info('TERMUX_PRIMARY=1: Telegram disabled on Render; health-only mode')
