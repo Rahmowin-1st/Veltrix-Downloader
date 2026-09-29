@@ -43,7 +43,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.7.1"
+VERSION = "9.7.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -461,6 +461,9 @@ def request_headers(url: str | None = None) -> dict[str, str]:
         headers["Referer"] = "https://www.instagram.com/"
     elif platform == "snapchat":
         headers["Referer"] = "https://www.snapchat.com/"
+        # Snapchat's embed HTML may advertise a broken compressed stream.
+        # Requesting the uncompressed page avoids httpx.DecodingError.
+        headers["Accept-Encoding"] = "identity"
         headers["Sec-Fetch-Dest"] = "document"
         headers["Sec-Fetch-Mode"] = "navigate"
         headers["Sec-Fetch-Site"] = "none"
@@ -736,7 +739,8 @@ def _snap_target_metadata(doc: dict[str, Any], requested_id: str) -> dict[str, A
             story_id = story.get("storyId") if isinstance(story.get("storyId"), dict) else {}
             if str(story_id.get("value") or "") == requested_id:
                 meta = item.get("metadata")
-                if isinstance(meta, dict):
+                video_meta = meta.get('videoMetadata') if isinstance(meta, dict) else None
+                if isinstance(video_meta, dict) and video_meta.get('contentUrl'):
                     return meta
 
     query_id = str(_dig_dict(doc, "query").get("snapID") or "")
@@ -744,9 +748,7 @@ def _snap_target_metadata(doc: dict[str, Any], requested_id: str) -> dict[str, A
     # Spotlight pages can expose the selected clip at the top level while
     # spotlightStories contains only unrelated recommendations. Trust the top
     # level only when the page's own snapID matches the requested clip.
-    if requested_id and stories and query_id != requested_id:
-        return {}
-    if requested_id and query_id and requested_id != query_id:
+    if requested_id and query_id != requested_id:
         return {}
     if isinstance(top, dict) and str(top.get("contentUrl") or ""):
         return {"videoMetadata": top}
@@ -823,7 +825,11 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
     cached = metadata_cache_get(f"snapchat:{url}")
     if cached:
         return cached
-    for candidate in extractor_candidates(url)[:3]:
+    candidates = extractor_candidates(url)[:3]
+    snap_id = _snap_requested_id(url, {})
+    if snap_id:
+        candidates.append(f"https://www.snapchat.com/spotlight/{snap_id}/embed")
+    for candidate in dict.fromkeys(candidates):
         try:
             response = fetch_public_page(candidate)
         except (httpx.HTTPError, RuntimeError):
@@ -841,7 +847,10 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
                     metadata_cache_put(f"snapchat:{url}", info)
                     return info
             continue
-        doc = json.loads(match.group(1))
+        try:
+            doc = json.loads(match.group(1))
+        except ValueError:
+            continue
         if "/spotlight/" in urlparse(candidate).path:
             info = _snap_info_from_doc(doc, page_url)
             if info:

@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.7.1
+# Veltrix Downloader 9.7.2
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -105,7 +105,7 @@ The regression suite includes real generated MP4/M4A/PNG/GIF media, native anima
 
 Direct requests to all four platforms timed out in the editing environment. No live Telegram bot token or access to the running Termux session was available here. Therefore this release still needs live URL-to-Telegram acceptance on the actual runtime. See `docs/RELEASE_AUDIT.md`.
 
-The owner's September 29 Render test subsequently confirmed 15 Instagram carousel items and 8 Pinterest items delivered. A Snapchat Spotlight route returned HTTP 404 from Render, and two YouTube videos triggered YouTube's automated-traffic verification despite a separate public-video metadata probe passing. These are source-access failures, not Telegram upload errors. The exact blocked links are not certified by the passing tests.
+The owner's September 29 Render test confirmed 15 Instagram carousel items and 8 Pinterest items delivered. Real source probes on Render confirmed that the failing Spotlight URL returns HTTP 404 on its normal route. Its embed route returns HTTP 200, but the post-matched metadata exposes no video URL or matched story. The bot now requests uncompressed Snapchat pages and tries this exact embed route when it contains a video. It will not send a recommended clip for the empty case. Both failing YouTube videos returned the platform's bot check with default, web_safari and android_sdkless yt-dlp clients. The Pinterest Pin exposed eight images and no audio/video metadata. A link alone does not override these source responses.
 
 ## Runtime diagnosis
 

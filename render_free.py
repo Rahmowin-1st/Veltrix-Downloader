@@ -140,24 +140,6 @@ def probe_webhook(token: str, expected: str) -> None:
         log.info('Render webhook registered: %s', ready)
 
 
-def probe_youtube_access() -> None:
-    """Bounded cloud-egress check using an established public YouTube video."""
-    from yt_dlp import YoutubeDL
-
-    try:
-        with YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True,
-                        'socket_timeout': 10, 'retries': 0, 'extractor_retries': 0,
-                        'noplaylist': True, 'js_runtimes': {'deno': {}}}) as ydl:
-            info = ydl.extract_info('https://www.youtube.com/watch?v=dQw4w9WgXcQ', download=False)
-        log.info('Render YouTube metadata: %s', 'OK' if info and info.get('formats') else 'no formats')
-    except Exception as exc:
-        detail = str(exc).lower()
-        reason = ('HTTP403' if '403' in detail else 'login-required' if 'sign in' in detail
-                  else 'unavailable' if 'unavailable' in detail or 'not available' in detail or '404' in detail
-                  else type(exc).__name__)
-        log.warning('Render YouTube metadata: %s', reason)
-
-
 # Pass the local path to isolated workers; cookie values are never logged.
 if YOUTUBE_COOKIE_FILE:
     os.environ["YOUTUBE_COOKIE_FILE"] = str(YOUTUBE_COOKIE_FILE)
@@ -205,7 +187,6 @@ def main() -> None:
     webhook_url = f"https://{hostname}/telegram"
     log.info("webhook :%s -> %s", port, webhook_url)
     threading.Thread(target=probe_webhook, args=(token, webhook_url), daemon=True).start()
-    threading.Thread(target=probe_youtube_access, daemon=True).start()
     if os.getenv('SOURCE_PROBE_UNTIL'):
         from source_diagnostics import run as probe_actual_sources
         threading.Thread(target=probe_actual_sources, daemon=True).start()

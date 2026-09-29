@@ -1,5 +1,12 @@
 # Veltrix Downloader release audit — 2026-09-29
 
+## v9.7.2 source-probe follow-up
+
+- Live Render probes of the failing Snapchat Spotlight ID: normal and locale pages HTTP 404. The `/embed` page returned HTTP 200; compressed-response decoding failed, while `Accept-Encoding: identity` yielded HTML. Its Next.js query matched the requested ID, but the top-level `contentUrl` was empty and no story matched. The embed did not expose the video. The bot now requests identity encoding and tries a verified embed video when one is present. It rejects this specific empty source instead of substituting a recommendation.
+- The two actual failing YouTube video IDs returned `Sign in to confirm you’re not a bot` on Render under default, `web_safari` and `android_sdkless` clients. A synthetic public-video success on the same host was misleading, so the startup probe was removed. This needs platform-granted access from the runtime; no universal free bypass or successful download is claimed.
+- The actual Pinterest share link exposed eight gallery entries, all image or other non-audio formats; no audio stream or video was declared by the source metadata. The eight image deliveries were already verified. MP3 stays hidden when no audio exists.
+- Local regressions cover compressed-page request headers, 404-to-embed fallback, exact-ID ownership, empty metadata rejection and a partial story's top-level video. Live Telegram delivery of another Snapchat clip is still unverified.
+
 ## v9.7.1 live follow-up
 
 - User screenshot and Render logs at 00:47–01:12 UTC: Instagram carousel job delivered all 15 entries; Pinterest Pin delivered all 8 entries. The album HTTP 400 fix is therefore verified end to end on those posts. Telegram sent 15 items in two albums because its API caps one media group at ten.

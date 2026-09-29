@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from unittest.mock import patch
 from pathlib import Path
 import httpx
@@ -82,6 +83,65 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(bot.platform_of(url), "snapchat")
         candidates = bot.extractor_candidates(url)
         self.assertTrue(any("/@creator/spotlight/" in item for item in candidates))
+
+    def test_snapchat_embed_is_used_after_public_route_404(self):
+        url = 'https://www.snapchat.com/spotlight/embed_case'
+        embed = url + '/embed'
+        document = {'query': {'snapID': 'embed_case'}, 'props': {'pageProps': {
+            'videoMetadata': {'contentUrl': 'https://cf-st.sc-cdn.net/d/right.mp4'},
+            'spotlightFeed': {'spotlightStories': []},
+        }}}
+        page = f'<script id="__NEXT_DATA__">{json.dumps(document)}</script>'
+        bad = httpx.HTTPStatusError('404', request=httpx.Request('GET', url),
+                                    response=httpx.Response(404))
+        good = httpx.Response(200, text=page, request=httpx.Request('GET', embed))
+        with patch('bot.extractor_candidates', return_value=[url]), \
+             patch('bot.fetch_public_page', side_effect=[bad, good]) as fetch:
+            info = bot.extract_snapchat_public(url)
+        self.assertEqual(info['entries'], [{'url': 'https://cf-st.sc-cdn.net/d/right.mp4',
+                                            'kind': 'video'}])
+        self.assertEqual(fetch.call_args_list[-1].args[0], embed)
+
+    def test_snapchat_embed_with_empty_video_does_not_send_recommendation(self):
+        url = 'https://www.snapchat.com/spotlight/wanted'
+        document = {'query': {'snapID': 'wanted'}, 'props': {'pageProps': {
+            'videoMetadata': {'contentUrl': ''},
+            'spotlightFeed': {'spotlightStories': [{
+                'story': {'storyId': {'value': 'unrelated'}},
+                'metadata': {'videoMetadata': {'contentUrl': 'https://cf-st.sc-cdn.net/d/wrong'}}
+            }]},
+        }}}
+        self.assertEqual(bot._snap_info_from_doc(document, url + '/embed'), {})
+        document['query'] = {}
+        document['props']['pageProps']['videoMetadata']['contentUrl'] = 'https://cf-st.sc-cdn.net/d/wrong'
+        self.assertEqual(bot._snap_info_from_doc(document, url + '/embed'), {})
+
+    def test_snapchat_partial_story_can_use_matching_page_video(self):
+        url = 'https://www.snapchat.com/spotlight/partial_case'
+        document = {'query': {'snapID': 'partial_case'}, 'props': {'pageProps': {
+            'videoMetadata': {'contentUrl': 'https://cf-st.sc-cdn.net/d/correct'},
+            'spotlightFeed': {'spotlightStories': [{
+                'story': {'storyId': {'value': 'partial_case'}},
+                'metadata': {'videoMetadata': {'thumbnailUrl': 'https://example.com/poster'}}
+            }]},
+        }}}
+        self.assertEqual(bot._snap_info_from_doc(document, url)['url'],
+                         'https://cf-st.sc-cdn.net/d/correct')
+
+    def test_snapchat_page_requests_identity_encoding(self):
+        url = 'https://www.snapchat.com/spotlight/wanted/embed'
+        seen = []
+        client_class = httpx.Client
+
+        def handle(request):
+            seen.append(request.headers['accept-encoding'])
+            return httpx.Response(200, text='page')
+
+        with patch('bot.PROXY', ''), patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.httpx.Client', side_effect=lambda **kw: client_class(
+                 transport=httpx.MockTransport(handle), **kw)):
+            self.assertEqual(bot.fetch_public_page(url).text, 'page')
+        self.assertEqual(seen, ['identity'])
 
     def test_application_json_content_url(self):
         page = '<script type="application/json">{"props":{"pageProps":{"videoMetadata":{"contentUrl":"https://cf-st.sc-cdn.net/d/abc","thumbnailUrl":"https://cf-st.sc-cdn.net/d/thumb"}}}}</script>'
