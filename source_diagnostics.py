@@ -99,6 +99,17 @@ def probe_snapchat(spotlight_id: str) -> None:
                                          document.get('query', {}).get('snapID') == spotlight_id,
                                          isinstance(props.get('videoMetadata'), dict),
                                          isinstance(props.get('spotlightFeed'), dict))
+                                feed = props.get('spotlightFeed') or {}
+                                stories = feed.get('spotlightStories') or []
+                                matched = [item for item in stories if isinstance(item, dict) and
+                                           isinstance(item.get('story'), dict) and
+                                           isinstance(item['story'].get('storyId'), dict) and
+                                           item['story']['storyId'].get('value') == spotlight_id]
+                                metadata = matched[0].get('metadata') or {} if matched else {}
+                                log.info('Snapchat probe %s schema: story_match=%s top_keys=%s match_keys=%s meta_video_keys=%s',
+                                         label, bool(matched), sorted((props.get('videoMetadata') or {}).keys())[:24],
+                                         sorted(metadata.keys())[:24],
+                                         sorted((metadata.get('videoMetadata') or {}).keys())[:24])
                 except Exception as retry_exc:
                     log.info('Snapchat probe %s raw: %s', label, reason(retry_exc))
 
