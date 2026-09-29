@@ -25,6 +25,12 @@ class BackendTests(unittest.TestCase):
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         )
 
+    def test_explicit_playlist_is_preserved_as_a_collection(self):
+        playlist = 'https://www.youtube.com/playlist?list=PL1234567890'
+        self.assertEqual(bot.extract_url(playlist), playlist)
+        self.assertTrue(bot.youtube_playlist_url(playlist))
+        self.assertFalse(bot.youtube_playlist_url('https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123'))
+
     def test_video_ladder(self):
         chain = bot.video_chain(720)
         self.assertTrue(any("height<=720" in item for item in chain))

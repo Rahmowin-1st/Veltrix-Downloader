@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,6 +41,80 @@ class MetadataTests(unittest.TestCase):
             {"type": "story_pin_video_block", "video": {"video_list": {"a": {"url": "https://cdn.test/clip.mp4"}}}},
         ]}]}})
         self.assertEqual([e["kind"] for e in entries], ["image", "audio", "video"])
+
+    def test_pinterest_visual_delivery_keeps_music_for_mp3_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = [
+                {'kind': 'image', 'formats': [{'url': 'https://cdn.test/photo.jpg'}]},
+                {'kind': 'audio', 'formats': [{'url': 'https://cdn.test/music.m4a'}]},
+            ]
+            def download(url, path, **kwargs):
+                path.write_bytes(b'fixture')
+                return True
+            with patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot._download_direct_file', side_effect=download), \
+                 patch('bot.classify', side_effect=lambda p: 'audio' if p.suffix == '.m4a' else 'image'), \
+                 patch('bot.validate_media_files', side_effect=lambda paths: paths):
+                visual = bot.download_source_entries(entries, root / 'pin', 'https://pinterest.com/pin/42/')
+            self.assertEqual(len(visual), 1)
+            self.assertEqual(visual[0].suffix, '.jpg')
+            self.assertEqual([p.suffix for p in bot.files_in(root / 'soundtrack')], ['.m4a'])
+
+    def test_video_variants_choose_a_real_audio_track(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silent, audible = root / 'silent.mp4', root / 'audible.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=320x240:rate=25', '-t', '0.4',
+                            '-c:v', 'libx264', str(silent)], check=True, timeout=20)
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=320x240:rate=25', '-f', 'lavfi',
+                            '-i', 'sine=frequency=440', '-t', '0.4', '-c:v', 'libx264',
+                            '-c:a', 'aac', str(audible)], check=True, timeout=20)
+            formats = [
+                {'url': 'https://cdn.test/silent.mp4', 'width': 1080, 'height': 1920, 'has_audio': True},
+                {'url': 'https://cdn.test/audible.mp4', 'width': 720, 'height': 1280, 'has_audio': True},
+            ]
+            def download(url, output, **kwargs):
+                shutil.copy2(audible if url.endswith('audible.mp4') else silent, output)
+                return True
+            with patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot._download_direct_file', side_effect=download):
+                pin_files = bot.download_source_entries([{'kind': 'video', 'formats': formats}],
+                                                        root / 'pin', 'https://pinterest.com/pin/42/')
+                instagram_files, _ = bot.download_instagram_dedicated(
+                    'https://instagram.com/p/test/', str(root / 'instagram_job'),
+                    {'entries': [{'kind': 'video', 'formats': formats}], 'type': 'video'})
+            self.assertTrue(bot.has_audio(pin_files[0]))
+            self.assertTrue(bot.has_audio(instagram_files[0]))
+
+    def test_instagram_single_post_music_is_muxed_into_silent_video(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silent, music = root / 'silent.mp4', root / 'music.m4a'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=320x240:rate=25', '-t', '0.8',
+                            '-c:v', 'libx264', str(silent)], check=True, timeout=20)
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'sine=frequency=440', '-t', '0.3', '-c:a', 'aac',
+                            str(music)], check=True, timeout=20)
+            def download(url, output, **kwargs):
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(music if 'music' in url else silent, output)
+                return True
+            job = root / 'job'
+            info = {'entries': [{'kind': 'video', 'formats': [
+                {'url': 'https://cdn.test/silent.mp4', 'width': 320, 'height': 240}]}],
+                'audio_urls': ['https://cdn.test/music.m4a'], 'type': 'video'}
+            with patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot._download_direct_file', side_effect=download):
+                videos, _ = bot.download_instagram_dedicated('https://instagram.com/reel/test/',
+                                                             str(job), info)
+            self.assertEqual(len(videos), 1)
+            self.assertTrue(bot.has_audio(videos[0]))
+            self.assertEqual(len(bot.audio_sources(videos, job / 'soundtrack')), 1)
+            self.assertEqual(bot.audio_sources(videos, job / 'soundtrack')[0].suffix, '.m4a')
 
     def test_instagram_music_is_exact_post_only(self):
         item = {"music_metadata": {"music_info": {"music_asset_info": {
@@ -142,6 +218,27 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.call_count, 1)
         self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"], markup)
         status.delete.assert_not_called()
+
+    async def test_mp3_button_is_under_the_delivered_video(self):
+        files = self.files(['.mp4'])
+        sent_video = SimpleNamespace(edit_reply_markup=AsyncMock())
+        async def send_video(**kwargs):
+            self.messages.append(['video'])
+            return sent_video
+        self.msg.reply_video.side_effect = send_video
+        status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
+                                 edit_text=AsyncMock(), delete=AsyncMock())
+        self.msg.chat_id = 42
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        markup = bot.InlineKeyboardMarkup([[bot.InlineKeyboardButton('MP3', callback_data='mp3|test')]])
+        with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=files), \
+             patch('bot.has_audio', return_value=True), \
+             patch('bot.post_mp3_button', return_value=markup), \
+             patch('bot._global_sem', None), patch('bot._job_locks', {}):
+            await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'auto', status)
+        sent_video.edit_reply_markup.assert_awaited_once()
+        self.assertEqual(sent_video.edit_reply_markup.call_args.kwargs['reply_markup'], markup)
+        self.assertIsNone(status.edit_text.call_args.kwargs['reply_markup'])
 
     async def test_photo_only_post_does_not_advertise_mp3(self):
         files = self.files([".jpg", ".jpg"])

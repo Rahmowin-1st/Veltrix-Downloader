@@ -103,8 +103,11 @@ def lossless_parts(path: Path, dest: Path, limit: int) -> list[Path]:
 
 def native_video(path: Path, dest: Path) -> Path:
     """Prefer remuxing; encode incompatible codecs for Telegram video playback."""
+    original_has_audio = any(s.get('codec_type') == 'audio' for s in probe(path)['streams'])
     final = prepare_video(path, dest)
     if streamable(final):
+        if original_has_audio and not any(s.get('codec_type') == 'audio' for s in probe(final)['streams']):
+            raise RuntimeError('Video audio track was lost during remux')
         return final
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / (path.stem + "_playable.mp4")
@@ -122,7 +125,8 @@ def native_video(path: Path, dest: Path) -> Path:
         "-map", f"0:{video['index']}", "-map", "0:a:0?", *video_options,
         *audio_options, "-movflags", "+faststart", str(output),
     ], capture_output=True, timeout=1800)
-    if result.returncode or not streamable(output):
+    if result.returncode or not streamable(output) or (original_has_audio and not any(
+            s.get('codec_type') == 'audio' for s in probe(output)['streams'])):
         raise RuntimeError("Could not prepare playable Telegram video")
     return output
 

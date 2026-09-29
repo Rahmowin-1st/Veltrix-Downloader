@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,21 @@ from telegram.error import TimedOut, BadRequest
 
 
 class ExtractorFlowTests(unittest.TestCase):
+    def test_authorized_instagram_route_uses_its_session_first(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cookie = Path(folder) / 'cookies.txt'
+            cookie.write_text('# Netscape HTTP Cookie File\n')
+            photo = Path(folder) / 'photo.jpg'
+            photo.write_bytes(b'fixture')
+            with patch.dict(os.environ, {'INSTAGRAM_COOKIE_FILE': str(cookie)}), \
+                 patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot.download_gallery', return_value=[photo]) as gallery, \
+                 patch('bot.download_instagram_dedicated') as public, \
+                 patch('bot.validate_media_files', side_effect=lambda paths: paths):
+                self.assertEqual(bot.grab('https://www.instagram.com/p/test/', 'auto', folder), [photo])
+            gallery.assert_called_once()
+            public.assert_not_called()
+
     def test_age_restriction_stops_fallback(self):
         self.assertTrue(bot.fatal_download_error(RuntimeError('age-restricted content')))
         self.assertFalse(bot.fatal_download_error(RuntimeError('rate limit exceeded')))

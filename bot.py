@@ -31,7 +31,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -43,7 +43,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.7.2"
+VERSION = "9.8.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -422,6 +422,12 @@ def extract_url(text: str) -> str | None:
     return url
 
 
+def youtube_playlist_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return (platform_of(url) == 'youtube' and parsed.path.rstrip('/').lower() == '/playlist'
+            and bool(parse_qs(parsed.query).get('list')))
+
+
 def platform_of(url: str) -> str | None:
     try:
         parsed = urlparse(url)
@@ -644,6 +650,26 @@ def extract_instagram_public(url: str) -> dict[str, Any]:
     return payload
 
 
+def attach_post_music(video: Path, music: Path, folder: Path) -> Path:
+    """Add a post's one exposed music track to a video with no native audio."""
+    from media_io import probe
+    if has_audio(video) or not has_audio(music):
+        return video
+    folder.mkdir(parents=True, exist_ok=True)
+    output = folder / f'{video.stem}_post_music.mkv'
+    ffmpeg(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(video),
+            '-stream_loop', '-1', '-i', str(music), '-map', '0:v:0', '-map', '1:a:0',
+            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k', '-shortest', str(output)])
+    if not output.exists() or not has_audio(output):
+        raise RuntimeError('Could not attach the post soundtrack to its video')
+    source_duration = float(probe(video).get('format', {}).get('duration') or 0)
+    output_duration = float(probe(output).get('format', {}).get('duration') or 0)
+    if source_duration > 0 and abs(output_duration - source_duration) > max(1, source_duration * 0.03):
+        output.unlink(missing_ok=True)
+        raise RuntimeError('Post soundtrack changed the video duration')
+    return output
+
+
 def download_instagram_dedicated(
     url: str,
     tmpdir: str,
@@ -682,7 +708,9 @@ def download_instagram_dedicated(
         formats.sort(key=lambda fmt: (kind != "video" or fmt.get("has_audio", True),
                                       _instagram_format_score(fmt, kind)), reverse=True)
 
-        for fmt in formats:
+        silent_fallback = None
+
+        for variant, fmt in enumerate(formats):
             media_url = str(fmt.get("url") or "")
             if not media_url or not safe_remote_url(media_url):
                 continue
@@ -691,21 +719,42 @@ def download_instagram_dedicated(
                 ext = path_ext if path_ext in {".mp4", ".m4v", ".mov", ".webm"} else ".mp4"
             else:
                 ext = path_ext if path_ext in {".jpg", ".jpeg", ".png", ".webp", ".avif"} else ".jpg"
-            out = dest / f"{index:02d}_{kind}{ext}"
+            out = dest / f"{index:02d}_{kind}_{variant:02d}{ext}"
             if _download_direct_file(media_url, out, referer="https://www.instagram.com/"):
                 if classify(out) != kind:
                     out.unlink(missing_ok=True)
                     continue
+                if kind == 'video' and not has_audio(out) and len(formats) > 1:
+                    # Keep the highest exposed silent rendition if no other
+                    # variant contains the post's actual audio stream.
+                    silent_fallback = silent_fallback or out
+                    continue
                 outputs.append(out)
                 break
+        else:
+            if silent_fallback is not None:
+                outputs.append(silent_fallback)
 
     if len(outputs) != len(entries):
         raise RuntimeError(f"Incomplete carousel: downloaded {len(outputs)}/{len(entries)} items.")
+    audio_files = []
     for index, audio_url in enumerate(info.get("audio_urls") or []):
         audio = Path(tmpdir) / "soundtrack" / f"{index:05d}.m4a"
         if _download_direct_file(audio_url, audio, referer=url):
             if not has_audio(audio):
                 audio.unlink(missing_ok=True)
+            else:
+                audio_files.append(audio)
+    if len(audio_files) == 1 and len(info.get('audio_urls') or []) == 1:
+        augmented = []
+        for path in outputs:
+            if classify(path) == 'video' and not has_audio(path):
+                try:
+                    path = attach_post_music(path, audio_files[0], dest / 'post_music_video')
+                except (RuntimeError, OSError) as exc:
+                    log.warning('Instagram post soundtrack could not be merged: %s', type(exc).__name__)
+            augmented.append(path)
+        outputs = augmented
     return validate_media_files(outputs), str(info.get("type") or "").lower()
 
 
@@ -905,15 +954,26 @@ def video_chain(height: int) -> list[str]:
     ]
 
 
+def requested_audio_track(entry: dict[str, Any]) -> bool:
+    """Check the formats yt-dlp selected, rather than guessing from a file name."""
+    tracks = entry.get('requested_formats') or []
+    if not tracks:
+        tracks = [entry]
+    return any(str(track.get('acodec') or 'none').lower() != 'none'
+               for track in tracks if isinstance(track, dict))
+
+
 def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     base = base_ydl_opts(tmpdir)
+    base['noplaylist'] = not youtube_playlist_url(url)
     cookie_file = os.getenv(f"{(platform_of(url) or '').upper()}_COOKIE_FILE", "")
     if cookie_file and Path(cookie_file).is_file():
         base["cookiefile"] = cookie_file
     attempts: list[tuple[str, dict[str, Any]]] = []
     if mode in {AUTO_MODE, "original"}:
         # yt-dlp ranks all exposed formats; no hidden resolution ceiling.
-        attempts = [("bv*+ba/b", {})]
+        # A music-only link may expose no video format at all.
+        attempts = [("bv*+ba/b/ba", {})]
     elif mode in VIDEO_PRESETS:
         attempts = [(fmt, {}) for fmt in video_chain(int(VIDEO_PRESETS[mode]["height"]))]
     elif mode in AUDIO_PRESETS:
@@ -963,6 +1023,9 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
                     complete = [p for p in complete if classify(p) in {"video", "audio"}]
                 if len(complete) != len(entries):
                     raise RuntimeError("Incomplete collection: some media files are missing")
+                if any(requested_audio_track(entry) and classify(path) == 'video' and not has_audio(path)
+                       for entry, path in zip(entries, complete) if isinstance(entry, dict)):
+                    raise RuntimeError('Incomplete source video audio track')
                 if complete:
                     return validate_media_files(complete)
                 shutil.rmtree(attempt_dir, ignore_errors=True)
@@ -1065,10 +1128,15 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
     if len(entries) > MAX_GALLERY_ITEMS:
         raise RuntimeError("Post exceeds configured item limit")
     outputs = []
+    soundtrack = []
     for index, entry in enumerate(entries):
-        folder = dest / f"source_{index:05d}"
+        # An audio block is an optional MP3 source for a visual post. Telegram
+        # cannot put it inside the same photo/video album, and the user asked
+        # to receive it only when pressing MP3.
+        folder = (dest.parent / "soundtrack" if entry["kind"] == "audio" else dest) / f"source_{index:05d}"
         folder.mkdir(parents=True, exist_ok=True)
         completed = None
+        silent_fallback = None
         for variant, fmt in enumerate(entry["formats"]):
             url = fmt.get("url") or ""
             if not safe_remote_url(url):
@@ -1093,16 +1161,22 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
                 actual = classify(path)
                 if actual != entry["kind"] and not (entry["kind"] == "image" and actual == "animation"):
                     continue
+                if entry["kind"] == "video" and not has_audio(path) and len(entry["formats"]) > 1:
+                    silent_fallback = silent_fallback or path
+                    continue
                 completed = path
                 break
             except Exception as exc:
                 if fatal_download_error(exc):
                     raise
                 log.warning("Source variant failed: %s", type(exc).__name__)
+        completed = completed or silent_fallback
         if completed is None:
             raise RuntimeError(f"Incomplete post: item {index + 1}/{len(entries)} unavailable; poster substitution refused")
-        outputs.append(completed)
-    return validate_media_files(outputs)
+        (soundtrack if entry["kind"] == "audio" else outputs).append(completed)
+    validate_media_files(outputs + soundtrack)
+    # An audio-only link still delivers its audio as the primary media.
+    return outputs or soundtrack
 
 
 def download_pinterest_page(url: str, tmpdir: str) -> list[Path]:
@@ -1346,9 +1420,13 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     if platform == "youtube":
         engines = [lambda: download_ytdlp(url, mode, tmpdir)]
     elif platform == "instagram":
-        engines = [lambda: download_instagram_dedicated(url, tmpdir, (prefetched or {}).get("_instagram_info"))[0],
-                   lambda: download_gallery(url, tmpdir),
-                   lambda: download_ytdlp(url, mode, tmpdir)]
+        dedicated = lambda: download_instagram_dedicated(url, tmpdir, (prefetched or {}).get("_instagram_info"))[0]
+        gallery = lambda: download_gallery(url, tmpdir)
+        cookie = os.getenv('INSTAGRAM_COOKIE_FILE', '')
+        # The dedicated public parser cannot receive a login session. An
+        # owner-authorized cookie file gives gallery-dl the first attempt.
+        engines = ([gallery, dedicated] if cookie and Path(cookie).is_file()
+                   else [dedicated, gallery]) + [lambda: download_ytdlp(url, mode, tmpdir)]
     elif platform == "pinterest":
         # gallery-dl retains page boundaries, audio blocks and carousel order.
         engines = [lambda: download_gallery(resolve_public_redirect(url), tmpdir),
@@ -1712,6 +1790,16 @@ def has_audio(path: Path) -> bool:
         return False
 
 
+def audio_sources(files: list[Path], soundtrack_dir: Path) -> list[Path]:
+    """List each original audio-bearing item once in post order."""
+    music = files_in(soundtrack_dir)
+    # A post-level track muxed into a silent video is the same track, not a
+    # second independent audio item for the MP3 action.
+    originals = [p for p in files if not (music and p.parent.name == 'post_music_video')]
+    unique = dict.fromkeys(p.resolve() for p in originals + music)
+    return [p for p in unique if has_audio(p)]
+
+
 async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None) -> int:
     """Preserve order; group compatible native types in batches of at most ten."""
     from media_io import lossless_parts, native_audio, native_video
@@ -1767,7 +1855,11 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         if progress is not None:
             progress["attempted"] = True
         mark_state("sending")
-        await _retry_telegram(send_once)
+        result = await _retry_telegram(send_once)
+        if progress is not None:
+            # sendMediaGroup cannot accept reply_markup, but its returned
+            # messages can be edited after the album is delivered.
+            progress["last_message"] = result[-1] if isinstance(result, (list, tuple)) and result else result
         sent += len(batch)
         if progress is not None:
             progress["sent"] = sent
@@ -2003,6 +2095,12 @@ async def run_job(
                     files.append(local)
             else:
                 files = await download_in_worker(url, mode, tmp, meta)
+            kinds = await asyncio.to_thread(lambda: [classify(p) for p in files])
+            with_sound = await asyncio.to_thread(lambda: sum(
+                kind == 'video' and has_audio(path) for kind, path in zip(kinds, files)))
+            log.info('Job %s source media: videos=%s with_audio=%s images=%s animations=%s audio=%s',
+                     event_id, kinds.count('video'), with_sound, kinds.count('image'),
+                     kinds.count('animation'), kinds.count('audio'))
             await report_job_event(event_id, source, 'prepared', items=len(files))
             await report_job_event(event_id, source, 'uploading', items=len(files))
             if mode in AUDIO_PRESETS:
@@ -2011,7 +2109,7 @@ async def run_job(
                     if selected_audio_index < 0 or selected_audio_index >= len(files):
                         raise RuntimeError("Requested media item is no longer available")
                     files = [files[selected_audio_index]]
-                sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
+                sources = await asyncio.to_thread(audio_sources, files, tmp / "soundtrack")
                 sent = await send_mp3_album(msg, sources, tmp, progress)
                 if not sent:
                     raise RuntimeError("No accessible audio track")
@@ -2031,7 +2129,7 @@ async def run_job(
                 delivered = True
                 # Persist delivery before optional cache/status operations.
                 mark_state("done")
-                sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
+                sources = await asyncio.to_thread(audio_sources, files, tmp / "soundtrack")
                 markup = None
                 if sources:
                     try:
@@ -2040,8 +2138,19 @@ async def run_job(
                         log.warning("Media delivered; MP3 cache could not be saved")
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
-                updated = await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
-                if markup is not None and not updated:
+                attached = False
+                last_message = progress.get("last_message")
+                if markup is not None and last_message is not None and hasattr(last_message, 'edit_reply_markup'):
+                    try:
+                        await last_message.edit_reply_markup(reply_markup=markup,
+                                                             connect_timeout=8, read_timeout=8)
+                        attached = True
+                    except TelegramError as exc:
+                        log.info("Media keyboard attachment failed: %s", type(exc).__name__)
+                updated = await edit_status(status, f"✅ {len(files)} media delivered" +
+                                            (" · MP3" if markup and not attached else ""),
+                                            reply_markup=None if attached else markup)
+                if markup is not None and not attached and not updated:
                     # An album cannot carry an inline keyboard. If editing its
                     # status fails, still deliver the saved audio action.
                     await msg.reply_text("🎵 MP3", reply_markup=markup)

@@ -1,10 +1,18 @@
 # Veltrix Downloader release audit — 2026-09-29
 
+## v9.8.0 audio and Pin verification
+
+- Rechecked the user's Pinterest Pin directly on Render. The gallery-dl URL manifest lists eight image URLs, but the Pin metadata has eight carousel slots: **two videos and six images**. The v9.7.2 claim that this Pin contained only images was wrong. The bot's metadata reconstruction already selected video for those slots; new aggregate per-job logging will show what the worker actually delivers on a new request.
+- Read both HLS renditions and an MP4 rendition for each video with ffprobe. All six variants contained video and **zero audio streams**. No MP3 or soundtrack is recoverable from them; attaching unrelated music would misrepresent the source.
+- Video variant downloaders now seek an audio-bearing rendition before falling back to the highest silent rendition. A single exposed Instagram post music track is muxed into silent video items; the MP3 action uses the original track once. Telegram conversion verifies that an existing source audio stream survived. Mixed Pinterest music blocks are cached for MP3 instead of being uploaded as an unsolicited audio message.
+- The MP3 button is attached under the delivered media using a post-send reply-markup edit when Telegram permits it; the status-button fallback remains. The MP3 action sends extracted audio only. Optional owner-authorized Netscape cookie files can now be materialized for all four platforms on Render from per-platform secret environment variables. An explicit YouTube playlist URL retains collection mode, bounded by the configured item/storage/job limits.
+- The exact failed Snapchat link still has no accessible video URL on Render, and the two YouTube IDs still receive YouTube's bot check there. No 100% source coverage, private-access bypass or uninterrupted Render Free uptime is claimed.
+
 ## v9.7.2 source-probe follow-up
 
 - Live Render probes of the failing Snapchat Spotlight ID: normal and locale pages HTTP 404. The `/embed` page returned HTTP 200; compressed-response decoding failed, while `Accept-Encoding: identity` yielded HTML. Its Next.js query matched the requested ID, but the top-level `contentUrl` was empty and no story matched. The embed did not expose the video. The bot now requests identity encoding and tries a verified embed video when one is present. It rejects this specific empty source instead of substituting a recommendation.
 - The two actual failing YouTube video IDs returned `Sign in to confirm you’re not a bot` on Render under default, `web_safari` and `android_sdkless` clients. A synthetic public-video success on the same host was misleading, so the startup probe was removed. This needs platform-granted access from the runtime; no universal free bypass or successful download is claimed.
-- The actual Pinterest share link exposed eight gallery entries, all image or other non-audio formats; no audio stream or video was declared by the source metadata. The eight image deliveries were already verified. MP3 stays hidden when no audio exists.
+- The initial Pinterest URL-only manifest exposed eight image-like entries. That was incomplete evidence of the source media type; the full Pin metadata and streams were checked later in v9.8.0 above.
 - Local regressions cover compressed-page request headers, 404-to-embed fallback, exact-ID ownership, empty metadata rejection and a partial story's top-level video. Live Telegram delivery of another Snapchat clip is still unverified.
 
 ## v9.7.1 live follow-up

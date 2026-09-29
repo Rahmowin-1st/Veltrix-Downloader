@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import base64
 import asyncio
 import hashlib
 import logging
@@ -34,30 +33,9 @@ def ensure_ffmpeg() -> None:
     os.environ["PATH"] = f"{bindir}:{os.environ.get('PATH', '')}"
 
 
-def materialize_youtube_cookies() -> Path | None:
-    """Create a temporary Netscape cookies file from a Render secret.
-
-    YOUTUBE_COOKIES_B64 is deliberately never logged. The decoded file lives
-    only in /tmp and is permission-restricted. This allows yt-dlp to use a
-    user-authorized YouTube session without committing credentials to GitHub.
-    """
-    raw = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
-    if not raw:
-        return None
-    try:
-        data = base64.b64decode(raw, validate=True)
-    except Exception as exc:
-        raise SystemExit(f"YOUTUBE_COOKIES_B64 is invalid base64: {exc}") from exc
-    if not data or len(data) > 2 * 1024 * 1024:
-        raise SystemExit("YOUTUBE_COOKIES_B64 is empty or unexpectedly large")
-    path = Path("/tmp/veltrix-youtube-cookies.txt")
-    path.write_bytes(data)
-    path.chmod(0o600)
-    return path
-
-
 ensure_ffmpeg()
-YOUTUBE_COOKIE_FILE = materialize_youtube_cookies()
+from source_auth import materialize_source_cookies  # noqa: E402
+SOURCE_COOKIE_FILES = materialize_source_cookies()
 
 import bot  # noqa: E402
 from telegram import Bot  # noqa: E402
@@ -140,9 +118,7 @@ def probe_webhook(token: str, expected: str) -> None:
         log.info('Render webhook registered: %s', ready)
 
 
-# Pass the local path to isolated workers; cookie values are never logged.
-if YOUTUBE_COOKIE_FILE:
-    os.environ["YOUTUBE_COOKIE_FILE"] = str(YOUTUBE_COOKIE_FILE)
+# The isolated workers inherit cookie file paths; cookie values are never logged.
 
 
 def main() -> None:

@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.7.2
+# Veltrix Downloader 9.8.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -18,13 +18,14 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 
 ## Quality and Telegram behavior
 
-- Automatic mode uses `bv*+ba/b` without a resolution ceiling. Instagram ranks available renditions by pixel area.
+- Automatic mode uses `bv*+ba/b/ba` without a resolution ceiling; an explicit YouTube playlist URL remains a bounded collection. Instagram ranks exposed renditions by pixel area.
 - “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
 - Compatible H.264/AAC videos are remuxed to MP4 without re-encoding and sent as playable videos.
 - Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
 - Photos are always sent as photos, never documents. Telegram may recompress them; the old `PRESERVE_ORIGINALS` setting is no longer used. Oversize/unusual photos are fitted to photo limits.
 - Ordered photo/video collections use albums of at most 10. Longer collections use multiple albums. Audio cannot share a photo/video album and is grouped separately in source order. Animations retain motion; within albums they use playable MP4.
-- An MP3 button appears on the status message only when the downloaded post actually exposes an audio stream or a separate soundtrack. `sendMediaGroup` cannot carry an inline keyboard. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. The adjacent Original button stores the source link in Telegram; if Render restarts and loses its cache, the bot verifies a signed callback and re-extracts the post for MP3. Photos without accessible music do not advertise MP3.
+- An MP3 button appears only when the post exposes an audio stream or separate soundtrack. The bot edits the last delivered media to place the button underneath; if Telegram rejects that edit, the status carries it. `sendMediaGroup` itself cannot accept a keyboard. Tapping MP3 sends audio only. The adjacent Original button stores the source link in Telegram so a signed callback can re-extract the post after a Render restart. Silent media without exposed music does not advertise MP3.
+- Video variants are checked for an actual audio stream. If the highest rendition is silent, another exposed rendition with audio is preferred. If an Instagram post exposes exactly one separate background track, it is added to silent video items without re-encoding their video stream; MP3 uses the original soundtrack once. Otherwise, videos with no exposed audio remain silent. Conversion checks that an existing audio track survives. Separate Pinterest music blocks are reserved for MP3 instead of being sent unprompted within a visual post.
 - Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
 - Files are streamed during upload rather than read entirely into RAM.
 - Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
@@ -105,7 +106,7 @@ The regression suite includes real generated MP4/M4A/PNG/GIF media, native anima
 
 Direct requests to all four platforms timed out in the editing environment. No live Telegram bot token or access to the running Termux session was available here. Therefore this release still needs live URL-to-Telegram acceptance on the actual runtime. See `docs/RELEASE_AUDIT.md`.
 
-The owner's September 29 Render test confirmed 15 Instagram carousel items and 8 Pinterest items delivered. Real source probes on Render confirmed that the failing Spotlight URL returns HTTP 404 on its normal route. Its embed route returns HTTP 200, but the post-matched metadata exposes no video URL or matched story. The bot now requests uncompressed Snapchat pages and tries this exact embed route when it contains a video. It will not send a recommended clip for the empty case. Both failing YouTube videos returned the platform's bot check with default, web_safari and android_sdkless yt-dlp clients. The Pinterest Pin exposed eight images and no audio/video metadata. A link alone does not override these source responses.
+The owner's September 29 Render test confirmed 15 Instagram carousel items and eight Pinterest items delivered. A deeper metadata probe of that exact Pinterest Pin found **two video slots and six image slots**. Both videos' HLS and MP4 variants exposed zero audio streams. The gallery-dl URL manifest alone called all eight images; it was insufficient evidence for media type. The bot reconstructs slots from Pin metadata and validates the files; its new job log reports video/image/audio counts. The failing Snapchat Spotlight URL returns HTTP 404 on its normal route; its embed route returns HTTP 200 but has an empty post-matched video URL. Both failing YouTube IDs triggered a platform bot check with default, web_safari and android_sdkless clients. Code cannot add missing source audio or override these platform responses.
 
 ## Runtime diagnosis
 
@@ -115,7 +116,7 @@ The worker log prints the authenticated bot username when initialization succeed
 
 Restarting Termux waits for the previous supervisor to finish, identifies its direct `python bot.py` child and signals that child if graceful shutdown stalls. After a further bounded wait it terminates only that verified child. Restart never starts a second bot while the previous supervisor remains active. An upload interrupted by restart may need manual inspection before retrying; check `/status` rather than resending the same link blindly. `python diagnose.py` can be run on its own even when startup reports a shutdown delay.
 
-Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, `PINTEREST_COOKIE_FILE`, and `SNAPCHAT_COOKIE_FILE`. They can help access accounts you are authorized to view, when supported by the applicable extractor; a link alone does not grant access to private accounts and cookies do not guarantee extraction. Keep them on the phone, outside chat and GitHub. Worker failures include a URL/token-redacted diagnostic in `logs/termux.log`.
+Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, `PINTEREST_COOKIE_FILE`, and `SNAPCHAT_COOKIE_FILE`. On Render, the corresponding `INSTAGRAM_COOKIES_B64`, `YOUTUBE_COOKIES_B64`, `PINTEREST_COOKIES_B64`, `SNAPCHAT_COOKIES_B64` secret environment variables create permission-restricted temporary cookie files for supported extractors. Base64 is encoding, **not encryption**: set these directly as Render secrets, never in chat or GitHub. Instagram's authenticated gallery route runs first when a cookie file exists. Cookies may help with content the signed-in owner is authorized to view; a link or cookies alone do not guarantee extraction, and private Snapchat/Friends media may have no extractable web URL. Worker failures include a URL/token-redacted diagnostic in `logs/termux.log`.
 
 ## Upstream references reviewed
 

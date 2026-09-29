@@ -123,8 +123,29 @@ class MediaFixtures(unittest.TestCase):
                 return {"filepath": str(fixture), "requested_downloads": [{"filepath": str(fixture)}]}
         with patch("bot.YoutubeDL", FakeDownloader):
             self.assertEqual(bot.download_ytdlp("https://www.youtube.com/watch?v=BaW_jenozKc", "auto", str(self.root)), [self.video])
-        self.assertEqual(seen[0]["format"], "bv*+ba/b")
+        self.assertEqual(seen[0]["format"], "bv*+ba/b/ba")
         self.assertEqual(len(seen), 1)
+
+    def test_youtube_never_delivers_video_after_declared_audio_is_lost(self):
+        silent = self.root / 'silent.mp4'
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(self.video),
+                        '-an', '-c:v', 'copy', str(silent)], check=True, timeout=20)
+        class FakeDownloader:
+            def __init__(self, opts):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def extract_info(self, url, download):
+                return {'requested_formats': [
+                    {'vcodec': 'h264', 'acodec': 'none'},
+                    {'vcodec': 'none', 'acodec': 'aac'}],
+                    'requested_downloads': [{'filepath': str(silent)}]}
+        with patch('bot.YoutubeDL', FakeDownloader):
+            with self.assertRaisesRegex(RuntimeError, 'Incomplete source video audio'):
+                bot.download_ytdlp('https://www.youtube.com/watch?v=BaW_jenozKc',
+                                   'auto', str(self.root))
 
     def test_remux_preserves_h264_audio(self):
         source = self.root / "remux-source.mkv"
