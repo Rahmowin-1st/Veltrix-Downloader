@@ -193,6 +193,37 @@ def probe_pinterest(short_code: str) -> None:
                     kind = item['kind']
                     extracted[kind] = extracted.get(kind, 0) + 1
                 log.info('Pinterest probe reconstructed: kinds=%s', extracted)
+                import bot
+                for position, item in enumerate(inferred, 1):
+                    if item['kind'] != 'video':
+                        continue
+                    formats = item.get('formats') or []
+                    variants = []
+                    for fmt in formats[:6]:
+                        path = str(fmt.get('url') or '').split('?', 1)[0].lower()
+                        variants.append({'type': 'hls' if path.endswith('.m3u8') else
+                                         'mp4' if path.endswith('.mp4') else 'other',
+                                         'width': int(fmt.get('width') or 0),
+                                         'height': int(fmt.get('height') or 0),
+                                         'audio_flag': fmt.get('has_audio', 'unknown')})
+                    log.info('Pinterest probe video #%s variants=%s', position, variants)
+                    for fmt in formats[:2]:
+                        url = fmt.get('url') or ''
+                        if not bot.safe_remote_url(url):
+                            continue
+                        cmd = ['ffprobe', '-v', 'error', '-rw_timeout', '12000000',
+                               '-show_entries', 'stream=codec_type,codec_name,width,height',
+                               '-of', 'json', '-headers', f'Referer: https://www.pinterest.com/\r\n',
+                               url]
+                        try:
+                            result = subprocess.run(cmd, capture_output=True, text=True, timeout=18)
+                            tracks = json.loads(result.stdout).get('streams') or [] if result.returncode == 0 else []
+                            log.info('Pinterest probe video #%s stream: ok=%s tracks=%s', position,
+                                     result.returncode == 0,
+                                     [{'type': t.get('codec_type'), 'codec': t.get('codec_name')}
+                                      for t in tracks[:4]])
+                        except Exception as exc:
+                            log.info('Pinterest probe video #%s stream: %s', position, reason(exc))
             except Exception as exc:
                 log.info('Pinterest probe reconstructed: %s', reason(exc))
     except Exception as exc:
