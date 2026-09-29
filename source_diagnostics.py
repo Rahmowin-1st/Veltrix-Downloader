@@ -167,6 +167,34 @@ def probe_pinterest(short_code: str) -> None:
                     'video' if ext in {'mp4', 'm3u8', 'webm'} else 'image-or-other')
             kinds[kind] = kinds.get(kind, 0) + 1
         log.info('Pinterest probe: entries=%s kinds=%s', len(urls), kinds)
+        from source_metadata import pinterest_entries
+        pins = [row[-1] for row in rows if isinstance(row, list) and row and row[0] == 2
+                and isinstance(row[-1], dict) and
+                any(k in row[-1] for k in ('images', 'videos', 'carousel_data', 'story_pin_data'))]
+        log.info('Pinterest probe: pin_metadata_rows=%s', len(pins))
+        if pins:
+            pin = pins[0]
+            pages = (pin.get('story_pin_data') or {}).get('pages') or []
+            blocks = [block for page in pages if isinstance(page, dict)
+                      for block in page.get('blocks') or [] if isinstance(block, dict)]
+            slots = (pin.get('carousel_data') or {}).get('carousel_slots') or []
+            by_type = {}
+            for block in blocks:
+                kind = str(block.get('type') or 'unknown')[:50]
+                by_type[kind] = by_type.get(kind, 0) + 1
+            media_keys = sorted({key for block in blocks for key in block if
+                                 any(word in key.lower() for word in ('video', 'audio', 'music', 'media'))})
+            log.info('Pinterest probe schema: pages=%s blocks=%s types=%s slots=%s media_keys=%s',
+                     len(pages), len(blocks), by_type, len(slots), media_keys[:20])
+            try:
+                inferred = pinterest_entries(pin)
+                extracted = {}
+                for item in inferred:
+                    kind = item['kind']
+                    extracted[kind] = extracted.get(kind, 0) + 1
+                log.info('Pinterest probe reconstructed: kinds=%s', extracted)
+            except Exception as exc:
+                log.info('Pinterest probe reconstructed: %s', reason(exc))
     except Exception as exc:
         log.info('Pinterest probe: %s', reason(exc))
 
