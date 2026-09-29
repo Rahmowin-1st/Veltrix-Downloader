@@ -55,6 +55,10 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
+log.info('Source access configured: youtube=%s instagram=%s pinterest=%s snapchat=%s proxy=%s',
+         *(bool(os.getenv(f'{name}_COOKIE_FILE')) for name in
+           ('YOUTUBE', 'INSTAGRAM', 'PINTEREST', 'SNAPCHAT')),
+         bool(bot.PROXY))
 
 
 def probe_telegram_egress(token: str) -> None:

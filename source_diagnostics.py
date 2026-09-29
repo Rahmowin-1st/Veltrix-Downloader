@@ -123,7 +123,8 @@ def probe_youtube(ids: str) -> None:
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
             continue
         url = f'https://www.youtube.com/watch?v={video_id}'
-        for client in ('default', 'web_safari', 'android_sdkless'):
+        for client in ('default', 'web_safari', 'android_sdkless',
+                       'web_embedded', 'tv'):
             opts = {
                 'quiet': True, 'no_warnings': True, 'skip_download': True,
                 'noplaylist': True, 'socket_timeout': 10,
