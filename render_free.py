@@ -206,6 +206,9 @@ def main() -> None:
     log.info("webhook :%s -> %s", port, webhook_url)
     threading.Thread(target=probe_webhook, args=(token, webhook_url), daemon=True).start()
     threading.Thread(target=probe_youtube_access, daemon=True).start()
+    if os.getenv('SOURCE_PROBE_UNTIL'):
+        from source_diagnostics import run as probe_actual_sources
+        threading.Thread(target=probe_actual_sources, daemon=True).start()
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
