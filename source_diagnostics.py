@@ -88,6 +88,17 @@ def probe_snapchat(spotlight_id: str) -> None:
                                      label, spotlight_id in page, '__NEXT_DATA__' in page,
                                      'contentUrl' in page, 'og:video' in page,
                                      bool(re.search(r'<link[^>]+as=["\']video["\']', page, re.I)))
+                            match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                                              page, re.I | re.S)
+                            if match:
+                                document = json.loads(match.group(1))
+                                chosen = bot._snap_info_from_doc(document, url)
+                                props = document.get('props', {}).get('pageProps', {})
+                                log.info('Snapchat probe %s document: matched_video=%s query_id=%s top_video=%s feed=%s',
+                                         label, bool(chosen),
+                                         document.get('query', {}).get('snapID') == spotlight_id,
+                                         isinstance(props.get('videoMetadata'), dict),
+                                         isinstance(props.get('spotlightFeed'), dict))
                 except Exception as retry_exc:
                     log.info('Snapchat probe %s raw: %s', label, reason(retry_exc))
 
