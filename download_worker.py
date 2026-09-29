@@ -10,6 +10,8 @@ import bot
 
 def failure_category(exc: Exception) -> str:
     message = str(exc).lower()
+    if "confirm you’re not a bot" in message or "confirm you're not a bot" in message:
+        return 'PlatformBotCheck'
     if any(word in message for word in ('429', 'rate limit', 'too many requests')):
         return 'RateLimited'
     if any(word in message for word in ('login', 'sign in', 'private', 'cookies')):

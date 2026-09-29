@@ -112,6 +112,19 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
                 markup = status.edit_text.call_args.kwargs['reply_markup']
                 self.assertEqual(markup is None, attempted)
 
+    async def test_known_platform_blocks_do_not_offer_futile_retry(self):
+        status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
+                                 edit_text=AsyncMock(), delete=AsyncMock())
+        msg = SimpleNamespace(chat_id=1)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with patch('bot.download_in_worker', new_callable=AsyncMock,
+                   side_effect=bot.WorkerFailure('YouTube: automated traffic check', 'PlatformBotCheck')), \
+                patch('bot.create_action') as action, \
+                patch('bot._job_locks', {}), patch('bot._global_sem', None):
+            await bot.run_job(msg, context, 1, 'https://youtu.be/test', 'auto', status)
+        self.assertIsNone(status.edit_text.call_args.kwargs['reply_markup'])
+        action.assert_not_called()
+
     async def test_rejected_album_can_be_retried_without_duplicate_warning(self):
         status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
                                  edit_text=AsyncMock(), delete=AsyncMock())

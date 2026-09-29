@@ -1,4 +1,12 @@
-# Veltrix Downloader release audit — 2026-09-28
+# Veltrix Downloader release audit — 2026-09-29
+
+## v9.7.1 live follow-up
+
+- User screenshot and Render logs at 00:47–01:12 UTC: Instagram carousel job delivered all 15 entries; Pinterest Pin delivered all 8 entries. The album HTTP 400 fix is therefore verified end to end on those posts. Telegram sent 15 items in two albums because its API caps one media group at ten.
+- The Snapchat Spotlight job failed during extraction: yt-dlp received HTTP 404 for that exact public page. Its dedicated metadata path now avoids a redundant redirect fetch and may use a single primary Snapchat CDN video on an exact Spotlight page without canonical tags; an actual HTTP 404 remains unresolved unless a public route exposes the media. The app opening a share link does not prove its server-side page is public.
+- Two YouTube jobs failed before Telegram upload with `Sign in to confirm you’re not a bot` from Render's IP. Another public video's metadata probe succeeded; it cannot establish access for these two. The bot now labels this platform check and does not offer a futile retry. Authorized cookies or a permitted working source route may be required, and a link alone cannot provide those credentials.
+- MP3 was shown after a Pin even though none of its delivered items exposed audio. The button is now conditional on a probed audio stream or separate soundtrack. A photo-only post cannot produce background music that the platform does not expose. The Instagram MP3 re-extraction also returned 15 items with no accessible audio; it is an audio availability failure, not a failed carousel upload.
+- Render free spun down between 01:04 and 01:11 UTC and woke for a new link. Its temporary cache and SQLite are not durable. Strict uninterrupted 24/7 availability remains out of scope for this free instance.
 
 ## v9.7.0 Render worker and verified carousel root cause
 

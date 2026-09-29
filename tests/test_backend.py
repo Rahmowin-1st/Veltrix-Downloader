@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+import httpx
 
 import bot
 
@@ -59,6 +60,14 @@ class BackendTests(unittest.TestCase):
         self.assertNotIn("ERROR:", msg)
         self.assertNotIn("HTTP Error", msg)
         self.assertIn("Snapchat", msg)
+
+    def test_youtube_automated_traffic_check_has_specific_category_and_message(self):
+        from download_worker import failure_category
+        error = RuntimeError("Sign in to confirm you’re not a bot. Use cookies.")
+        self.assertEqual(failure_category(error), "PlatformBotCheck")
+        message = bot.friendly_error("youtube", error)
+        self.assertIn("automated-traffic check", message)
+        self.assertNotIn("cookies", message)
 
     def test_auto_mode_contract(self):
         self.assertEqual(bot.AUTO_MODE, "auto")
@@ -122,6 +131,29 @@ class BackendTests(unittest.TestCase):
                 '<link rel="preload" as="video" href="https://cf-st.sc-cdn.net/d/wanted.mp4">')
         self.assertTrue(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/wanted'))
         self.assertFalse(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/other'))
+
+    def test_snapchat_exact_route_can_use_single_preload_without_canonical(self):
+        url = 'https://www.snapchat.com/spotlight/wanted'
+        page = ('<link data-react-helmet="true" rel="preload" '
+                'href="https://cf-st.sc-cdn.net/d/wanted.mp4" as="video"/>')
+        response = httpx.Response(200, text=page, request=httpx.Request('GET', url))
+        with patch('bot.fetch_public_page', return_value=response) as fetch:
+            info = bot.extract_snapchat_public(url)
+        self.assertEqual(info['entries'], [{'url': 'https://cf-st.sc-cdn.net/d/wanted.mp4', 'kind': 'video'}])
+        fetch.assert_called_once_with(url)
+
+    def test_snapchat_preload_rejects_different_nextjs_post(self):
+        page = ('<script id="__NEXT_DATA__" type="application/json">'
+                '{"query":{"snapID":"unrelated"},"props":{"pageProps":{}}}'
+                '</script><link rel="preload" as="video" '
+                'href="https://cf-st.sc-cdn.net/d/unrelated.mp4">')
+        self.assertFalse(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/wanted'))
+
+    def test_spotlight_candidate_does_not_refetch_redirect(self):
+        url = 'https://www.snapchat.com/spotlight/wanted?share_id=123'
+        with patch('bot.fetch_public_page') as fetch:
+            self.assertEqual(bot.extractor_candidates(url)[0], url)
+        fetch.assert_not_called()
 
     def test_classify_real_media_types(self):
         with tempfile.TemporaryDirectory() as td:

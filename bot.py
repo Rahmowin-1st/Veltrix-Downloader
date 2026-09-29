@@ -43,7 +43,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.7.0"
+VERSION = "9.7.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -471,7 +471,12 @@ def request_headers(url: str | None = None) -> dict[str, str]:
 
 
 def resolve_public_redirect(url: str) -> str:
-    if (urlparse(url).hostname or "").lower() != "pin.it" and platform_of(url) != "snapchat":
+    parsed = urlparse(url)
+    # A full Spotlight URL already contains the exact post ID. Probing it here
+    # used to fetch the same page twice, including two identical HTTP 404s.
+    if platform_of(url) == "snapchat" and "/spotlight/" in parsed.path.lower():
+        return url
+    if (parsed.hostname or "").lower() != "pin.it" and platform_of(url) != "snapchat":
         return url
     try:
         response = fetch_public_page(url)
@@ -772,8 +777,7 @@ def _snap_info_from_doc(doc: dict[str, Any], page_url: str) -> dict[str, str]:
 def _snap_info_from_exact_page(page: str, page_url: str) -> dict[str, Any]:
     """Use page-owned video tags only after checking the exact Spotlight ID."""
     requested = _snap_requested_id(page_url, {})
-    canonical = og_values(page, {'og:url'})
-    if not requested or not any(_snap_requested_id(value, {}) == requested for value in canonical):
+    if not requested or not _snap_page_owns_spotlight(page, page_url):
         return {}
     videos = list(dict.fromkeys(og_values(page, {
         'og:video', 'og:video:url', 'og:video:secure_url', 'twitter:player:stream',
@@ -785,7 +789,7 @@ def _snap_info_from_exact_page(page: str, page_url: str) -> dict[str, Any]:
 
 
 def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
-    """A preload belongs to this post only if the page names its exact ID."""
+    """Check page identity before accepting its one primary video preload."""
     requested = _snap_requested_id(page_url, {})
     if not requested:
         return False
@@ -794,8 +798,25 @@ def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
         fields = dict(re.findall(r'([\w:-]+)\s*=\s*["\']([^"\']*)["\']', tag, flags=re.I))
         if 'canonical' in fields.get('rel', '').lower().split() and fields.get('href'):
             canonical.append(urljoin(page_url, html.unescape(fields['href'])))
-    return any(platform_of(value) == 'snapchat' and _snap_requested_id(value, {}) == requested
-               for value in canonical)
+    if canonical:
+        return all(platform_of(value) == 'snapchat' and _snap_requested_id(value, {}) == requested
+                   for value in canonical)
+    match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', page, re.I | re.S)
+    if match:
+        try:
+            doc = json.loads(match.group(1))
+        except ValueError:
+            return False
+        query_id = str(_dig_dict(doc, 'query').get('snapID') or '')
+        if query_id:
+            return query_id == requested
+        stories = _dig_dict(doc, 'props', 'pageProps', 'spotlightFeed').get('spotlightStories') or []
+        return any(str(_dig_dict(item, 'story', 'storyId').get('value') or '') == requested
+                   for item in stories if isinstance(item, dict))
+    # Some Snapchat Spotlight HTML has one primary video preload but no
+    # canonical or Next.js tags. The page was fetched from the exact ID route
+    # and the caller also requires precisely one Snapchat CDN video.
+    return True
 
 
 def extract_snapchat_public(url: str) -> dict[str, Any]:
@@ -807,11 +828,14 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
             response = fetch_public_page(candidate)
         except (httpx.HTTPError, RuntimeError):
             continue
+        page_url = str(response.url)
+        if _snap_requested_id(page_url, {}) and _snap_requested_id(page_url, {}) != _snap_requested_id(candidate, {}):
+            continue
         match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', response.text, re.I | re.S)
         if not match:
             if "/spotlight/" in urlparse(candidate).path:
-                info = _snap_info_from_exact_page(response.text, candidate)
-                if not info and _snap_page_owns_spotlight(response.text, candidate):
+                info = _snap_info_from_exact_page(response.text, page_url)
+                if not info and _snap_page_owns_spotlight(response.text, page_url):
                     info = snapchat_preload(response.text)
                 if info:
                     metadata_cache_put(f"snapchat:{url}", info)
@@ -819,10 +843,10 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
             continue
         doc = json.loads(match.group(1))
         if "/spotlight/" in urlparse(candidate).path:
-            info = _snap_info_from_doc(doc, candidate)
+            info = _snap_info_from_doc(doc, page_url)
             if info:
                 info["entries"] = [{"url": info["url"], "kind": "video"}]
-            elif str(_dig_dict(doc, 'query').get('snapID') or '') == _snap_requested_id(candidate, {}):
+            elif str(_dig_dict(doc, 'query').get('snapID') or '') == _snap_requested_id(page_url, {}):
                 info = snapchat_preload(response.text)
         else:
             entries = snapchat_story_entries(doc, candidate)
@@ -1229,6 +1253,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
         return f"{label}: the download took too long. Please try again later."
     if "incomplete" in low or "truncated" in low:
         return f"{label}: some media could not be retrieved. The incomplete post was not sent."
+    if "confirm you’re not a bot" in low or "confirm you're not a bot" in low:
+        return f"{label}: this server was stopped by the platform's automated-traffic check. The media was not downloaded."
     if re.search(r"\bage(?:\b|_)", low) and any(s in low for s in ("restricted", "limit", "confirm", "verify")):
         return "This age-restricted media is not supported."
     if "limit" in low:
@@ -1236,6 +1262,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     if any(x in low for x in ("login", "sign in", "cookies", "private", "empty media response")):
         return f"{label}: this post currently requires access the bot does not have."
     if "404" in low or "not found" in low:
+        if platform == "snapchat":
+            return "Snapchat: this clip's public web page returned 404 to the bot. The link may still open inside the Snapchat app."
         return f"{label}: this link is unavailable, expired, or its public page changed."
     if "403" in low or "forbidden" in low:
         return f"{label}: the platform blocked this download request."
@@ -1969,6 +1997,7 @@ async def run_job(
             await report_job_event(event_id, source, 'prepared', items=len(files))
             await report_job_event(event_id, source, 'uploading', items=len(files))
             if mode in AUDIO_PRESETS:
+                progress["phase"] = "Checking available audio tracks"
                 if selected_audio_index is not None:
                     if selected_audio_index < 0 or selected_audio_index >= len(files):
                         raise RuntimeError("Requested media item is no longer available")
@@ -1995,10 +2024,11 @@ async def run_job(
                 mark_state("done")
                 sources = await asyncio.to_thread(lambda: [p for p in files + files_in(tmp / "soundtrack") if has_audio(p)])
                 markup = None
-                try:
-                    markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
-                except OSError:
-                    log.warning("Media delivered; MP3 cache could not be saved")
+                if sources:
+                    try:
+                        markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
+                    except OSError:
+                        log.warning("Media delivered; MP3 cache could not be saved")
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
                 updated = await edit_status(status, f"✅ {len(files)} media delivered" + (" · MP3" if markup else ""), reply_markup=markup)
@@ -2025,7 +2055,10 @@ async def run_job(
         await report_job_event(event_id, source, 'interrupted' if uncertain or count else 'failed',
                                items=count, error=exc.category if isinstance(exc, WorkerFailure) else type(exc).__name__)
         markup = None
-        if mode == AUTO_MODE and not count and not uncertain:
+        definitive = isinstance(exc, WorkerFailure) and exc.category in {
+            'SourceUnavailable', 'PlatformBotCheck', 'AccessRequired',
+        }
+        if mode == AUTO_MODE and not count and not uncertain and not definitive:
             try:
                 token = create_action(uid, url)
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("Try again", callback_data=f"retry|{token}")]])

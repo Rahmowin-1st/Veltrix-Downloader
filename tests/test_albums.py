@@ -143,6 +143,22 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"], markup)
         status.delete.assert_not_called()
 
+    async def test_photo_only_post_does_not_advertise_mp3(self):
+        files = self.files([".jpg", ".jpg"])
+        status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
+                                 edit_text=AsyncMock(), delete=AsyncMock())
+        self.msg.chat_id = 42
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with patch("bot.download_in_worker", new_callable=AsyncMock, return_value=files), \
+                patch("bot.has_audio", return_value=False), \
+                patch("bot.post_mp3_button") as button, \
+                patch("bot._global_sem", None), patch("bot._job_locks", {}):
+            await bot.run_job(self.msg, context, 42, "https://www.pinterest.com/pin/42/", "auto", status)
+        self.assertEqual(self.messages, [["photo", "photo"]])
+        button.assert_not_called()
+        self.assertIsNone(status.edit_text.call_args.kwargs["reply_markup"])
+        self.assertNotIn("MP3", status.edit_text.call_args.args[0])
+
     async def test_mp3_button_is_sent_when_status_edit_fails_after_album(self):
         files = self.files([".jpg", ".mp4"])
         status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,

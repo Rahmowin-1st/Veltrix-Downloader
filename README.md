@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.7
+# Veltrix Downloader 9.7.1
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -24,7 +24,7 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
 - Photos are always sent as photos, never documents. Telegram may recompress them; the old `PRESERVE_ORIGINALS` setting is no longer used. Oversize/unusual photos are fitted to photo limits.
 - Ordered photo/video collections use albums of at most 10. Longer collections use multiple albums. Audio cannot share a photo/video album and is grouped separately in source order. Animations retain motion; within albums they use playable MP4.
-- One post-level MP3 button remains on the status message because `sendMediaGroup` has no inline-keyboard parameter. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. The adjacent Original button stores the source link in Telegram; if Render restarts and loses its cache, the bot verifies a signed callback and re-extracts the post for MP3.
+- An MP3 button appears on the status message only when the downloaded post actually exposes an audio stream or a separate soundtrack. `sendMediaGroup` cannot carry an inline keyboard. It extracts every accessible audio-bearing source, including exposed Instagram soundtrack metadata. The adjacent Original button stores the source link in Telegram; if Render restarts and loses its cache, the bot verifies a signed callback and re-extracts the post for MP3. Photos without accessible music do not advertise MP3.
 - Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
 - Files are streamed during upload rather than read entirely into RAM.
 - Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
@@ -49,6 +49,7 @@ YouTube community image posts and all possible Snapchat share URL variants are n
 - No generic page-wide download fallback: these can return thumbnails, recommendations or unrelated media.
 - Telegram flood-control delays are honored in full. Proven connection-establishment failures may retry. For relay uploads, a unique request ID lets the phone retrieve a cached Telegram result after a lost reply; when the result is still unknown, the upload is not replayed.
 - The carousel previously produced Telegram HTTP 400: multipart album files lacked their `attach://` names. Attachments now receive a unique name and the serialized Telegram request is checked in tests. Telegram's explicit HTTP 400 is reported as a rejection and allows a safe retry; uncertain timeouts still require inspection.
+- A source's definitive HTTP 404 or YouTube automated-traffic check does not offer a futile immediate retry button. Snapchat Spotlight extraction can use the one Snapchat CDN video preloaded by the exact public post even when the page omits canonical tags; mismatched page IDs are still rejected.
 - If the album arrives but editing the status to add the MP3 button fails, the bot sends a small fallback button message. Render records only a short job ID, platform, stage, item count and error class, without chat contents or links; historic chat messages and the phone's local log are not available from Render.
 - Long uploads have dedicated timeouts; MP3 conversions share the same resource semaphore.
 - Conversion processes and download process groups are stopped on shutdown. A local process lock prevents two workers using the same data directory. Separate devices/services must still avoid polling the same token.
@@ -103,6 +104,8 @@ bash -n termux_start.sh termux_setup.sh termux_supervisor.sh termux_process.sh
 The regression suite includes real generated MP4/M4A/PNG/GIF media, native animation/video conversion, MP3 extraction, stream-copy splits, mixed albums, cache ownership, exact-pin metadata, partial Instagram rejection and async delivery failures. Source-page and Telegram delivery tests use controlled fixtures; passing them is not live-platform certification.
 
 Direct requests to all four platforms timed out in the editing environment. No live Telegram bot token or access to the running Termux session was available here. Therefore this release still needs live URL-to-Telegram acceptance on the actual runtime. See `docs/RELEASE_AUDIT.md`.
+
+The owner's September 29 Render test subsequently confirmed 15 Instagram carousel items and 8 Pinterest items delivered. A Snapchat Spotlight route returned HTTP 404 from Render, and two YouTube videos triggered YouTube's automated-traffic verification despite a separate public-video metadata probe passing. These are source-access failures, not Telegram upload errors. The exact blocked links are not certified by the passing tests.
 
 ## Runtime diagnosis
 
