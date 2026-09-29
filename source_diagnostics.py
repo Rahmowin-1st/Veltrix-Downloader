@@ -207,7 +207,7 @@ def probe_pinterest(short_code: str) -> None:
                                          'height': int(fmt.get('height') or 0),
                                          'audio_flag': fmt.get('has_audio', 'unknown')})
                     log.info('Pinterest probe video #%s variants=%s', position, variants)
-                    for fmt in formats[:2]:
+                    for fmt in formats[:3]:
                         url = fmt.get('url') or ''
                         if not bot.safe_remote_url(url):
                             continue
@@ -220,8 +220,8 @@ def probe_pinterest(short_code: str) -> None:
                             tracks = json.loads(result.stdout).get('streams') or [] if result.returncode == 0 else []
                             log.info('Pinterest probe video #%s stream: ok=%s tracks=%s', position,
                                      result.returncode == 0,
-                                     [{'type': t.get('codec_type'), 'codec': t.get('codec_name')}
-                                      for t in tracks[:4]])
+                                     {'video': sum(t.get('codec_type') == 'video' for t in tracks),
+                                      'audio': sum(t.get('codec_type') == 'audio' for t in tracks)})
                         except Exception as exc:
                             log.info('Pinterest probe video #%s stream: %s', position, reason(exc))
             except Exception as exc:
