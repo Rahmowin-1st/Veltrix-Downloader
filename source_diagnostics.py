@@ -46,6 +46,7 @@ def reason(exc: Exception) -> str:
 
 def probe_snapchat(spotlight_id: str) -> None:
     import bot
+    import httpx
 
     if not re.fullmatch(r'[A-Za-z0-9_-]{20,160}', spotlight_id):
         log.warning('Snapchat probe: invalid ID')
@@ -62,6 +63,29 @@ def probe_snapchat(spotlight_id: str) -> None:
                      page.status_code, bool(selected), len(page.content))
         except Exception as exc:
             log.info('Snapchat probe %s: %s', label, reason(exc))
+            if isinstance(exc, httpx.DecodingError):
+                # The exact embed route sometimes advertises compression that
+                # httpx cannot decode. Inspect a bounded raw response without
+                # writing the page, cookies, media URL or HTML to the log.
+                try:
+                    headers = dict(bot.request_headers(url))
+                    headers['Accept-Encoding'] = 'identity'
+                    with httpx.Client(headers=headers, follow_redirects=False, timeout=20,
+                                      proxy=bot.PROXY or None, trust_env=False) as client:
+                        with client.stream('GET', url) as raw:
+                            data = b''
+                            for chunk in raw.iter_raw():
+                                data += chunk
+                                if len(data) > 12 * 1024 * 1024:
+                                    raise RuntimeError('Probe page size exceeded')
+                            page = data.decode('utf-8', errors='replace')
+                            exact = bool(bot._snap_info_from_exact_page(page, url))
+                            log.info('Snapchat probe %s raw: HTTP%s content_type=%s encoding=%s bytes=%s exact_video=%s',
+                                     label, raw.status_code,
+                                     (raw.headers.get('content-type') or '').split(';')[0],
+                                     raw.headers.get('content-encoding') or 'none', len(data), exact)
+                except Exception as retry_exc:
+                    log.info('Snapchat probe %s raw: %s', label, reason(retry_exc))
 
 
 def probe_youtube(ids: str) -> None:
