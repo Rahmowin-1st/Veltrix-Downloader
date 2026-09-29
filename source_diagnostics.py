@@ -84,6 +84,10 @@ def probe_snapchat(spotlight_id: str) -> None:
                                      label, raw.status_code,
                                      (raw.headers.get('content-type') or '').split(';')[0],
                                      raw.headers.get('content-encoding') or 'none', len(data), exact)
+                            log.info('Snapchat probe %s markers: exact_id=%s next_data=%s content_url=%s og_video=%s preload_video=%s',
+                                     label, spotlight_id in page, '__NEXT_DATA__' in page,
+                                     'contentUrl' in page, 'og:video' in page,
+                                     bool(re.search(r'<link[^>]+as=["\']video["\']', page, re.I)))
                 except Exception as retry_exc:
                     log.info('Snapchat probe %s raw: %s', label, reason(retry_exc))
 
