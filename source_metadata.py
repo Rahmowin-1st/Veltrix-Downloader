@@ -102,10 +102,11 @@ def pinterest_entries(pin: dict) -> list[dict]:
             return {"kind": "video", "formats": formats}
         if node.get("is_video") or node.get("type") == "story_pin_video_block":
             raise RuntimeError("Incomplete Pinterest video metadata; poster rejected")
-        if node.get("audio"):
+        images = node.get("images") or (node.get("image") or {}).get("images") or {}
+        if node.get("audio") and (node.get("type") == "story_pin_music_block" or
+                                  not images and not node.get("image_signature")):
             audio = node["audio"]
             return {"kind": "audio", "formats": [{"url": audio.get("audio_url") or audio.get("url")}]}
-        images = node.get("images") or (node.get("image") or {}).get("images") or {}
         formats = [v for v in images.values() if isinstance(v, dict) and v.get("url")]
         if not formats:
             sig = node.get("image_signature")

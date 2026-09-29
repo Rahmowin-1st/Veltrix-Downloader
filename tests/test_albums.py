@@ -52,6 +52,11 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(pinterest_post_audio_urls(pin), ['https://cdn.test/music.m4a'])
         self.assertEqual([entry['kind'] for entry in pinterest_entries(pin)], ['image', 'audio'])
 
+    def test_pinterest_single_image_with_music_is_still_an_image(self):
+        pin = {'images': {'orig': {'url': 'https://cdn.test/photo.jpg'}},
+               'audio': {'audio_url': 'https://cdn.test/music.m4a'}}
+        self.assertEqual([entry['kind'] for entry in pinterest_entries(pin)], ['image', 'audio'])
+
     def test_pinterest_visual_delivery_keeps_music_for_mp3_action(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
