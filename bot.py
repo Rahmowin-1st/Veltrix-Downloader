@@ -43,7 +43,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.8.0"
+VERSION = "9.8.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1175,6 +1175,19 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
             raise RuntimeError(f"Incomplete post: item {index + 1}/{len(entries)} unavailable; poster substitution refused")
         (soundtrack if entry["kind"] == "audio" else outputs).append(completed)
     validate_media_files(outputs + soundtrack)
+    post_music = [path for entry, path in zip(
+        [entry for entry in entries if entry['kind'] == 'audio'], soundtrack)
+        if entry.get('scope') == 'post']
+    if len(post_music) == 1 and outputs:
+        augmented = []
+        for path in outputs:
+            if classify(path) == 'video' and not has_audio(path):
+                try:
+                    path = attach_post_music(path, post_music[0], dest / 'post_music_video')
+                except (RuntimeError, OSError) as exc:
+                    log.warning('Pinterest post soundtrack could not be merged: %s', type(exc).__name__)
+            augmented.append(path)
+        outputs = augmented
     # An audio-only link still delivers its audio as the primary media.
     return outputs or soundtrack
 
@@ -1434,6 +1447,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     else:
         engines = [lambda: download_snapchat_dedicated(url, tmpdir, (prefetched or {}).get("_snap_info")),
                    lambda: download_ytdlp(url, mode, tmpdir)]
+    silent_candidate: list[Path] = []
     for engine in engines:
         try:
             files = engine()
@@ -1446,13 +1460,31 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
             files = validate_media_files(files)
             if mode not in AUDIO_PRESETS and is_video_post_url(url) and any(classify(p) != "video" for p in files):
                 raise RuntimeError("Video post returned a poster instead of video")
+            available_audio = audio_sources(files, Path(tmpdir) / 'soundtrack')
+            if mode in AUDIO_PRESETS and not available_audio:
+                # The first successful visual extractor may expose only a
+                # silent rendition. Try the independent audio-capable path.
+                silent_candidate = silent_candidate or files
+                continue
+            if mode not in AUDIO_PRESETS and platform != 'youtube' and any(classify(p) == 'video' for p in files):
+                if not available_audio:
+                    silent_candidate = silent_candidate or files
+                    continue
+                if silent_candidate:
+                    # Never replace a complete carousel with a partial reel
+                    # or a different ordering merely to get one audio track.
+                    old_kinds = [classify(p) for p in silent_candidate]
+                    if [classify(p) for p in files] != old_kinds:
+                        continue
             return files
         except Exception as exc:
             # Never hide a partial collection by falling back to a one-item result.
-            if fatal_download_error(exc):
+            if fatal_download_error(exc) and not silent_candidate:
                 raise
             errors.append(exc)
             log.warning("%s extractor failed: %s", platform, type(exc).__name__)
+    if silent_candidate:
+        return silent_candidate
     if errors:
         raise errors[-1]
     raise RuntimeError("No public downloadable media found")
@@ -2130,12 +2162,14 @@ async def run_job(
                 # Persist delivery before optional cache/status operations.
                 mark_state("done")
                 sources = await asyncio.to_thread(audio_sources, files, tmp / "soundtrack")
+                # Offer one MP3 action for every delivered post. A silent
+                # rendition can be rechecked through the other extractors
+                # when clicked; if none exposes sound, report that clearly.
                 markup = None
-                if sources:
-                    try:
-                        markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
-                    except OSError:
-                        log.warning("Media delivered; MP3 cache could not be saved")
+                try:
+                    markup = await asyncio.to_thread(post_mp3_button, uid, url, sources, str(meta.get("title") or ""))
+                except OSError:
+                    log.warning("Media delivered; MP3 action could not be saved")
                 ticker.cancel()
                 await asyncio.gather(ticker, return_exceptions=True)
                 attached = False

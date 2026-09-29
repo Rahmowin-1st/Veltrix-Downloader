@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import bot
-from source_metadata import instagram_audio_urls, instagram_extractor, pinterest_entries, find_pinterest_pin
+from source_metadata import (instagram_audio_urls, instagram_extractor,
+                             pinterest_entries, pinterest_post_audio_urls, find_pinterest_pin)
 from telegram.error import TimedOut, BadRequest
 
 
@@ -41,6 +42,15 @@ class MetadataTests(unittest.TestCase):
             {"type": "story_pin_video_block", "video": {"video_list": {"a": {"url": "https://cdn.test/clip.mp4"}}}},
         ]}]}})
         self.assertEqual([e["kind"] for e in entries], ["image", "audio", "video"])
+
+    def test_pinterest_carousel_post_music_is_not_artwork(self):
+        pin = {'carousel_data': {'carousel_slots': [
+            {'images': {'orig': {'url': 'https://cdn.test/cover.jpg'}}}]},
+            'music_metadata': {'audio_url': 'https://cdn.test/music.m4a',
+                               'artwork': {'url': 'https://cdn.test/cover.jpg'}},
+            'recommendations': [{'audio_url': 'https://cdn.test/unrelated.mp3'}]}
+        self.assertEqual(pinterest_post_audio_urls(pin), ['https://cdn.test/music.m4a'])
+        self.assertEqual([entry['kind'] for entry in pinterest_entries(pin)], ['image', 'audio'])
 
     def test_pinterest_visual_delivery_keeps_music_for_mp3_action(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -89,6 +99,26 @@ class MetadataTests(unittest.TestCase):
             self.assertTrue(bot.has_audio(pin_files[0]))
             self.assertTrue(bot.has_audio(instagram_files[0]))
 
+    def test_silent_instagram_extractor_does_not_hide_an_audible_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silent, audible = root / 'silent.mp4', root / 'audible.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=160x120:rate=25', '-t', '0.3',
+                            '-c:v', 'libx264', str(silent)], check=True, timeout=20)
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=160x120:rate=25', '-f', 'lavfi',
+                            '-i', 'sine=frequency=440', '-t', '0.3', '-c:v', 'libx264',
+                            '-c:a', 'aac', str(audible)], check=True, timeout=20)
+            with patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot.download_instagram_dedicated', return_value=([silent], 'video')), \
+                 patch('bot.download_gallery', return_value=[audible]) as gallery, \
+                 patch('bot.download_ytdlp', side_effect=AssertionError('Should use audible fallback')):
+                for mode in ('auto', 'mp3_320'):
+                    self.assertEqual(bot.grab('https://instagram.com/reel/test/', mode,
+                                              str(root / 'job')), [audible])
+            self.assertEqual(gallery.call_count, 2)
+
     def test_instagram_single_post_music_is_muxed_into_silent_video(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -116,11 +146,44 @@ class MetadataTests(unittest.TestCase):
             self.assertEqual(len(bot.audio_sources(videos, job / 'soundtrack')), 1)
             self.assertEqual(bot.audio_sources(videos, job / 'soundtrack')[0].suffix, '.m4a')
 
+    def test_pinterest_post_music_is_muxed_without_duplicate_mp3_track(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            silent, music = root / 'silent.mp4', root / 'music.m4a'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'testsrc2=size=160x120:rate=25', '-t', '0.6',
+                            '-c:v', 'libx264', str(silent)], check=True, timeout=20)
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi',
+                            '-i', 'sine=frequency=440', '-t', '0.3', '-c:a', 'aac',
+                            str(music)], check=True, timeout=20)
+            pin = {'carousel_data': {'carousel_slots': [{'videos': {'video_list': {
+                'mp4': {'url': 'https://cdn.test/silent.mp4', 'width': 160, 'height': 120}}}}]},
+                'audio': {'audio_url': 'https://cdn.test/music.m4a'}}
+            def download(url, output, **kwargs):
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(music if 'music' in url else silent, output)
+                return True
+            with patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot._download_direct_file', side_effect=download):
+                videos = bot.download_source_entries(pinterest_entries(pin), root / 'pin',
+                                                     'https://pinterest.com/pin/42/')
+            self.assertEqual(len(videos), 1)
+            self.assertTrue(bot.has_audio(videos[0]))
+            sources = bot.audio_sources(videos, root / 'soundtrack')
+            self.assertEqual(len(sources), 1)
+            self.assertEqual(sources[0].suffix, '.m4a')
+
     def test_instagram_music_is_exact_post_only(self):
         item = {"music_metadata": {"music_info": {"music_asset_info": {
             "progressive_download_url": "https://cdn.test/selected.m4a"}}},
             "recommendations": {"audio_url": "https://cdn.test/unrelated.mp3"}}
         self.assertEqual(instagram_audio_urls(item), ["https://cdn.test/selected.m4a"])
+
+    def test_instagram_carousel_child_music_is_extracted(self):
+        item = {'carousel_media': [{'clips_metadata': {'music_info': {
+            'music_asset_info': {'progressive_download_url': 'https://cdn.test/music.m4a'}}}}],
+            'recommendations': {'audio_url': 'https://cdn.test/unrelated.mp3'}}
+        self.assertEqual(instagram_audio_urls(item), ['https://cdn.test/music.m4a'])
 
     def test_real_parth_parser_preserves_music(self):
         from parth_dl import InstagramDownloader
@@ -240,21 +303,41 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_video.edit_reply_markup.call_args.kwargs['reply_markup'], markup)
         self.assertIsNone(status.edit_text.call_args.kwargs['reply_markup'])
 
-    async def test_photo_only_post_does_not_advertise_mp3(self):
+    async def test_photo_only_post_has_mp3_check_action(self):
         files = self.files([".jpg", ".jpg"])
         status = SimpleNamespace(photo=None, video=None, audio=None, document=None, animation=None,
                                  edit_text=AsyncMock(), delete=AsyncMock())
         self.msg.chat_id = 42
         context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        markup = bot.InlineKeyboardMarkup([[bot.InlineKeyboardButton('MP3', callback_data='mp3|test')]])
         with patch("bot.download_in_worker", new_callable=AsyncMock, return_value=files), \
                 patch("bot.has_audio", return_value=False), \
-                patch("bot.post_mp3_button") as button, \
+                patch("bot.post_mp3_button", return_value=markup) as button, \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.pinterest.com/pin/42/", "auto", status)
         self.assertEqual(self.messages, [["photo", "photo"]])
-        button.assert_not_called()
-        self.assertIsNone(status.edit_text.call_args.kwargs["reply_markup"])
-        self.assertNotIn("MP3", status.edit_text.call_args.args[0])
+        button.assert_called_once()
+        self.assertEqual(button.call_args.args[2], [])
+        self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"], markup)
+
+    async def test_silent_video_still_gets_mp3_check_action(self):
+        files = self.files(['.mp4'])
+        sent_video = SimpleNamespace(edit_reply_markup=AsyncMock())
+        async def send_video(**kwargs):
+            self.messages.append(['video'])
+            return sent_video
+        self.msg.reply_video.side_effect = send_video
+        status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+        self.msg.chat_id = 42
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        markup = bot.InlineKeyboardMarkup([[bot.InlineKeyboardButton('MP3', callback_data='mp3|test')]])
+        with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=files), \
+             patch('bot.has_audio', return_value=False), \
+             patch('bot.post_mp3_button', return_value=markup) as button, \
+             patch('bot._global_sem', None), patch('bot._job_locks', {}):
+            await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'auto', status)
+        button.assert_called_once()
+        sent_video.edit_reply_markup.assert_awaited_once()
 
     async def test_mp3_button_is_sent_when_status_edit_fails_after_album(self):
         files = self.files([".jpg", ".mp4"])

@@ -18,6 +18,46 @@ def instagram_audio_urls(item: dict) -> list[str]:
                 walk(value)
     for key in ("music_metadata", "clips_metadata", "music_info", "audio", "audio_info"):
         walk(item.get(key))
+    # Carousel children may own the music metadata even when the parent does
+    # not. Do not walk the whole response: it may include recommended posts.
+    for child in item.get("carousel_media") or []:
+        if isinstance(child, dict):
+            urls.extend(instagram_audio_urls(child))
+    for edge in (item.get("edge_sidecar_to_children") or {}).get("edges") or []:
+        child = edge.get("node") if isinstance(edge, dict) else None
+        if isinstance(child, dict):
+            urls.extend(instagram_audio_urls(child))
+    return list(dict.fromkeys(urls))
+
+
+def pinterest_post_audio_urls(pin: dict) -> list[str]:
+    """Read only music attached to this pin, never related-pin metadata."""
+    urls = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in {"audio_url", "audio_src", "progressive_download_url"}:
+                    if isinstance(value, str) and value.startswith("https://"):
+                        urls.append(value)
+                elif key == "url" and isinstance(value, str) and value.startswith("https://"):
+                    # Music objects often contain artwork URLs too.
+                    path = value.split("?", 1)[0].lower()
+                    if path.endswith((".m4a", ".mp3", ".aac", ".ogg", ".opus", ".wav")):
+                        urls.append(value)
+                elif isinstance(value, (dict, list)):
+                    walk(value)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child)
+
+    # Only a post-wide soundtrack can safely be applied to every silent slot.
+    for key in ("audio", "music", "music_metadata", "soundtrack", "sound"):
+        value = pin.get(key)
+        if isinstance(value, str) and value.startswith("https://"):
+            urls.append(value)
+        else:
+            walk(value)
     return list(dict.fromkeys(urls))
 
 
@@ -77,6 +117,8 @@ def pinterest_entries(pin: dict) -> list[dict]:
         formats.sort(key=lambda f: int(f.get("width") or 0) * int(f.get("height") or 0), reverse=True)
         return {"kind": "image", "formats": formats}
 
+    post_music = [{"kind": "audio", "scope": "post", "formats": [{"url": url}]}
+                  for url in pinterest_post_audio_urls(pin)]
     if pin.get("story_pin_data"):
         result = []
         for page in pin["story_pin_data"].get("pages") or []:
@@ -87,13 +129,15 @@ def pinterest_entries(pin: dict) -> list[dict]:
                 result.append(media({"image_signature": page.get("image_signature"), **block}))
         if not result:
             raise RuntimeError("Incomplete Pinterest story metadata")
-        return result
+        used = {fmt.get("url") for entry in result if entry["kind"] == "audio"
+                for fmt in entry["formats"]}
+        return result + [entry for entry in post_music if entry["formats"][0]["url"] not in used]
     if pin.get("carousel_data"):
         slots = pin["carousel_data"].get("carousel_slots") or []
         if not slots:
             raise RuntimeError("Incomplete Pinterest carousel metadata")
-        return [media(slot) for slot in slots]
-    return [media(pin)]
+        return [media(slot) for slot in slots] + post_music
+    return [media(pin)] + post_music
 
 
 def find_pinterest_pin(document, pin_id: str) -> dict:

@@ -167,13 +167,21 @@ def probe_pinterest(short_code: str) -> None:
                     'video' if ext in {'mp4', 'm3u8', 'webm'} else 'image-or-other')
             kinds[kind] = kinds.get(kind, 0) + 1
         log.info('Pinterest probe: entries=%s kinds=%s', len(urls), kinds)
-        from source_metadata import pinterest_entries
+        from source_metadata import pinterest_entries, pinterest_post_audio_urls
         pins = [row[-1] for row in rows if isinstance(row, list) and row and row[0] == 2
                 and isinstance(row[-1], dict) and
                 any(k in row[-1] for k in ('images', 'videos', 'carousel_data', 'story_pin_data'))]
         log.info('Pinterest probe: pin_metadata_rows=%s', len(pins))
         if pins:
             pin = pins[0]
+            # Field names only; never write private URLs or cookie values.
+            log.info('Pinterest probe post audio fields: keys=%s explicit_tracks=%s',
+                     sorted(k for k in pin if any(word in k.lower() for word in ('audio', 'music', 'sound'))),
+                     len(pinterest_post_audio_urls(pin)))
+            carousel = (pin.get('carousel_data') or {}).get('carousel_slots') or []
+            log.info('Pinterest probe carousel audio field counts: %s',
+                     {key: sum(key in slot for slot in carousel if isinstance(slot, dict))
+                      for key in ('audio', 'music', 'music_metadata', 'soundtrack', 'sound')})
             pages = (pin.get('story_pin_data') or {}).get('pages') or []
             blocks = [block for page in pages if isinstance(page, dict)
                       for block in page.get('blocks') or [] if isinstance(block, dict)]

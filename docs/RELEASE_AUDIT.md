@@ -1,5 +1,10 @@
 # Veltrix Downloader release audit — 2026-09-29
 
+## v9.8.1 owner retest
+
+- Render app logs for the September 29 19:10–19:14 UZT retest: Instagram delivered one video and a 15-item post (11 videos, four images). All 12 Instagram video files had zero audio streams. Pinterest delivered eight items (two videos, six images), and both video files had zero audio streams. The MP3 keyboard was missing because v9.8.0 conditioned it on source audio. The tested YouTube link returned the platform bot-check error; the Snapchat Spotlight route returned HTTP 404. These failures are not a Telegram album upload failure.
+- Show an MP3 action for every completed post, including silent ones, and recheck independent extractors on click. A missing source audio track produces an explicit error. Read music attached to Instagram carousel children and Pinterest pin-level metadata, mux one exact post soundtrack into silent video, and prefer an audio-bearing alternative only if all media types and item counts match. Never synthesize sound or copy music from recommendations.
+
 ## v9.8.0 audio and Pin verification
 
 - Rechecked the user's Pinterest Pin directly on Render. The gallery-dl URL manifest lists eight image URLs, but the Pin metadata has eight carousel slots: **two videos and six images**. The v9.7.2 claim that this Pin contained only images was wrong. The bot's metadata reconstruction already selected video for those slots; new aggregate per-job logging will show what the worker actually delivers on a new request.
