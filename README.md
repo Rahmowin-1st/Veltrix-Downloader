@@ -127,3 +127,8 @@ Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUT
 - [Telegram local Bot API limits](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
 
 Cobalt was studied for behavior and public schema structure. No Cobalt service or paid endpoint is required.
+## Hosted fallback setup
+
+YouTube and Snapchat can use owner-configured hosted API fallbacks when local
+extraction fails. See [setup, costs and verification limits](docs/HOSTED_FALLBACKS.md).
+The optional APIs are inactive until their environment keys are configured.

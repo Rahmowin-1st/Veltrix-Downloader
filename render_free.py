@@ -59,6 +59,9 @@ log.info('Source access configured: youtube=%s instagram=%s pinterest=%s snapcha
          *(bool(os.getenv(f'{name}_COOKIE_FILE')) for name in
            ('YOUTUBE', 'INSTAGRAM', 'PINTEREST', 'SNAPCHAT')),
          bool(bot.PROXY))
+from remote_sources import configured as remote_configured
+log.info('Hosted fallbacks configured: youtube=%s snapchat=%s',
+         remote_configured('youtube'), remote_configured('snapchat'))
 
 
 def probe_telegram_egress(token: str) -> None:
