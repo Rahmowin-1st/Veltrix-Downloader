@@ -1,7 +1,33 @@
-# Veltrix Downloader 9.8.1
+# Veltrix Downloader 9.9.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
+
+Instagram's full-object DASH audio tracks are recovered per carousel item when
+exposed in exact-post metadata, then muxed into that item's silent video. Native
+audio is retained. If a video still lacks audio, the delivered caption says so.
+One audible video no longer stops the search for other missing carousel tracks.
+
+## Optional extraction API
+
+An owner-operated or explicitly authorized [Cobalt API](https://github.com/imputnet/cobalt/blob/main/docs/api.md)
+can be used after built-in extractors fail or return silent videos:
+
+```dotenv
+COBALT_API_URL=https://your-authorized-cobalt-host.example/
+COBALT_API_KEY=
+```
+
+Leave these empty to disable it. Cobalt does not provide an official unrestricted
+public API endpoint; this repository does not include an instance or API key.
+Self-hosting on the same blocked IP does not guarantee YouTube access. A provider
+must actually expose the requested post and audio; integration alone cannot
+establish live success.
+
+The adapter requests maximum quality with sound, downloads all picker items in
+order, keeps background audio for MP3, and checks real media streams. API keys
+are sent only to the configured HTTPS endpoint, never to media/CDN hosts.
+Explicit YouTube playlists stay on the collection-capable built-in route.
 
 ## Platform routes
 

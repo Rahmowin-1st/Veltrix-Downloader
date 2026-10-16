@@ -1,9 +1,49 @@
 """Exact-post metadata adapters. Never search recommendations or poster URLs."""
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 
-def instagram_audio_urls(item: dict) -> list[str]:
-    urls = []
+
+def instagram_dash_audio_urls(item: dict) -> list[str]:
+    """Read full-object audio BaseURLs from this item's DASH metadata only.
+
+    SegmentBase byte ranges describe a complete object. SegmentTemplate/List
+    need a segmented downloader and must never be mistaken for a complete file.
+    """
+    dash_info = item.get('dash_info') if isinstance(item.get('dash_info'), dict) else {}
+    manifests = [item.get('video_dash_manifest'), dash_info.get('video_dash_manifest')]
+    candidates = []
+    for manifest in manifests:
+        if (not isinstance(manifest, str) or len(manifest) > 2 * 1024 * 1024
+                or '<!DOCTYPE' in manifest.upper() or '<!ENTITY' in manifest.upper()):
+            continue
+        try:
+            root = ET.fromstring(manifest)
+        except ET.ParseError:
+            continue
+        def walk(node, inherited_audio=False, segmented=False):
+            mime = node.get('mimeType', '')
+            audio = node.get('contentType') == 'audio' or mime.startswith('audio/') or inherited_audio
+            children = list(node)
+            segmented = segmented or any(child.tag.rsplit('}', 1)[-1] in {
+                'SegmentTemplate', 'SegmentList'} for child in children)
+            if node.tag.rsplit('}', 1)[-1] == 'Representation' and audio and not segmented:
+                try:
+                    bandwidth = int(node.get('bandwidth') or 0)
+                except ValueError:
+                    bandwidth = 0
+                for child in children:
+                    url = (child.text or '').strip()
+                    if child.tag.rsplit('}', 1)[-1] == 'BaseURL' and url.startswith('https://'):
+                        candidates.append((bandwidth, url))
+            for child in children:
+                walk(child, audio, segmented)
+        walk(root)
+    return list(dict.fromkeys(url for _, url in sorted(candidates, reverse=True)))
+
+
+def instagram_audio_urls(item: dict, *, include_children: bool = True, include_dash: bool = True) -> list[str]:
+    urls = instagram_dash_audio_urls(item) if include_dash else []
     # These fields belong to the selected post, not related posts or album art.
     def walk(node):
         if isinstance(node, dict):
@@ -20,10 +60,10 @@ def instagram_audio_urls(item: dict) -> list[str]:
         walk(item.get(key))
     # Carousel children may own the music metadata even when the parent does
     # not. Do not walk the whole response: it may include recommended posts.
-    for child in item.get("carousel_media") or []:
+    for child in (item.get("carousel_media") or []) if include_children else []:
         if isinstance(child, dict):
             urls.extend(instagram_audio_urls(child))
-    for edge in (item.get("edge_sidecar_to_children") or {}).get("edges") or []:
+    for edge in ((item.get("edge_sidecar_to_children") or {}).get("edges") or []) if include_children else []:
         child = edge.get("node") if isinstance(edge, dict) else None
         if isinstance(child, dict):
             urls.extend(instagram_audio_urls(child))
@@ -71,7 +111,11 @@ def instagram_extractor(downloader):
             expected = max(int(item.get("carousel_media_count") or 0), len(item.get("carousel_media") or [item]))
             if len(result.get("entries") or []) != expected:
                 raise RuntimeError("Incomplete Instagram carousel metadata")
-            result["audio_urls"] = instagram_audio_urls(item)
+            children = item.get('carousel_media') or []
+            result["audio_urls"] = instagram_audio_urls(item, include_children=False, include_dash=False)
+            for entry, child in zip(result['entries'], children or [item]):
+                entry['audio_urls'] = (instagram_audio_urls(child, include_children=False) if children
+                                       else instagram_dash_audio_urls(child))
             return result
 
         def _parse_graphql_media(self, item):
@@ -80,7 +124,11 @@ def instagram_extractor(downloader):
             expected = max(int(sidecar.get("count") or 0), len(sidecar.get("edges") or [item]))
             if len(result.get("entries") or []) != expected:
                 raise RuntimeError("Incomplete Instagram carousel metadata")
-            result["audio_urls"] = instagram_audio_urls(item)
+            edges = sidecar.get('edges') or []
+            result["audio_urls"] = instagram_audio_urls(item, include_children=False, include_dash=False)
+            for entry, child in zip(result['entries'], [edge.get('node') or {} for edge in edges] or [item]):
+                entry['audio_urls'] = (instagram_audio_urls(child, include_children=False) if edges
+                                       else instagram_dash_audio_urls(child))
             return result
 
     # Preserve the existing extractor's rate limiter and request configuration.

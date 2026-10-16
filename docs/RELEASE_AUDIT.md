@@ -1,4 +1,48 @@
-# Veltrix Downloader release audit — 2026-09-29
+# Veltrix Downloader release audit — 2026-10-16
+
+## v9.9.0 per-item audio and optional provider fallback
+
+- Baseline: `b3bc031`. The existing Instagram parser discarded full-object audio
+  BaseURLs from `video_dash_manifest` / `dash_info.video_dash_manifest`. Read audio
+  representations from the selected item's bounded XML, prioritize bandwidth,
+  reject segmented-only manifests, and validate downloaded bytes with ffprobe.
+  Each carousel child's track is muxed only into its own silent video. Native
+  audio remains intact. Item audio is not looped; separate post music retains
+  the existing background-music behavior.
+- Fixed premature fallback success: one audible video or a separate soundtrack
+  no longer proves all carousel videos have sound. Seek another complete
+  rendition with the same item/type order; retain the candidate that adds
+  audible positions without losing existing ones. Resource/age restrictions
+  remain terminal. Captions explicitly report videos with unavailable audio.
+- Added an optional owner-authorized Cobalt API adapter: bounded JSON, HTTPS,
+  no API redirect following, no cookie forwarding, API keys confined to the
+  manifest request, maximum quality with sound, ordered picker downloads and
+  separate post soundtrack handling. Files use existing byte/storage/probe
+  checks and MP3 delivery. Explicit playlists never fall back to a single video.
+  A provider outage preserves the original platform error.
+- Official Cobalt documentation states there is no official unrestricted
+  pre-hosted API; use an owner-operated or authorized instance. No endpoint or
+  key was available, so this route is disabled by default and **not live-tested**.
+  Hosting it on the same blocked IP is not an established YouTube fix.
+- Validation: 173 tests run, **172 passed, one existing environment-dependent
+  test skipped**. Twenty new tests cover manifest parsing/authentication,
+  response bounds, redirect/key isolation, DASH alternatives, REST/GraphQL
+  child scoping, real ffmpeg muxing, partial audio coverage, complete-carousel
+  retention and playlist/provider failure behavior. Dependency integrity,
+  compilation, shell syntax and whitespace checks passed.
+- Read-only production observation before deployment: Render started the
+  existing build, verified identity `@VeltrixDownloaderBot`, found ffmpeg,
+  ffprobe and Deno, and confirmed webhook registration on October 16. All
+  source-cookie/proxy flags were false. This is connectivity evidence, not a
+  successful source download or Telegram media delivery of this patch.
+- Remaining acceptance: retest the actual failing URLs on the deployed build.
+  Source platforms can omit licensed/background audio, reject datacenter IPs,
+  or require authorized access. No universal download or 100% coverage claim.
+
+Primary implementation references:
+- [yt-dlp Instagram DASH handling](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/extractor/instagram.py)
+- [Cobalt API contract](https://github.com/imputnet/cobalt/blob/main/docs/api.md)
+- [Cobalt API availability](https://github.com/imputnet/cobalt/blob/main/api/README.md)
 
 ## v9.8.1 owner retest
 
