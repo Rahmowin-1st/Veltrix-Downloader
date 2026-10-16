@@ -43,7 +43,7 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 
 load_dotenv()
-VERSION = "9.8.1"
+VERSION = "9.8.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1030,7 +1030,7 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
                     return validate_media_files(complete)
                 shutil.rmtree(attempt_dir, ignore_errors=True)
             except Exception as exc:
-                if fatal_download_error(exc):
+                if fatal_download_error(exc) and str(exc) != 'Incomplete source video audio track':
                     raise
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), str(exc)[:220])
@@ -1421,6 +1421,45 @@ def sanitize_media_files(paths: list[Path]) -> list[Path]:
     return clean
 
 
+def download_remote_source(url: str, mode: str, tmpdir: str) -> list[Path]:
+    from remote_sources import resolve, RemoteSourceError
+    platform = platform_of(url)
+    # A one-video API must never silently turn a playlist into a single item.
+    if platform == 'youtube' and youtube_playlist_url(url):
+        return []
+    entries = resolve(platform, url, mode, proxy=PROXY or None)
+    if len(entries) > MAX_GALLERY_ITEMS:
+        raise RemoteSourceError('Remote collection exceeds configured item limit')
+    outputs = []
+    for index, entry in enumerate(entries, 1):
+        media_url = entry.get('url')
+        if not isinstance(media_url, str) or not safe_remote_url(media_url):
+            raise RemoteSourceError('Unsafe remote media destination')
+        path = Path(tmpdir) / 'remote' / f'{index:05d}{".m4a" if entry["kind"] == "audio" else ".mp4"}'
+        if not _download_direct_file(media_url, path, referer=''):
+            raise RemoteSourceError('Remote media transfer failed')
+        validate_media_files([path])
+        if classify(path) != entry['kind']:
+            raise RemoteSourceError('Remote provider returned the wrong media type')
+        if entry['kind'] == 'video' and not has_audio(path) and entry.get('audio_url'):
+            audio_url = entry['audio_url']
+            if not isinstance(audio_url, str) or not safe_remote_url(audio_url):
+                raise RemoteSourceError('Unsafe remote audio destination')
+            audio = path.with_suffix('.audio.m4a')
+            if not _download_direct_file(audio_url, audio, referer='') or not has_audio(audio):
+                raise RemoteSourceError('Remote audio transfer failed')
+            merged = path.with_suffix('.merged.mkv')
+            ffmpeg(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(path),
+                    '-i', str(audio), '-map', '0:v:0', '-map', '1:a:0',
+                    '-c', 'copy', str(merged)])
+            validate_media_files([merged])
+            path = merged
+        if entry.get('requires_audio') and not has_audio(path):
+            raise RemoteSourceError('Remote provider returned no audio track')
+        outputs.append(path)
+    return outputs
+
+
 def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = None) -> list[Path]:
     platform = platform_of(url)
     if not platform or not safe_remote_url(url):
@@ -1447,6 +1486,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     else:
         engines = [lambda: download_snapchat_dedicated(url, tmpdir, (prefetched or {}).get("_snap_info")),
                    lambda: download_ytdlp(url, mode, tmpdir)]
+    from remote_sources import configured
+    if configured(platform):
+        engines.append(lambda: download_remote_source(url, mode, tmpdir))
     silent_candidate: list[Path] = []
     for engine in engines:
         try:
@@ -1479,7 +1521,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
             return files
         except Exception as exc:
             # Never hide a partial collection by falling back to a one-item result.
-            if fatal_download_error(exc) and not silent_candidate:
+            missing_single_audio = (platform == 'youtube' and not youtube_playlist_url(url)
+                                    and str(exc) == 'Incomplete source video audio track')
+            if fatal_download_error(exc) and not silent_candidate and not missing_single_audio:
                 raise
             errors.append(exc)
             log.warning("%s extractor failed: %s", platform, type(exc).__name__)
