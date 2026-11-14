@@ -10,6 +10,7 @@ from unittest.mock import patch
 import httpx
 import bot
 from cobalt_provider import ProviderError, parse_manifest, request_manifest
+from media_io import probe, same_video_stream
 from source_metadata import instagram_dash_audio_urls, instagram_extractor
 
 
@@ -162,6 +163,7 @@ class RealMediaFallbackTests(unittest.TestCase):
         cls.temp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp.name)
         cls.silent, cls.audible = cls.root / 'silent.mp4', cls.root / 'audible.mp4'
+        cls.second_silent, cls.second_audible = cls.root / 'second_silent.mp4', cls.root / 'second_audible.mp4'
         subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=s=160x120:r=25',
                         '-t', '0.4', '-c:v', 'libx264', str(cls.silent)], check=True, timeout=20)
         subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(cls.silent), '-f', 'lavfi',
@@ -170,6 +172,11 @@ class RealMediaFallbackTests(unittest.TestCase):
         cls.music = cls.root / 'music.m4a'
         subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(cls.audible), '-vn',
                         '-c:a', 'copy', str(cls.music)], check=True, timeout=20)
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=160x120:r=25',
+                        '-t', '1.6', '-c:v', 'libx264', str(cls.second_silent)], check=True, timeout=20)
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(cls.second_silent), '-f', 'lavfi',
+                        '-i', 'sine=frequency=660', '-t', '1.6', '-c:v', 'copy',
+                        '-c:a', 'aac', str(cls.second_audible)], check=True, timeout=20)
 
     @classmethod
     def tearDownClass(cls):
@@ -183,6 +190,26 @@ class RealMediaFallbackTests(unittest.TestCase):
             self.assertEqual(bot.grab('https://instagram.com/p/test/', 'auto', job),
                              [self.audible, self.audible])
             fallback.assert_called_once()
+
+    def test_complementary_fallbacks_keep_both_matching_videos_with_audio(self):
+        original = [self.audible, self.second_silent]
+        for mode in ('auto', 'mp3_320'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as job, \
+                 patch.dict(os.environ, {'COBALT_API_URL': ''}), \
+                 patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot.download_instagram_dedicated', return_value=(original, 'carousel')), \
+                 patch('bot.download_gallery', return_value=[self.silent, self.second_audible]):
+                self.assertEqual(bot.grab('https://instagram.com/p/test/', mode, job),
+                                 [self.audible, self.second_audible])
+
+    def test_unmatched_video_does_not_replace_another_carousel_child(self):
+        original = [self.audible, self.second_silent]
+        with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \
+             patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.download_instagram_dedicated', return_value=(original, 'carousel')), \
+             patch('bot.download_gallery', return_value=[self.second_silent, self.audible]), \
+             patch('bot.download_ytdlp', return_value=[]):
+            self.assertEqual(bot.grab('https://instagram.com/p/test/', 'auto', job), original)
 
     def test_audio_from_shorter_carousel_does_not_replace_complete_post(self):
         complete = [self.silent, self.silent]
@@ -220,6 +247,54 @@ class RealMediaFallbackTests(unittest.TestCase):
              patch('bot._download_direct_file', side_effect=download):
             files, _ = bot.download_instagram_dedicated('https://instagram.com/p/test/', job, info)
             self.assertEqual([bot.has_audio(p) for p in files], [True, False])
+            self.assertEqual(len(bot.audio_sources(files, Path(job) / 'soundtrack')), 1)
+
+    def test_instagram_gallery_uses_embedded_dash_and_keeps_original_track_for_mp3(self):
+        manifest = [[3, 'ytdl:https://www.instagram.com/p/test/1.mp4', {
+            '_ytdl_manifest': 'dash', '_ytdl_manifest_data': dash('https://cdn.test/music.m4a'),
+            '_fallback': ['https://cdn.test/video.mp4']}]]
+        observed = []
+
+        def download(url, output, **kwargs):
+            observed.append(url)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.music if url.endswith('.m4a') else self.second_silent, output)
+            return True
+
+        with tempfile.TemporaryDirectory() as job, patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.subprocess.run', return_value=subprocess.CompletedProcess([], 0, json.dumps(manifest))) as cli, \
+             patch('bot._download_direct_file', side_effect=download):
+            files = bot.download_gallery('https://instagram.com/p/test/', job)
+            self.assertIn('output.private=true', cli.call_args.args[0])
+            self.assertEqual(observed, ['https://cdn.test/video.mp4', 'https://cdn.test/music.m4a'])
+            self.assertTrue(bot.has_audio(files[0]))
+            self.assertTrue(same_video_stream(self.second_silent, files[0]))
+            self.assertAlmostEqual(float(probe(files[0])['format']['duration']), 1.6, delta=0.1)
+            sources = bot.audio_sources(files, Path(job) / 'soundtrack')
+            self.assertEqual(len(sources), 1)
+            self.assertEqual(sources[0].read_bytes(), self.music.read_bytes())
+
+    def test_pinterest_music_does_not_replace_distinct_videos_or_surface_invalid_tracks(self):
+        entries = [{'kind': 'video', 'formats': [{'url': f'https://cdn.test/video_{index}.mp4'}]}
+                   for index in range(2)]
+        entries.extend({'kind': 'audio', 'scope': 'post', 'formats': [{'url': f'https://cdn.test/{name}.m4a'}]}
+                       for name in ('expired', 'music'))
+
+        def download(url, output, **kwargs):
+            if 'expired' in url:
+                shutil.copy2(self.silent, output)
+            else:
+                source = self.music if 'music' in url else self.silent if '_0.' in url else self.second_silent
+                shutil.copy2(source, output)
+            return True
+
+        with tempfile.TemporaryDirectory() as job, patch('bot.safe_remote_url', return_value=True), \
+             patch('bot._download_direct_file', side_effect=download):
+            files = bot.download_source_entries(entries, Path(job) / 'pinterest', 'https://pinterest.com/pin/42/')
+            self.assertEqual(len(set(files)), 2)
+            self.assertTrue(all(bot.has_audio(path) for path in files))
+            self.assertTrue(same_video_stream(files[0], self.silent))
+            self.assertTrue(same_video_stream(files[1], self.second_silent))
             self.assertEqual(len(bot.audio_sources(files, Path(job) / 'soundtrack')), 1)
 
     def test_configured_provider_recovers_after_youtube_bot_check(self):

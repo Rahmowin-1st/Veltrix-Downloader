@@ -174,6 +174,32 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch('bot.send_album', side_effect=receive):
                 self.assertEqual(await bot.send_mp3_album(None, [source], root), 1)
 
+    async def test_partial_mp3_cache_is_refreshed_without_losing_existing_audio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            cached, first, second = [root / name for name in ('cached.m4a', 'first.m4a', 'second.m4a')]
+            for path in (cached, first, second):
+                path.write_bytes(path.name.encode())
+            for available in (1, 2):
+                with self.subTest(available=available):
+                    status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+                    msg = SimpleNamespace(chat_id=1)
+                    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+                    async def send(msg, sources, tmp, progress):
+                        expected = [first, second] if available == 2 else [cached]
+                        self.assertEqual([p.read_bytes() for p in sources], [p.read_bytes() for p in expected])
+                        return len(sources)
+
+                    with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=[first, second][:available]) as worker, \
+                         patch('bot.send_mp3_album', side_effect=send) as upload, \
+                         patch('bot.has_audio', return_value=True):
+                        await bot.run_job(msg, context, 1, 'https://instagram.com/p/test/', 'mp3_320', status,
+                                          cached_sources=[cached], refresh_audio=True)
+                    worker.assert_awaited_once()
+                    upload.assert_awaited_once()
+                    status.delete.assert_awaited_once()
+
 
 class VideoTrackTests(unittest.TestCase):
     def test_h264_is_preserved_when_only_audio_needs_conversion(self):

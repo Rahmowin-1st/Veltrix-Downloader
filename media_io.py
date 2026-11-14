@@ -28,6 +28,25 @@ def probe(path: Path) -> dict:
     return _probe(str(path.resolve()), stat.st_size, stat.st_mtime_ns)
 
 
+def same_video_stream(first: Path, second: Path) -> bool:
+    """Verify that two variants carry the same encoded video, ignoring audio and container."""
+    def fingerprint(path):
+        video = next(stream for stream in probe(path)['streams']
+                     if stream.get('codec_type') == 'video' and not stream.get('disposition', {}).get('attached_pic'))
+        codec = video.get('codec_name')
+        normalize = ['-bsf:v', f'{codec}_mp4toannexb'] if codec in {'h264', 'hevc'} else []
+        result = run(['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path), '-map', '0:V:0',
+                      '-c:v', 'copy', *normalize, '-f', 'hash', '-'], capture_output=True, text=True,
+                     check=True, timeout=30)
+        return codec, result.stdout.strip()
+
+    try:
+        expected = fingerprint(first)
+        return bool(expected[1]) and expected == fingerprint(second)
+    except (RuntimeError, OSError, subprocess.SubprocessError, StopIteration):
+        return False
+
+
 def media_kind(path: Path) -> str:
     info = probe(path)
     streams = info["streams"]

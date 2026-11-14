@@ -21,7 +21,8 @@ veltrix_child_pids() {
     command="$(ps -p "$child" -o args= 2>/dev/null || true)"
     if [ "$owner" = "$parent" ]; then
       case "$command" in
-        *"python bot.py"*) printf '%s\n' "$child" ;;
+        python\ bot.py|*/python\ bot.py|python3\ bot.py|*/python3\ bot.py|\
+        python3.[0-9]*\ bot.py|*/python3.[0-9]*\ bot.py) printf '%s\n' "$child" ;;
       esac
     fi
   done

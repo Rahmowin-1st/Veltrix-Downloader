@@ -342,6 +342,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
              patch('bot._global_sem', None), patch('bot._job_locks', {}):
             await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'auto', status)
         button.assert_called_once()
+        self.assertTrue(button.call_args.kwargs['refresh_audio'])
         sent_video.edit_reply_markup.assert_awaited_once()
 
     async def test_mp3_button_is_sent_when_status_edit_fails_after_album(self):
@@ -405,6 +406,29 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job.call_args.args[3], url)
             unauthorized = SimpleNamespace(message=query.message)
             self.assertEqual(bot.recover_mp3_action(unauthorized, 43, data), {})
+
+    async def test_mp3_button_survives_a_failed_cache_write(self):
+        url = 'https://instagram.com/p/test/'
+        video = self.files(['.mp4'])[0]
+        sent_video = SimpleNamespace(edit_reply_markup=AsyncMock())
+        self.msg.reply_video.side_effect = None
+        self.msg.reply_video.return_value = sent_video
+        status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+        self.msg.chat_id = 42
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=[video]), \
+             patch('bot.has_audio', return_value=True), \
+             patch('bot.create_action', side_effect=OSError('cache unavailable')), \
+             patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.BOT_TOKEN', 'test-bot-token'), \
+             patch('bot._global_sem', None), patch('bot._job_locks', {}):
+            await bot.run_job(self.msg, context, 42, url, 'auto', status)
+            sent_video.edit_reply_markup.assert_awaited_once()
+            markup = sent_video.edit_reply_markup.call_args.kwargs['reply_markup']
+            query = SimpleNamespace(message=SimpleNamespace(reply_markup=markup))
+            data = markup.inline_keyboard[0][0].callback_data
+            self.assertEqual(bot.recover_mp3_action(query, 42, data)['url'], url)
+            self.assertEqual(bot.recover_mp3_action(query, 43, data), {})
 
     async def test_both_polling_and_upload_use_ipv4_option(self):
         with patch.dict(os.environ, {"TELEGRAM_IPV4": "1"}), patch("telegram_network.environment_proxy", return_value=None), \
