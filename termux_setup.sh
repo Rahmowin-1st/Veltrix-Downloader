@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 echo "[1/4] Installing Termux packages..."
 pkg update -y
-pkg install -y python git ffmpeg nodejs deno
+pkg install -y python git ffmpeg nodejs deno python-pillow
 
 echo "[2/4] Installing Python dependencies..."
 # Termux manages pip through its own Python package. Never self-upgrade pip here.

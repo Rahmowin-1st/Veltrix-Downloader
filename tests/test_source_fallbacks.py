@@ -249,6 +249,71 @@ class RealMediaFallbackTests(unittest.TestCase):
             self.assertEqual([bot.has_audio(p) for p in files], [True, False])
             self.assertEqual(len(bot.audio_sources(files, Path(job) / 'soundtrack')), 1)
 
+    def test_best_instagram_video_can_use_separate_audio_before_smaller_rendition(self):
+        info = {'type': 'video', 'entries': [{
+            'kind': 'video', 'audio_urls': ['https://cdn.test/source.m4a'], 'formats': [
+                {'url': 'https://cdn.test/lower.mp4', 'width': 640, 'height': 480, 'has_audio': True},
+                {'url': 'https://cdn.test/best.mp4', 'width': 1920, 'height': 1080, 'has_audio': False},
+            ],
+        }]}
+        sources = {'best.mp4': self.second_silent, 'lower.mp4': self.audible, 'source.m4a': self.music}
+        requested = []
+
+        def download(url, output, **kwargs):
+            name = url.rsplit('/', 1)[-1]
+            requested.append(name)
+            shutil.copyfile(sources[name], output)
+            return True
+
+        with tempfile.TemporaryDirectory() as job, patch('bot.safe_remote_url', return_value=True), \
+             patch('bot._download_direct_file', side_effect=download):
+            files, _ = bot.download_instagram_dedicated('https://instagram.com/reel/test/', job, info)
+            self.assertEqual(requested, ['best.mp4', 'source.m4a'])
+            self.assertTrue(same_video_stream(files[0], self.second_silent))
+            self.assertTrue(bot.has_audio(files[0]))
+
+    def test_partial_download_can_recover_only_the_complete_carousel(self):
+        from source_metadata import IncompletePost
+
+        layout = ('video', 'video')
+        for replacement in ([self.audible], [self.audible, self.second_audible]):
+            with self.subTest(size=len(replacement)), tempfile.TemporaryDirectory() as job, \
+                 patch.dict(os.environ, {'COBALT_API_URL': ''}), patch('bot.safe_remote_url', return_value=True), \
+                 patch('bot.download_instagram_dedicated', side_effect=IncompletePost('Incomplete carousel', layout)), \
+                 patch('bot.download_gallery', return_value=replacement), patch('bot.download_ytdlp', return_value=[]):
+                if len(replacement) < 2:
+                    with self.assertRaises(IncompletePost):
+                        bot.grab('https://instagram.com/p/test/', 'auto', job)
+                else:
+                    self.assertEqual(bot.grab('https://instagram.com/p/test/', 'auto', job), replacement)
+
+    def test_snapchat_hls_uses_video_download_and_checks_its_audio(self):
+        media = {'entries': [{'kind': 'video', 'url': 'https://cdn.test/spotlight/master.m3u8?sig=fake'}]}
+        options = []
+
+        class PlaylistDownloader:
+            def __init__(self, opts):
+                options.append(opts)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, *, download):
+                self.assertion = (url, download)
+                path = Path(options[-1]['outtmpl'].replace('%(ext)s', 'mp4'))
+                shutil.copyfile(RealMediaFallbackTests.audible, path)
+                return {'requested_downloads': [{'filepath': str(path)}]}
+
+        with tempfile.TemporaryDirectory() as job, patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.YoutubeDL', PlaylistDownloader), patch('bot._download_direct_file') as direct:
+            files = bot.download_snapchat_dedicated('https://snapchat.com/spotlight/test', job, media)
+            direct.assert_not_called()
+            self.assertTrue(bot.has_audio(files[0]))
+            self.assertEqual(options[0]['http_headers']['Referer'], 'https://www.snapchat.com/')
+
     def test_instagram_gallery_uses_embedded_dash_and_keeps_original_track_for_mp3(self):
         manifest = [[3, 'ytdl:https://www.instagram.com/p/test/1.mp4', {
             '_ytdl_manifest': 'dash', '_ytdl_manifest_data': dash('https://cdn.test/music.m4a'),

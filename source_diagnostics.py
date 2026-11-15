@@ -5,6 +5,7 @@ environment. Never writes URLs, cookies, page content or media to the log.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -239,6 +240,34 @@ def probe_pinterest(short_code: str) -> None:
         log.info('Pinterest probe: %s', reason(exc))
 
 
+async def probe_downloads(urls: list[str]) -> None:
+    """Check the release's downloader on explicit public inputs, without Telegram uploads."""
+    from pathlib import Path
+    import bot
+
+    for index, url in enumerate(urls[:6], 1):
+        platform = bot.platform_of(url) if isinstance(url, str) else None
+        if not platform or bot.youtube_playlist_url(url):
+            continue
+        log.info('Media probe #%s %s started', index, platform)
+        try:
+            async with asyncio.timeout(70):
+                with tempfile.TemporaryDirectory(prefix='vx_source_probe_') as folder:
+                    root = Path(folder)
+                    files = await bot.download_in_worker(url, bot.AUTO_MODE, root, {})
+                    kinds = [bot.classify(path) for path in files]
+                    videos_with_audio = sum(kind == 'video' and bot.has_audio(path)
+                                            for kind, path in zip(kinds, files))
+                    tracks = len(bot.audio_sources(files, root / 'soundtrack'))
+                    log.info('Media probe #%s %s: items=%s video=%s image=%s animation=%s audio=%s video_with_audio=%s mp3_sources=%s',
+                             index, platform, len(files), kinds.count('video'), kinds.count('image'),
+                             kinds.count('animation'), kinds.count('audio'), videos_with_audio, tracks)
+        except bot.WorkerFailure as exc:
+            log.info('Media probe #%s %s: %s', index, platform, exc.category)
+        except Exception as exc:
+            log.info('Media probe #%s %s: %s', index, platform, type(exc).__name__)
+
+
 def run() -> None:
     deadline = os.getenv('SOURCE_PROBE_UNTIL', '').strip()
     if not deadline:
@@ -252,6 +281,14 @@ def run() -> None:
     snap = os.getenv('SOURCE_PROBE_SPOTLIGHT_ID', '').strip()
     youtube = os.getenv('SOURCE_PROBE_YOUTUBE_IDS', '').strip()
     pinterest = os.getenv('SOURCE_PROBE_PIN_CODE', '').strip()
+    urls = os.getenv('SOURCE_PROBE_URLS', '')
+    if urls:
+        try:
+            inputs = json.loads(urls)
+        except ValueError:
+            inputs = []
+        if isinstance(inputs, list):
+            asyncio.run(probe_downloads(inputs))
     if snap:
         probe_snapchat(snap)
     if youtube:

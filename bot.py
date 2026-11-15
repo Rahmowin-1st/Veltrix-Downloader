@@ -35,16 +35,19 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, InputMediaVideo, InputMediaAudio, Update
+from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, InputMediaVideo,
+                      InputMediaAudio, InputMediaDocument, MessageEntity, Update)
 from telegram.constants import ChatAction
 from telegram.error import BadRequest, Conflict, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 from cobalt_provider import ProviderError
+from source_metadata import IncompletePost, media_quality
+from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.9.1"
+VERSION = "9.10.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -91,7 +94,12 @@ _metadata_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 METADATA_CACHE_TTL = 60.0
 
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
-YT_ID_RE = re.compile(r"(?:v=|/shorts/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})")
+YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+YT_POST_RE = re.compile(r'^/(?:(?:@|%40)[^/]+/)?post/([A-Za-z0-9_-]+)/?$', re.I)
+INSTAGRAM_POST_RE = re.compile(r"^/(reels?|p|tv)/([A-Za-z0-9_-]+)(?:/embed(?:/captioned)?)?/?$", re.I)
+PINTEREST_PIN_RE = re.compile(r"^/pin/(?:[^/]+--)?(\d+)/?$", re.I)
+SNAP_SPOTLIGHT_RE = re.compile(r'^/(?:(?:@|%40)[^/]+/)?spotlight/([A-Za-z0-9_-]+)(?:/embed)?/?$', re.I)
+SNAP_PROFILE_RE = re.compile(r'^/(?:add/|@|%40)([A-Za-z0-9_.-]+)(?:/(.*))?$', re.I)
 PLATFORMS = {
     "youtube": {"label": "YouTube", "hosts": ("youtube.com", "youtu.be", "youtube-nocookie.com", "music.youtube.com")},
     "instagram": {"label": "Instagram", "hosts": ("instagram.com", "instagr.am")},
@@ -416,15 +424,25 @@ def mp3_button(
 def extract_url(text: str) -> str | None:
     if not text:
         return None
-    match = URL_RE.search(text.strip())
+    match = URL_RE.search(text)
     if not match:
         return None
     url = match.group(0).rstrip(").,]}>\"'")
-    if url.startswith("www."):
+    if url.lower().startswith("www."):
         url = "https://" + url
-    yt = YT_ID_RE.search(url)
-    if yt and platform_of(url) == "youtube":
-        return f"https://www.youtube.com/watch?v={yt.group(1)}"
+    if platform_of(url) == 'youtube':
+        parsed = urlparse(url)
+        parts = parsed.path.strip('/').split('/')
+        if parsed.path.rstrip('/') == '/watch':
+            video_id = parse_qs(parsed.query).get('v', [''])[0]
+        elif (parsed.hostname or '').lower() in {'youtu.be', 'www.youtu.be'} and len(parts) == 1:
+            video_id = parts[0]
+        elif len(parts) == 2 and parts[0] in {'shorts', 'live', 'embed', 'v'}:
+            video_id = parts[1]
+        else:
+            video_id = ''
+        if YT_ID_RE.fullmatch(video_id):
+            return f'https://www.youtube.com/watch?v={video_id}'
     return url
 
 
@@ -434,14 +452,27 @@ def youtube_playlist_url(url: str) -> bool:
             and bool(parse_qs(parsed.query).get('list')))
 
 
+def youtube_post_id(url: str) -> str:
+    parsed = urlparse(url)
+    if match := YT_POST_RE.fullmatch(parsed.path):
+        return match[1]
+    if parsed.path.rstrip('/').endswith('/community'):
+        linked = parse_qs(parsed.query).get('lb', [''])[0]
+        if re.fullmatch(r'[A-Za-z0-9_-]{5,128}', linked):
+            return linked
+    return ''
+
+
 def platform_of(url: str) -> str | None:
     try:
         parsed = urlparse(url)
+        host = (parsed.hostname or '').lower().rstrip('.').removeprefix('www.')
+        if parsed.username is not None or parsed.password is not None:
+            return None
     except ValueError:
         return None
     if parsed.scheme not in {"http", "https"}:
         return None
-    host = (parsed.netloc or "").split("@")[-1].split(":")[0].lower().removeprefix("www.")
     for key, meta in PLATFORMS.items():
         if any(host == suffix or host.endswith("." + suffix) for suffix in meta["hosts"]):
             return key
@@ -487,16 +518,23 @@ def request_headers(url: str | None = None) -> dict[str, str]:
 
 def resolve_public_redirect(url: str) -> str:
     parsed = urlparse(url)
+    platform = platform_of(url)
     # A full Spotlight URL already contains the exact post ID. Probing it here
     # used to fetch the same page twice, including two identical HTTP 404s.
-    if platform_of(url) == "snapchat" and "/spotlight/" in parsed.path.lower():
+    if platform == 'snapchat' and (SNAP_SPOTLIGHT_RE.fullmatch(parsed.path) or SNAP_PROFILE_RE.fullmatch(parsed.path)):
         return url
-    if (parsed.hostname or "").lower() != "pin.it" and platform_of(url) != "snapchat":
+    short_pin = (parsed.hostname or '').lower().removeprefix('www.') == 'pin.it'
+    short_instagram = platform == 'instagram' and parsed.path.lower().startswith('/share/')
+    if not (short_pin or short_instagram or platform == 'snapchat'):
         return url
+    key = f'redirect:{url}'
+    if cached := metadata_cache_get(key):
+        return cached['url']
     try:
         response = fetch_public_page(url)
         final = str(response.url)
-        if platform_of(final) == platform_of(url):
+        if platform_of(final) == platform:
+            metadata_cache_put(key, {'url': final})
             return final
     except Exception as exc:
         log.info("Share resolution failed: %s", type(exc).__name__)
@@ -511,12 +549,12 @@ def extractor_candidates(url: str) -> list[str]:
     try:
         parsed = urlparse(resolved)
         if platform == "instagram":
-            match = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", parsed.path, re.I)
+            match = INSTAGRAM_POST_RE.fullmatch(parsed.path)
             if match:
                 kind = "reel" if match.group(1).lower() in {"reel", "reels"} else match.group(1).lower()
                 out.insert(0, f"https://www.instagram.com/{kind}/{match.group(2)}/")
         elif platform == "snapchat":
-            match = re.search(r"/(?:@[^/]+/)?spotlight/([A-Za-z0-9_-]+)", parsed.path, re.I)
+            match = SNAP_SPOTLIGHT_RE.fullmatch(parsed.path)
             if match:
                 snap_id = match.group(1)
                 # Keep the resolved @creator route first when available. yt-dlp
@@ -530,7 +568,7 @@ def extractor_candidates(url: str) -> list[str]:
                     f"https://snapchat.com/spotlight/{snap_id}",
                 ])
         elif platform == "pinterest":
-            match = re.search(r"/pin/(?:[\w-]+--)?(\d+)", parsed.path, re.I)
+            match = PINTEREST_PIN_RE.fullmatch(parsed.path)
             if match:
                 out.insert(0, f"https://www.pinterest.com/pin/{match.group(1)}/")
     except Exception:
@@ -543,7 +581,7 @@ def public_page_candidates(url: str) -> list[str]:
     if platform_of(url) == "instagram":
         try:
             parsed = urlparse(url)
-            match = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", parsed.path, re.I)
+            match = INSTAGRAM_POST_RE.fullmatch(parsed.path)
             if match:
                 kind = "reel" if match.group(1).lower() in {"reel", "reels"} else match.group(1).lower()
                 code = match.group(2)
@@ -628,9 +666,8 @@ def base_ydl_opts(tmpdir: str) -> dict[str, Any]:
     return opts
 
 
-def _instagram_format_score(fmt: dict[str, Any], kind: str) -> tuple[int, int, int]:
-    width, height = int(fmt.get("width") or 0), int(fmt.get("height") or 0)
-    return (width * height or height, int(fmt.get("has_audio", True)), int(fmt.get("bitrate") or 0))
+def _instagram_format_score(fmt: dict[str, Any], kind: str) -> tuple[float, float, float]:
+    return media_quality(fmt)
 
 
 def extract_instagram_public(url: str) -> dict[str, Any]:
@@ -650,8 +687,14 @@ def extract_instagram_public(url: str) -> dict[str, Any]:
     )
     from source_metadata import instagram_extractor
     downloader = instagram_extractor(downloader)
-    info = downloader.get_info(extractor_candidates(url)[0])
+    candidate = extractor_candidates(url)[0]
+    match = INSTAGRAM_POST_RE.fullmatch(urlparse(candidate).path)
+    if not match:
+        return {}
+    info = downloader.get_info(candidate)
     payload = info if isinstance(info, dict) else {}
+    if payload.get('id') not in {None, '', 'unknown', match[2]}:
+        raise RuntimeError('Instagram returned media for a different post')
     metadata_cache_put(cache_key, payload)
     return payload
 
@@ -666,7 +709,7 @@ def attach_post_music(video: Path, music: Path, folder: Path, *, loop_audio: boo
     try:
         ffmpeg(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(video),
                 *(['-stream_loop', '-1'] if loop_audio else []), '-i', str(music),
-                '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k',
+                '-map', '0:V:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k',
                 *([] if loop_audio else ['-af', 'apad']), '-shortest', str(output)])
         if not has_audio(output):
             raise RuntimeError('Could not attach the source audio to its video')
@@ -720,75 +763,17 @@ def download_instagram_dedicated(
     if not entries:
         return [], str(info.get("type") or "").lower()
 
-    dest = Path(tmpdir) / "instagram"
-    dest.mkdir(parents=True, exist_ok=True)
-    outputs: list[Path] = []
-
-    if len(entries) > MAX_GALLERY_ITEMS:
-        raise RuntimeError("Post exceeds the configured item limit; nothing was truncated.")
-    for index, entry in enumerate(entries, 1):
-        if not isinstance(entry, dict):
-            continue
-        kind = str(entry.get("kind") or "").lower()
-        if kind not in {"video", "image"}:
-            continue
-        formats = [
-            fmt for fmt in (entry.get("formats") or [])
-            if isinstance(fmt, dict) and fmt.get("url")
-        ]
-        formats.sort(key=lambda fmt: (kind != "video" or fmt.get("has_audio", True),
-                                      _instagram_format_score(fmt, kind)), reverse=True)
-
-        silent_fallback = None
-
-        for variant, fmt in enumerate(formats):
-            media_url = str(fmt.get("url") or "")
-            if not media_url or not safe_remote_url(media_url):
-                continue
-            path_ext = Path(urlparse(media_url).path).suffix.lower()
-            if kind == "video":
-                ext = path_ext if path_ext in {".mp4", ".m4v", ".mov", ".webm"} else ".mp4"
-            else:
-                ext = path_ext if path_ext in {".jpg", ".jpeg", ".png", ".webp", ".avif"} else ".jpg"
-            out = dest / f"{index:02d}_{kind}_{variant:02d}{ext}"
-            if _download_direct_file(media_url, out, referer="https://www.instagram.com/"):
-                if classify(out) != kind:
-                    out.unlink(missing_ok=True)
-                    continue
-                if kind == 'video' and not has_audio(out) and len(formats) > 1:
-                    # Keep the highest exposed silent rendition if no other
-                    # variant contains the post's actual audio stream.
-                    silent_fallback = silent_fallback or out
-                    continue
-                outputs.append(out)
-                break
-        else:
-            if silent_fallback is not None:
-                outputs.append(silent_fallback)
-
-    if len(outputs) != len(entries):
-        raise RuntimeError(f"Incomplete carousel: downloaded {len(outputs)}/{len(entries)} items.")
-    for index, (entry, path) in enumerate(zip(entries, outputs)):
-        outputs[index] = attach_item_audio(path, entry.get('audio_urls') or [], dest / f'item_{index:05d}', url)
-    audio_files = []
-    for index, audio_url in enumerate(info.get("audio_urls") or []):
-        audio = Path(tmpdir) / "soundtrack" / f"{index:05d}.m4a"
-        if _download_direct_file(audio_url, audio, referer=url):
-            if not has_audio(audio):
-                audio.unlink(missing_ok=True)
-            else:
-                audio_files.append(audio)
-    if len(audio_files) == 1 and len(info.get('audio_urls') or []) == 1:
-        augmented = []
-        for path in outputs:
-            if classify(path) == 'video' and not has_audio(path):
-                try:
-                    path = attach_post_music(path, audio_files[0], dest / 'post_music_video')
-                except (RuntimeError, OSError) as exc:
-                    log.warning('Instagram post soundtrack could not be merged: %s', type(exc).__name__)
-            augmented.append(path)
-        outputs = augmented
-    return validate_media_files(outputs), str(info.get("type") or "").lower()
+    media = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get('kind') not in {'video', 'image'}:
+            raise RuntimeError('Incomplete Instagram carousel metadata')
+        formats = [fmt for fmt in (entry.get('formats') or [])
+                   if isinstance(fmt, dict) and fmt.get('url')]
+        media.append({**entry, 'formats': sorted(formats, key=media_quality, reverse=True)})
+    media.extend({'kind': 'audio', 'scope': 'post', 'formats': [{'url': url}]}
+                 for url in dict.fromkeys(info.get('audio_urls') or []))
+    files = download_source_entries(media, Path(tmpdir) / 'instagram', url)
+    return files, str(info.get('type') or '').lower()
 
 
 def _dig_dict(node: Any, *keys: str) -> dict[str, Any]:
@@ -801,7 +786,7 @@ def _dig_dict(node: Any, *keys: str) -> dict[str, Any]:
 
 
 def _snap_requested_id(url: str, doc: dict[str, Any]) -> str:
-    match = re.search(r"/(?:@[^/]+/)?spotlight/([A-Za-z0-9_-]+)", urlparse(url).path, re.I)
+    match = SNAP_SPOTLIGHT_RE.fullmatch(urlparse(url).path)
     if match:
         return match.group(1)
     query = doc.get("query") if isinstance(doc.get("query"), dict) else {}
@@ -908,7 +893,7 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
     if cached:
         return cached
     candidates = extractor_candidates(url)[:3]
-    snap_id = _snap_requested_id(url, {})
+    snap_id = _snap_requested_id(candidates[0], {})
     if snap_id:
         candidates.append(f"https://www.snapchat.com/spotlight/{snap_id}/embed")
     for candidate in dict.fromkeys(candidates):
@@ -917,29 +902,27 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
         except (httpx.HTTPError, RuntimeError):
             continue
         page_url = str(response.url)
-        if _snap_requested_id(page_url, {}) and _snap_requested_id(page_url, {}) != _snap_requested_id(candidate, {}):
+        if platform_of(page_url) != 'snapchat':
+            continue
+        candidate_id = _snap_requested_id(candidate, {})
+        if candidate_id and _snap_requested_id(page_url, {}) != candidate_id:
             continue
         match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', response.text, re.I | re.S)
-        if not match:
-            if "/spotlight/" in urlparse(candidate).path:
-                info = _snap_info_from_exact_page(response.text, page_url)
-                if not info and _snap_page_owns_spotlight(response.text, page_url):
-                    info = snapchat_preload(response.text)
-                if info:
-                    metadata_cache_put(f"snapchat:{url}", info)
-                    return info
-            continue
         try:
-            doc = json.loads(match.group(1))
+            doc = json.loads(match.group(1)) if match else {}
         except ValueError:
-            continue
-        if "/spotlight/" in urlparse(candidate).path:
+            doc = {}
+        if candidate_id:
             info = _snap_info_from_doc(doc, page_url)
             if info:
                 info["entries"] = [{"url": info["url"], "kind": "video"}]
-            elif str(_dig_dict(doc, 'query').get('snapID') or '') == _snap_requested_id(page_url, {}):
-                info = snapchat_preload(response.text)
+            elif _snap_page_owns_spotlight(response.text, page_url):
+                info = _snap_info_from_exact_page(response.text, page_url) or snapchat_preload(response.text)
         else:
+            profile = SNAP_PROFILE_RE.fullmatch(urlparse(candidate).path)
+            redirected_profile = SNAP_PROFILE_RE.fullmatch(urlparse(page_url).path)
+            if not profile or not redirected_profile or profile[1].casefold() != redirected_profile[1].casefold():
+                continue
             entries = snapchat_story_entries(doc, candidate)
             info = {"entries": entries, "title": "Snapchat story"} if entries else {}
         if info:
@@ -951,16 +934,8 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
 def download_snapchat_dedicated(url: str, tmpdir: str, info: dict[str, Any] | None = None) -> list[Path]:
     info = info or extract_snapchat_public(url)
     entries = info.get("entries") or ([{"url": info["url"], "kind": "video"}] if info.get("url") else [])
-    if len(entries) > MAX_GALLERY_ITEMS:
-        raise RuntimeError("Story exceeds the configured item limit; nothing was truncated.")
-    outputs = []
-    for index, entry in enumerate(entries, 1):
-        kind = entry["kind"]
-        out = Path(tmpdir) / "snapchat" / f"{index:05d}{'.jpg' if kind == 'image' else '.mp4'}"
-        if not _download_direct_file(entry["url"], out, referer="https://www.snapchat.com/"):
-            raise RuntimeError(f"Incomplete story: downloaded {len(outputs)}/{len(entries)} items")
-        outputs.append(out)
-    return validate_media_files(outputs)
+    media = [{**entry, 'formats': entry.get('formats') or [{'url': entry['url']}]} for entry in entries]
+    return download_source_entries(media, Path(tmpdir) / 'snapchat', 'https://www.snapchat.com/')
 
 
 def files_in(root: Path) -> list[Path]:
@@ -989,17 +964,50 @@ def video_chain(height: int) -> list[str]:
 
 def requested_audio_track(entry: dict[str, Any]) -> bool:
     """Check the formats yt-dlp selected, rather than guessing from a file name."""
-    tracks = entry.get('requested_formats') or []
-    if not tracks:
-        tracks = [entry]
+    tracks = list(entry.get('requested_formats') or [entry])
+    for item in entry.get('requested_downloads') or []:
+        if isinstance(item, dict):
+            tracks.extend(item.get('requested_formats') or [item])
     return any(str(track.get('acodec') or 'none').lower() != 'none'
                for track in tracks if isinstance(track, dict))
+
+
+def final_downloads(info: dict, folder: Path) -> list[Path]:
+    """Pair each extractor entry with its final file, in playlist order."""
+    if not isinstance(info, dict) or not info:
+        return []
+    collection = info.get('_type') in {'playlist', 'multi_video'}
+    entries = list(info.get('entries') or []) if collection else [info]
+    if len(entries) > MAX_GALLERY_ITEMS:
+        raise RuntimeError('Collection exceeds configured item limit')
+    files = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return []
+        downloads = entry.get('requested_downloads') or [entry]
+        names = [item.get('filepath') for item in downloads if isinstance(item, dict)]
+        if len(names) == 1 and names[0]:
+            path = Path(names[0])
+            if not path.is_file() or re.search(r'\.(?:part|ytdl)$', path.name, re.I):
+                return []
+            files.append(path)
+        elif not collection and len(names) == 1 and not names[0]:
+            possible = files_in(folder)
+            if len(possible) != 1:
+                return []
+            files.extend(possible)
+        else:
+            return []
+    return files
 
 
 def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     base = base_ydl_opts(tmpdir)
     base['noplaylist'] = not youtube_playlist_url(url)
-    cookie_file = os.getenv(f"{(platform_of(url) or '').upper()}_COOKIE_FILE", "")
+    platform = platform_of(url)
+    if platform == 'youtube' and mode not in AUDIO_PRESETS:
+        base.update(format_sort=['res', 'fps', 'hdr:12'], format_sort_force=True)
+    cookie_file = os.getenv(f"{(platform or '').upper()}_COOKIE_FILE", "")
     if cookie_file and Path(cookie_file).is_file():
         base["cookiefile"] = cookie_file
     attempts: list[tuple[str, dict[str, Any]]] = []
@@ -1007,6 +1015,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
         # yt-dlp ranks all exposed formats; no hidden resolution ceiling.
         # A music-only link may expose no video format at all.
         attempts = [("bv*+ba/b/ba", {})]
+        if platform == 'youtube' and base['noplaylist']:
+            attempts.append(("b", {}))
     elif mode in VIDEO_PRESETS:
         attempts = [(fmt, {}) for fmt in video_chain(int(VIDEO_PRESETS[mode]["height"]))]
     elif mode in AUDIO_PRESETS:
@@ -1036,24 +1046,11 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
                 opts.update(extra)
                 with YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(candidate, download=True)
-                files = files_in(attempt_dir)
                 if not info:
                     raise RuntimeError("Extractor returned no media metadata")
                 entries = list(info.get("entries") or []) if info.get("_type") in {"playlist", "multi_video"} else [info]
-                if any(e is None for e in entries) or len(entries) > MAX_GALLERY_ITEMS:
-                    raise RuntimeError("Incomplete collection or configured item limit exceeded")
-                # Only postprocessed final paths, never leftover video-only/audio-only fragments.
-                expected = []
-                for entry in entries:
-                    for item in entry.get("requested_downloads") or [entry]:
-                        name = item.get("filepath") or entry.get("filepath")
-                        if name and Path(name).is_file(): expected.append(Path(name))
-                if expected:
-                    files = expected
-                complete = [p for p in files if p.suffix.lower() not in {".part", ".ytdl"}]
-                if mode in AUDIO_PRESETS:
-                    complete = [p for p in complete if classify(p) in {"audio", "video", "animation"}]
-                elif platform_of(url) == "youtube" or is_video_post_url(url):
+                complete = final_downloads(info, attempt_dir)
+                if platform == 'youtube' or is_video_post_url(url):
                     complete = [p for p in complete if classify(p) in {"video", "audio"}]
                 if len(complete) != len(entries):
                     raise RuntimeError("Incomplete collection: some media files are missing")
@@ -1067,6 +1064,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
             except Exception as exc:
                 if fatal_download_error(exc):
                     raise
+                if re.search(r"confirm you[’']re not a bot|login required|sign in to (?:confirm|view|watch)|private video", str(exc), re.I):
+                    raise
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), type(exc).__name__)
             shutil.rmtree(attempt_dir, ignore_errors=True)
@@ -1075,6 +1074,22 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     if last:
         raise last
     return []
+
+
+def download_youtube_post(url: str, mode: str, tmpdir: str, post_id: str) -> list[Path]:
+    from source_metadata import youtube_photo_entries, youtube_post_attachment
+
+    page = fetch_public_page(f'https://www.youtube.com/post/{post_id}')
+    attachment = youtube_post_attachment(page.text, post_id)
+    for name in ('videoRenderer', 'compactVideoRenderer'):
+        video = attachment.get(name)
+        video_id = video.get('videoId') if isinstance(video, dict) else None
+        if isinstance(video_id, str) and YT_ID_RE.fullmatch(video_id):
+            return download_ytdlp(f'https://www.youtube.com/watch?v={video_id}', mode, tmpdir)
+    entries = youtube_photo_entries(attachment)
+    if not entries:
+        raise RuntimeError('This YouTube Community post has no accessible media attachment')
+    return download_source_entries(entries, Path(tmpdir) / 'youtube_post', url)
 
 
 def _pinterest_quality_score(fmt: dict[str, Any]) -> tuple[int, int, int]:
@@ -1133,7 +1148,10 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
     if platform == "instagram":
         from source_metadata import instagram_dash_audio_urls
         media = []
+        requested = INSTAGRAM_POST_RE.fullmatch(urlparse(url).path)
         for _, media_url, meta in entries:
+            if requested and meta.get('post_shortcode') not in {None, '', requested[2]}:
+                raise RuntimeError('Instagram returned media for a different post')
             if meta.get('audio_url'):
                 media.append({'kind': 'audio', 'formats': [{'url': meta['audio_url']}],
                               'scope': 'post' if meta.get('type') in {'post', 'reel'} else None})
@@ -1153,7 +1171,13 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
     if platform == "pinterest":
         from source_metadata import pinterest_entries
         pins = [row[-1] for row in manifest if isinstance(row, list) and row and row[0] == 2
-                and isinstance(row[-1], dict) and any(k in row[-1] for k in ("images", "videos", "carousel_data", "story_pin_data"))]
+                and isinstance(row[-1], dict) and any(k in row[-1] for k in ('images', 'videos', 'carousel_data', 'story_pin_data', 'audio'))]
+        requested = PINTEREST_PIN_RE.fullmatch(urlparse(url).path)
+        if requested and pins:
+            pins = [pin for pin in pins if str(pin.get('id')) == requested[1]]
+            if not pins:
+                raise RuntimeError('Pinterest returned metadata for a different Pin')
+            pins = [max(pins, key=lambda pin: (bool(pin.get('story_pin_data') or pin.get('carousel_data')), len(pin)))]
         if pins:
             # Reconstruct from full pin metadata: gallery-dl's carousel path
             # chooses an image even for a video slot.
@@ -1196,6 +1220,7 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
     soundtrack = []
     post_music = []
     includes_visual = any(entry['kind'] != 'audio' for entry in entries)
+    expected = tuple(entry['kind'] for entry in entries if not includes_visual or entry['kind'] != 'audio')
     for index, entry in enumerate(entries):
         # An audio block is an optional MP3 source for a visual post. Telegram
         # cannot put it inside the same photo/video album, and the user asked
@@ -1204,48 +1229,65 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
         folder.mkdir(parents=True, exist_ok=True)
         completed = None
         silent_fallback = None
+        source_limit = None
+        tried_item_audio = False
+        used_urls = set()
         for variant, fmt in enumerate(entry["formats"]):
             url = fmt.get("url") or ""
-            if not safe_remote_url(url):
+            if not isinstance(url, str) or url in used_urls or not safe_remote_url(url):
                 continue
+            used_urls.add(url)
+            variant_dir = folder / f'variant_{variant}'
             try:
                 if urlparse(url).path.lower().endswith(('.m3u8', '.mpd')):
-                    variant_dir = folder / f'variant_{variant}'
                     opts = base_ydl_opts(str(variant_dir))
                     selector = 'ba/b' if entry['kind'] == 'audio' else 'bv*+ba/b'
-                    opts.update(format=selector, outtmpl=str(variant_dir / 'media.%(ext)s'))
+                    opts.update(format=selector, outtmpl=str(variant_dir / 'media.%(ext)s'),
+                                http_headers={**request_headers(referer), 'Referer': referer})
                     with YoutubeDL(opts) as ydl:
                         info = ydl.extract_info(url, download=True)
-                    found = [Path(x["filepath"]) for x in info.get("requested_downloads", []) if x.get("filepath")]
-                    found = found or files_in(variant_dir)
+                    found = final_downloads(info, variant_dir)
                     if len(found) != 1:
                         continue
                     path = found[0]
                 else:
                     ext = Path(urlparse(url).path).suffix
-                    ext = ext if re.fullmatch(r"\.[a-zA-Z0-9]{1,8}", ext) else ".bin"
-                    path = folder / f"{variant}{ext}"
+                    if not re.fullmatch(r'\.[a-zA-Z0-9]{1,8}', ext):
+                        ext = {'image': '.jpg', 'video': '.mp4', 'animation': '.gif', 'audio': '.m4a'}[entry['kind']]
+                    variant_dir.mkdir()
+                    path = variant_dir / f'media{ext}'
                     if not _download_direct_file(url, path, referer=referer):
                         continue
                 validate_media_files([path])
                 actual = classify(path)
                 if actual != entry["kind"] and not (entry["kind"] == "image" and actual == "animation"):
                     continue
-                if entry["kind"] == "video" and not has_audio(path) and len(entry["formats"]) > 1:
-                    silent_fallback = silent_fallback or path
-                    continue
+                if entry['kind'] == 'video' and not has_audio(path):
+                    if not tried_item_audio and entry.get('audio_urls'):
+                        tried_item_audio = True
+                        path = attach_item_audio(path, entry['audio_urls'], variant_dir, referer)
+                    if not has_audio(path):
+                        silent_fallback = silent_fallback or path
+                        continue
                 completed = path
                 break
+            except TransferLimit as exc:
+                source_limit = exc
             except Exception as exc:
                 if fatal_download_error(exc):
                     raise
                 log.warning("Source variant failed: %s", type(exc).__name__)
+            finally:
+                if not any(p and p.is_relative_to(variant_dir) for p in (completed, silent_fallback)):
+                    shutil.rmtree(variant_dir, ignore_errors=True)
         completed = completed or silent_fallback
         if completed is None:
             if entry['kind'] == 'audio' and includes_visual:
-                shutil.rmtree(folder)
+                shutil.rmtree(folder, ignore_errors=True)
                 continue
-            raise RuntimeError(f"Incomplete post: item {index + 1}/{len(entries)} unavailable; poster substitution refused")
+            if source_limit:
+                raise source_limit
+            raise IncompletePost(f'Incomplete carousel or post: item {index + 1}/{len(entries)} unavailable', expected)
         if entry['kind'] == 'audio':
             for unused in files_in(folder):
                 if unused != completed:
@@ -1254,7 +1296,9 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
             if entry.get('scope') == 'post':
                 post_music.append(completed)
         else:
-            outputs.append(attach_item_audio(completed, entry.get('audio_urls') or [], folder, referer))
+            if silent_fallback and completed != silent_fallback:
+                shutil.rmtree(silent_fallback.parent, ignore_errors=True)
+            outputs.append(completed)
     if len(post_music) == 1 and outputs:
         augmented = []
         for path in outputs:
@@ -1272,14 +1316,20 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
 def download_pinterest_page(url: str, tmpdir: str) -> list[Path]:
     from source_metadata import find_pinterest_pin, pinterest_entries
     resolved = resolve_public_redirect(url)
-    match = re.search(r"/pin/(?:[\w-]+--)?(\d+)", urlparse(resolved).path)
+    match = PINTEREST_PIN_RE.fullmatch(urlparse(resolved).path)
     if not match:
         return []
     page = fetch_public_page(resolved)
+    if platform_of(str(page.url)) != 'pinterest' or PINTEREST_PIN_RE.fullmatch(urlparse(str(page.url)).path) is None:
+        return []
+    decoder = json.JSONDecoder()
     matches = []
     for raw in re.findall(r"<script\b[^>]*>(.*?)</script>", page.text, re.I | re.S):
+        raw = raw.lstrip()
+        if raw.startswith(('window.__PWS_DATA__', 'window.__PWS_INITIAL_PROPS__')):
+            raw = raw.partition('=')[2].lstrip()
         try:
-            document = json.loads(raw)
+            document, _ = decoder.raw_decode(raw)
         except (ValueError, TypeError):
             continue
         pin = find_pinterest_pin(document, match.group(1))
@@ -1418,6 +1468,10 @@ def friendly_error(platform: str, exc: Exception) -> str:
     text = str(exc)
     low = text.lower()
     label = PLATFORMS.get(platform, {}).get("label", "Media")
+    if 'no accessible media attachment' in low:
+        return f'{label}: this post has no accessible media attachment.'
+    if 'original file exceeds the telegram upload limit' in low:
+        return 'This original file exceeds Telegram’s upload limit. Send the link on its own to try playable parts.'
     if "429" in low or "too many requests" in low or "rate-limit" in low or "rate limit" in low:
         return f"{label}: temporarily rate-limited. Please wait before trying again."
     if "storage" in low or "no space left" in low:
@@ -1519,6 +1573,11 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
         raise RuntimeError("Not enough free storage for a download")
     # Source-aware parsers only: page-wide URL scans can leak recommendations/posters.
     errors = []
+    youtube_post = youtube_post_id(url) if platform == 'youtube' else ''
+    if youtube_post:
+        return download_youtube_post(url, mode, tmpdir, youtube_post)
+    if platform == 'instagram':
+        url = resolve_public_redirect(url)
     if platform == "youtube":
         engines = [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
     elif platform == "instagram":
@@ -1544,11 +1603,13 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     candidate_kinds: list[str] = []
     candidate_sound: set[int] = set()
     candidate_tracks: list[Path] = []
+    required_layouts: set[tuple[str, ...]] = set()
     audio_mode = mode in AUDIO_PRESETS
     for engine in engines:
         attempt = Path(tempfile.mkdtemp(prefix='extractor_', dir=tmpdir))
         try:
-            extract_mode = AUTO_MODE if audio_mode and len(candidate) > 1 else mode
+            has_collection = len(candidate) > 1 or any(len(layout) > 1 for layout in required_layouts)
+            extract_mode = AUTO_MODE if audio_mode and has_collection else mode
             files = engine(str(attempt), extract_mode)
             if not files:
                 shutil.rmtree(attempt, ignore_errors=True)
@@ -1560,8 +1621,12 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 raise RuntimeError("Source file exceeds configured storage limit")
             files = validate_media_files(files)
             kinds = [classify(p) for p in files]
-            if mode not in AUDIO_PRESETS and is_video_post_url(url) and any(kind != "video" for kind in kinds):
+            if not audio_mode and is_video_post_url(url) and any(kind != 'video' for kind in kinds):
                 raise RuntimeError("Video post returned a poster instead of video")
+            layout = tuple('image' if kind == 'animation' else kind for kind in kinds)
+            if required_layouts and required_layouts != {layout}:
+                shutil.rmtree(attempt, ignore_errors=True)
+                continue
             tracks = [p for p in files_in(attempt / 'soundtrack') if p not in files and has_audio(p)]
             video_indices = {i for i, kind in enumerate(kinds) if kind == 'video'}
             sound = {i for i in video_indices if has_audio(files[i])}
@@ -1591,7 +1656,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
             # complete silent candidate exists.
             incomplete = any(word in str(exc).lower() for word in ('incomplete', 'truncated'))
             lost_audio = str(exc) == 'Incomplete source video audio track'
-            if fatal_download_error(exc) and not lost_audio and (not candidate or not incomplete):
+            if isinstance(exc, IncompletePost):
+                required_layouts.add(tuple('image' if kind == 'animation' else kind for kind in exc.expected_kinds))
+            elif fatal_download_error(exc) and not lost_audio and (not candidate or not incomplete):
                 raise
             # A provider configuration/outage error must not hide the actual
             # platform failure (e.g. YouTube's bot check) from the user.
@@ -1600,7 +1667,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
             log.warning("%s extractor failed: %s", platform, type(exc).__name__)
         if not any(p.is_relative_to(attempt) for p in candidate + candidate_tracks):
             shutil.rmtree(attempt, ignore_errors=True)
-    if candidate:
+    final_layout = tuple('image' if kind == 'animation' else kind for kind in candidate_kinds)
+    if candidate and (not required_layouts or required_layouts == {final_layout}):
         if candidate_tracks:
             soundtrack = Path(tmpdir) / 'soundtrack'
             soundtrack.mkdir(exist_ok=True)
@@ -1608,7 +1676,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 path.rename(soundtrack / f'{index:05d}{path.suffix}')
         return candidate
     if errors:
-        raise errors[-1]
+        raise next((exc for exc in errors if isinstance(exc, IncompletePost)), errors[-1])
     raise RuntimeError("No public downloadable media found")
 
 
@@ -1746,12 +1814,22 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "📥 Send a YouTube, Instagram, Snapchat or Pinterest media link.\n"
         "🎬 Highest available quality; large videos may arrive in parts.\n"
-        "🎵 After a video is sent, tap MP3 to get audio."
+        "🎵 Tap MP3 after delivery to get audio.\n"
+        "📎 Use /original followed by the link to receive source files without Telegram photo compression or video conversion."
     )
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("⚙️ Quality is automatic. No setup needed.")
+
+
+async def cmd_original(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    url = extract_url(' '.join(context.args or []))
+    if not url or not platform_of(url):
+        await msg.reply_text('Use /original followed by a YouTube, Instagram, Snapchat or Pinterest link.')
+        return
+    await dispatch_job(msg, context, update.effective_user.id, url, 'original')
 
 
 async def edit_status(status, text: str, reply_markup=None) -> bool:
@@ -1773,7 +1851,13 @@ async def edit_status(status, text: str, reply_markup=None) -> bool:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     uid = update.effective_user.id
-    url = extract_url(msg.text or msg.caption or "")
+    content = msg.text or msg.caption or ''
+    parse_entities = getattr(msg, 'parse_entities' if msg.text else 'parse_caption_entities', None)
+    links = ([entity.url for entity in parse_entities(types=[MessageEntity.TEXT_LINK])]
+             if parse_entities else [])
+    links.extend(match.group() for match in URL_RE.finditer(content))
+    urls = list(filter(None, map(extract_url, links)))
+    url = next((value for value in urls if platform_of(value)), urls[0] if urls else None)
     if not url:
         await msg.reply_text("Send a YouTube, Instagram, Snapchat or Pinterest link to download its media.")
         return
@@ -1816,9 +1900,9 @@ class DeferredStatus:
 async def dispatch_job(msg, context, uid: int, url: str, mode: str, action=None) -> None:
     url = extract_url(url) or url
     if platform_of(url) == "instagram":
-        match = re.search(r"/(reels?|p|tv)/([A-Za-z0-9_-]+)", urlparse(url).path)
+        match = INSTAGRAM_POST_RE.fullmatch(urlparse(url).path)
         if match:
-            kind = "reel" if match[1] in {"reel", "reels"} else match[1]
+            kind = 'reel' if match[1].lower() in {'reel', 'reels'} else match[1].lower()
             url = f"https://www.instagram.com/{kind}/{match[2]}/"
     manager = job_manager()
     result, row = manager.admit(uid, msg.chat_id, url, mode, getattr(msg, "message_thread_id", None))
@@ -1963,7 +2047,8 @@ def audio_sources(files: list[Path], soundtrack_dir: Path) -> list[Path]:
     return [p for p in unique if has_audio(p)]
 
 
-async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None) -> int:
+async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None,
+                     *, originals: bool = False) -> int:
     """Preserve order; group compatible native types in batches of at most ten."""
     from media_io import lossless_parts, native_audio, native_video
     prepared = []
@@ -1972,10 +2057,21 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
             progress["phase"] = f"Preparing media {index + 1}/{len(files)}"
         folder = tmp / "delivery" / str(index)
         kind = await asyncio.to_thread(classify, path)
+        if originals:
+            if path.stat().st_size > MAX_BYTES:
+                raise RuntimeError('Original file exceeds the Telegram upload limit')
+            prepared.append(('document', path))
+            continue
         if kind == "image":
             prepared.append(("image", await asyncio.to_thread(fit_image, path, folder)))
         elif kind in {"video", "animation"}:
-            final = await asyncio.to_thread(native_video, path, folder)
+            try:
+                final = await asyncio.to_thread(native_video, path, folder)
+            except (RuntimeError, OSError, ImportError, subprocess.SubprocessError):
+                if path.stat().st_size > MAX_BYTES:
+                    raise
+                prepared.append(('document', path))
+                continue
             parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", MAX_BYTES)
             delivery_kind = "animation" if kind == "animation" and len(files) == len(parts) == 1 else "video"
             prepared.extend((delivery_kind, part) for part in parts)
@@ -1986,11 +2082,12 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         else:
             raise RuntimeError("Unsupported media type; no photo substitution performed")
     sent = 0
+    families = {'image': 'visual', 'video': 'visual', 'animation': 'visual', 'audio': 'audio', 'document': 'document'}
     while sent < len(prepared):
-        family = "audio" if prepared[sent][0] == "audio" else "visual"
+        family = families[prepared[sent][0]]
         batch = []
         for kind, path in prepared[sent:sent + 10]:
-            if ("audio" if kind == "audio" else "visual") != family:
+            if families[kind] != family:
                 break
             batch.append((kind, path))
         label = caption if not sent else ""
@@ -2010,8 +2107,11 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                             return await msg.reply_video(video=upload, caption=item_caption, supports_streaming=True)
                         if kind == "animation":
                             return await msg.reply_animation(animation=upload, caption=item_caption)
+                        if kind == 'document':
+                            return await msg.reply_document(document=upload, caption=item_caption, disable_content_type_detection=True)
                         return await msg.reply_audio(audio=upload, caption=item_caption)
-                    cls = {"image": InputMediaPhoto, "video": InputMediaVideo, "audio": InputMediaAudio}[kind]
+                    cls = {'image': InputMediaPhoto, 'video': InputMediaVideo, 'audio': InputMediaAudio,
+                           'document': InputMediaDocument}[kind]
                     kwargs = {"supports_streaming": True} if kind == "video" else {}
                     media.append(cls(media=upload, caption=item_caption, **kwargs))
                 return await msg.reply_media_group(media=media)
@@ -2304,7 +2404,10 @@ async def run_job(
                 silent_videos = kinds.count('video') - with_sound
                 if silent_videos:
                     caption += f"\n🔇 Audio unavailable in {silent_videos} source video(s)."
-                sent = await send_album(msg, files, caption, tmp, progress)
+                if mode == 'original':
+                    sent = await send_album(msg, files, caption, tmp, progress, originals=True)
+                else:
+                    sent = await send_album(msg, files, caption, tmp, progress)
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned")
                 delivered = True
@@ -2491,21 +2594,29 @@ def _fetch_public_page_once(url: str) -> httpx.Response:
 
 def snapchat_story_entries(doc: dict, url: str) -> list[dict]:
     props = _dig_dict(doc, "props", "pageProps")
-    match = re.search(r"/(?:add|@)/?([^/]+)(?:/([^/?]+))?", urlparse(url).path)
-    requested = match.group(2) if match else None
-    if requested in {"story", "stories"}:
-        requested = None
-    story = props.get("story") or {}
-    snaps = list(story.get("snapList") or [])
-    if not snaps and not requested:
-        # Only an explicitly linked public profile can select its current highlight.
-        highlights = props.get("curatedHighlights") or []
-        if highlights:
-            snaps = list(highlights[0].get("snapList") or [])
-    if requested:
-        snaps = [s for s in snaps if str((s.get("snapId") or {}).get("value")) == requested]
+    match = SNAP_PROFILE_RE.fullmatch(urlparse(url).path)
+    if not match:
+        return []
+    requested = (match[2] or '').strip('/').rsplit('/', 1)[-1]
+    if requested in {'story', 'stories', 'highlights'}:
+        requested = ''
+    story = _dig_dict(props, 'story')
+    highlights = [row for row in (props.get('curatedHighlights') or []) if isinstance(row, dict)]
+    snaps = story.get('snapList') or []
+    if not requested:
+        if not snaps and len(highlights) == 1:
+            snaps = highlights[0].get('snapList') or []
+    else:
+        snaps = [snap for group in [story, *highlights] for snap in (group.get('snapList') or [])
+                 if isinstance(snap, dict) and _dig_dict(snap, 'snapId').get('value') == requested]
+        if not snaps:
+            selected = next((group for group in highlights
+                             if _dig_dict(group, 'highlightId').get('value') == requested), {})
+            snaps = selected.get('snapList') or []
     output = []
     for snap in snaps:
+        if not isinstance(snap, dict):
+            raise RuntimeError('Incomplete story metadata')
         urls = snap.get("snapUrls") or {}
         media_url = urls.get("mediaUrl")
         if isinstance(media_url, dict):
@@ -2669,8 +2780,10 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler('original', cmd_original))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    caption_links = filters.CaptionRegex(URL_RE) | filters.CaptionEntity(MessageEntity.TEXT_LINK)
+    app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | caption_links, on_text))
     app.add_error_handler(on_error)
 
 

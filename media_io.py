@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import tempfile
 from media_process import run
 from functools import lru_cache
 from pathlib import Path
@@ -52,11 +53,18 @@ def media_kind(path: Path) -> str:
     streams = info["streams"]
     video = [s for s in streams if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")]
     audio = any(s.get("codec_type") == "audio" for s in streams)
-    fmt = info.get("format", {}).get("format_name", "")
+    container = info.get('format', {})
+    fmt = container.get('format_name', '')
+    brand = (container.get('tags', {}).get('major_brand') or '').strip()
     if video:
         frames = str(video[0].get("nb_frames") or "1")
-        if "gif" in fmt or "apng" in fmt or (video[0].get("codec_name") == "webp" and frames.isdigit() and int(frames) > 1):
+        if 'gif' in fmt or 'apng' in fmt or brand in {'avis', 'msf1'}:
             return "animation"
+        if video[0].get('codec_name') == 'webp':
+            if (frames.isdigit() and int(frames) > 1) or animated_webp(path):
+                return 'animation'
+        if not audio and brand in {'avif', 'mif1', 'heic', 'heix', 'hevc', 'hevx'}:
+            return 'image'
         if not audio and ("image2" in fmt or "_pipe" in fmt or video[0].get("codec_name") in {"png", "mjpeg", "webp"}):
             if float(info.get("format", {}).get("duration", 0) or 0) <= 0.1:
                 return "image"
@@ -66,11 +74,50 @@ def media_kind(path: Path) -> str:
     raise RuntimeError("Unsupported media streams")
 
 
+def animated_webp(path: Path) -> bool:
+    # WebP's VP8X feature byte is available even on ffprobe builds that only
+    # recognize the container and cannot decode its animated frames.
+    with path.open('rb') as media:
+        header = media.read(21)
+    return (len(header) == 21 and header[:4] == b'RIFF' and header[8:16] == b'WEBPVP8X'
+            and bool(header[20] & 0x02))
+
+
+def webp_video(path: Path, dest: Path) -> Path:
+    """Decode complete WebP frames and retain their order and timestamps."""
+    from PIL import Image
+
+    dest.mkdir(parents=True, exist_ok=True)
+    output = dest / (path.stem + '_animation.mp4')
+    with Image.open(path) as image, tempfile.TemporaryDirectory(dir=dest) as directory:
+        root = Path(directory)
+        with (root / 'frames.ffconcat').open('w', encoding='utf-8') as manifest:
+            manifest.write('ffconcat version 1.0\n')
+            for index in range(image.n_frames):
+                image.seek(index)
+                image.load()
+                frame = Image.new('RGBA', image.size, (0, 0, 0, 255))
+                frame.alpha_composite(image.convert('RGBA'))
+                filename = f'{index:06d}.png'
+                frame.convert('RGB').save(root / filename, compress_level=1)
+                duration = max(1, image.info.get('duration', 100)) / 1000
+                manifest.write(f'file {filename}\noption framerate 1000\nduration {duration:.3f}\n')
+            manifest.write(f'file {filename}\noption framerate 1000\n')
+        run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-f', 'concat', '-safe', '0',
+             '-i', str(root / 'frames.ffconcat'), '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
+             '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p',
+             '-fps_mode', 'vfr', '-enc_time_base', '1/1000', '-movflags', '+faststart', str(output)],
+            capture_output=True, check=True, timeout=900)
+    if not streamable(output):
+        raise RuntimeError('Could not prepare WebP animation')
+    return output
+
+
 def streamable(path: Path) -> bool:
     info = probe(path)
-    videos = [s for s in info["streams"] if s.get("codec_type") == "video"]
+    videos = [s for s in info['streams'] if s.get('codec_type') == 'video' and not s.get('disposition', {}).get('attached_pic')]
     audios = [s for s in info["streams"] if s.get("codec_type") == "audio"]
-    return (path.suffix.lower() == ".mp4" and bool(videos)
+    return (path.suffix.lower() == '.mp4' and 'mp4' in info['format'].get('format_name', '').split(',') and bool(videos)
             and all(s.get("codec_name") == "h264" and s.get("pix_fmt") in {"yuv420p", "yuvj420p"} for s in videos)
             and all(s.get("codec_name") in {"aac", "mp3"} for s in audios))
 
@@ -79,12 +126,12 @@ def prepare_video(path: Path, dest: Path) -> Path:
     """Remux compatible tracks to MP4 without re-encoding a single frame."""
     info = probe(path)
     codecs = {s.get("codec_name") for s in info["streams"] if s.get("codec_type") in {"video", "audio"}}
-    if path.suffix.lower() == ".mp4" or not codecs.issubset({"h264", "aac", "mp3"}):
+    if streamable(path) or not codecs.issubset({'h264', 'aac', 'mp3'}):
         return path
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / (path.stem + ".mp4")
     result = run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
-                             "-map", "0:v:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", str(output)],
+                             "-map", "0:V:0", "-map", "0:a?", "-c", "copy", "-movflags", "+faststart", str(output)],
                             capture_output=True, timeout=900)
     if result.returncode:
         output.unlink(missing_ok=True)
@@ -107,7 +154,7 @@ def lossless_parts(path: Path, dest: Path, limit: int) -> list[Path]:
         folder.mkdir(exist_ok=True)
         result = run([
             "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
-            "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-f", "segment",
+            "-map", "0:V?", "-map", "0:a?", "-c", "copy", "-f", "segment",
             "-segment_time", str(interval), "-reset_timestamps", "1",
             str(folder / ("part%05d" + ext)),
         ], capture_output=True, text=True, timeout=900)
@@ -122,30 +169,34 @@ def lossless_parts(path: Path, dest: Path, limit: int) -> list[Path]:
 
 def native_video(path: Path, dest: Path) -> Path:
     """Prefer remuxing; encode incompatible codecs for Telegram video playback."""
-    original_has_audio = any(s.get('codec_type') == 'audio' for s in probe(path)['streams'])
+    if animated_webp(path):
+        return webp_video(path, dest)
+    streams = probe(path)['streams']
+    audio_count = sum(s.get('codec_type') == 'audio' for s in streams)
     final = prepare_video(path, dest)
     if streamable(final):
-        if original_has_audio and not any(s.get('codec_type') == 'audio' for s in probe(final)['streams']):
+        if sum(s.get('codec_type') == 'audio' for s in probe(final)['streams']) != audio_count:
             raise RuntimeError('Video audio track was lost during remux')
         return final
     dest.mkdir(parents=True, exist_ok=True)
     output = dest / (path.stem + "_playable.mp4")
-    streams = probe(path)["streams"]
     video = next(s for s in streams if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic"))
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
     copy_video = video.get("codec_name") == "h264" and video.get("pix_fmt") in {"yuv420p", "yuvj420p"}
     video_options = ["-c:v", "copy"] if copy_video else [
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
     ]
-    audio_options = ["-c:a", "copy"] if audio and audio.get("codec_name") in {"aac", "mp3"} else ["-c:a", "aac", "-b:a", "256k"]
+    audio_options = ['-c:a', 'copy']
+    for index, audio in enumerate(s for s in streams if s.get('codec_type') == 'audio'):
+        if audio.get('codec_name') not in {'aac', 'mp3'}:
+            audio_options.extend([f'-c:a:{index}', 'aac', f'-b:a:{index}', '256k'])
     result = run([
         "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
-        "-map", f"0:{video['index']}", "-map", "0:a:0?", *video_options,
+        "-map", f"0:{video['index']}", "-map", "0:a?", *video_options,
         *audio_options, "-movflags", "+faststart", str(output),
     ], capture_output=True, timeout=1800)
-    if result.returncode or not streamable(output) or (original_has_audio and not any(
-            s.get('codec_type') == 'audio' for s in probe(output)['streams'])):
+    if result.returncode or not streamable(output) or sum(
+            s.get('codec_type') == 'audio' for s in probe(output)['streams']) != audio_count:
         raise RuntimeError("Could not prepare playable Telegram video")
     return output
 

@@ -1,7 +1,83 @@
 """Exact-post metadata adapters. Never search recommendations or poster URLs."""
 from __future__ import annotations
 
+import json
+import re
 import xml.etree.ElementTree as ET
+from urllib.parse import urlparse, urlunparse
+
+
+class IncompletePost(RuntimeError):
+    """A known post is incomplete. Another extractor must recover every slot."""
+
+    def __init__(self, message: str, expected_kinds: tuple[str, ...]):
+        super().__init__(message)
+        self.expected_kinds = expected_kinds
+
+
+def media_quality(fmt: dict) -> tuple[float, float, float]:
+    def number(value):
+        try:
+            return max(0, float(value or 0))
+        except (ValueError, TypeError):
+            return 0
+
+    width, height = number(fmt.get('width')), number(fmt.get('height'))
+    return width * height or max(width, height), number(fmt.get('fps')), number(fmt.get('bitrate') or fmt.get('tbr'))
+
+
+def youtube_post_attachment(page: str, post_id: str) -> dict:
+    """Read the one Community post that owns the requested ID."""
+    for match in re.finditer(r'(?:\bytInitialData\b\s*=|\[\s*["\']ytInitialData["\']\s*\]\s*=)\s*(?=\{)', page):
+        try:
+            document, _ = json.JSONDecoder().raw_decode(page, match.end())
+        except ValueError:
+            continue
+        for node in dictionaries(document):
+            for name in ('backstagePostRenderer', 'postRenderer'):
+                post = node.get(name)
+                if isinstance(post, dict) and post.get('postId') == post_id:
+                    attachment = post.get('backstageAttachment') or post.get('attachment')
+                    if isinstance(attachment, dict) and attachment:
+                        return attachment
+    return {}
+
+
+def youtube_photo_entries(attachment: dict) -> list[dict]:
+    """Use attached images only, with each post or poll image in source order."""
+    if 'backstageImageRenderer' in attachment:
+        images = [attachment['backstageImageRenderer'].get('image') or {}]
+    elif 'postMultiImageRenderer' in attachment:
+        images = [(row.get('backstageImageRenderer') or {}).get('image') or {}
+                  for row in attachment['postMultiImageRenderer'].get('images', [])]
+    else:
+        poll = attachment.get('pollRenderer') or attachment.get('imagePollRenderer') or {}
+        images = [row['image'] for row in poll.get('choices', []) if row.get('image')]
+
+    entries = []
+    for image in images:
+        formats = []
+        for row in image.get('thumbnails', []):
+            if not isinstance(row, dict) or not isinstance(row.get('url'), str):
+                continue
+            parsed = urlparse(row['url'])
+            host = parsed.hostname or ''
+            if parsed.scheme == 'https' and (host.endswith('.googleusercontent.com') or host in {'i.ytimg.com', 'yt3.ggpht.com'}):
+                formats.append(row)
+        entries.append({'kind': 'image', 'formats': sorted(formats, key=media_quality, reverse=True)})
+    return entries
+
+
+def dictionaries(document):
+    """Walk JSON containers without descending through scalar values."""
+    pending = [document]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, dict):
+            yield node
+            pending.extend(node.values())
+        elif isinstance(node, list):
+            pending.extend(node)
 
 
 def instagram_dash_audio_urls(item: dict) -> list[str]:
@@ -114,6 +190,8 @@ def instagram_extractor(downloader):
             children = item.get('carousel_media') or []
             result["audio_urls"] = instagram_audio_urls(item, include_children=False, include_dash=False)
             for entry, child in zip(result['entries'], children or [item]):
+                if entry['kind'] == 'image' and child.get('media_type') == 2:
+                    raise RuntimeError('Incomplete Instagram video metadata')
                 entry['audio_urls'] = (instagram_audio_urls(child, include_children=False) if children
                                        else instagram_dash_audio_urls(child))
             return result
@@ -129,6 +207,11 @@ def instagram_extractor(downloader):
             for entry, child in zip(result['entries'], [edge.get('node') or {} for edge in edges] or [item]):
                 entry['audio_urls'] = (instagram_audio_urls(child, include_children=False) if edges
                                        else instagram_dash_audio_urls(child))
+                if entry['kind'] == 'image':
+                    entry['formats'].extend({'url': row['src'], 'width': row.get('config_width'),
+                                             'height': row.get('config_height')}
+                                            for row in (child.get('display_resources') or [])
+                                            if isinstance(row, dict) and row.get('src'))
             return result
 
     # Preserve the existing extractor's rate limiter and request configuration.
@@ -141,30 +224,38 @@ def pinterest_entries(pin: dict) -> list[dict]:
     def media(node):
         video = node.get("videos") or node.get("video")
         if video:
-            formats = [v for v in (video.get("video_list") or {}).values()
+            formats = [v for v in (video.get('video_list') or {}).values()
                        if isinstance(v, dict) and v.get("url")]
             if not formats:
                 raise RuntimeError("Incomplete Pinterest video metadata; poster rejected")
-            formats.sort(key=lambda f: (int(f.get("width") or 0) * int(f.get("height") or 0),
-                                       ".m3u8" in f["url"]), reverse=True)
-            return {"kind": "video", "formats": formats}
+            formats.sort(key=media_quality, reverse=True)
+            return {'kind': 'video', 'formats': formats,
+                    'audio_urls': pinterest_post_audio_urls(node) if node is not pin else []}
         if node.get("is_video") or node.get("type") == "story_pin_video_block":
             raise RuntimeError("Incomplete Pinterest video metadata; poster rejected")
         images = node.get("images") or (node.get("image") or {}).get("images") or {}
         if node.get("audio") and (node.get("type") == "story_pin_music_block" or
                                   not images and not node.get("image_signature")):
             audio = node["audio"]
-            return {"kind": "audio", "formats": [{"url": audio.get("audio_url") or audio.get("url")}]}
-        formats = [v for v in images.values() if isinstance(v, dict) and v.get("url")]
-        if not formats:
+            audio_url = audio.get('audio_url') or audio.get('url') if isinstance(audio, dict) else audio
+            return {'kind': 'audio', 'formats': [{'url': audio_url}]}
+        original = [v for key, v in images.items() if key in {'orig', 'original', 'originals'}
+                    and isinstance(v, dict) and v.get('url')]
+        formats = sorted([v for v in images.values() if isinstance(v, dict) and v.get('url')],
+                         key=media_quality, reverse=True)
+        if not original:
             sig = node.get("image_signature")
-            if sig and len(sig) >= 6 and sig.isalnum():
+            if isinstance(sig, str) and re.fullmatch(r'[a-fA-F0-9]{6,128}', sig):
                 base = f"https://i.pinimg.com/originals/{sig[:2]}/{sig[2:4]}/{sig[4:6]}/{sig}"
-                formats = [{"url": base + ext} for ext in (".jpg", ".png", ".webp")]
-        if not formats:
+                original = [{'url': base + ext} for ext in ('.jpg', '.png', '.webp', '.gif')]
+            elif formats:
+                best = urlparse(formats[0]['url'])
+                if best.hostname == 'i.pinimg.com' and re.match(r'^/\d+x(?:\d+)?/', best.path):
+                    path = re.sub(r'^/\d+x(?:\d+)?/', '/originals/', best.path)
+                    original = [{'url': urlunparse(best._replace(path=path))}]
+        if not (formats or original):
             raise RuntimeError("Incomplete Pinterest image metadata")
-        formats.sort(key=lambda f: int(f.get("width") or 0) * int(f.get("height") or 0), reverse=True)
-        return {"kind": "image", "formats": formats}
+        return {'kind': 'image', 'formats': list({v['url']: v for v in original + formats}.values())}
 
     post_music = [{"kind": "audio", "scope": "post", "formats": [{"url": url}]}
                   for url in pinterest_post_audio_urls(pin)]
@@ -186,19 +277,13 @@ def pinterest_entries(pin: dict) -> list[dict]:
         if not slots:
             raise RuntimeError("Incomplete Pinterest carousel metadata")
         return [media(slot) for slot in slots] + post_music
-    return [media(pin)] + post_music
+    item = media(pin)
+    primary_urls = {fmt.get('url') for fmt in item['formats']}
+    return [item] + [entry for entry in post_music if entry['formats'][0]['url'] not in primary_urls]
 
 
 def find_pinterest_pin(document, pin_id: str) -> dict:
-    candidates = []
-    pending = [document]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, list):
-            pending.extend(node)
-        elif isinstance(node, dict):
-            if str(node.get("id")) == pin_id and any(node.get(k) for k in ("images", "videos", "carousel_data", "story_pin_data")):
-                candidates.append(node)
-            pending.extend(v for v in node.values() if isinstance(v, (dict, list)))
+    candidates = [node for node in dictionaries(document) if str(node.get('id')) == pin_id and
+                  any(node.get(k) for k in ('images', 'videos', 'carousel_data', 'story_pin_data', 'audio'))]
     return max(candidates, key=lambda p: (bool(p.get("story_pin_data") or p.get("carousel_data")),
                                          bool(p.get("videos")), len(p)), default={})

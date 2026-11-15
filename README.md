@@ -33,23 +33,23 @@ Explicit YouTube playlists stay on the collection-capable built-in route.
 
 | Platform | Implemented route | Media handled by that route |
 | --- | --- | --- |
-| YouTube | yt-dlp + yt-dlp-ejs + Deno + ffmpeg | Videos, Shorts, accessible long videos and audio streams |
-| Instagram | parth-dl, then gallery-dl, then yt-dlp | Public Reels, posts, ordered mixed image/video carousels exposed by these extractors |
-| Snapchat | Exact Spotlight ID / public story metadata; dedicated video preload; yt-dlp fallback | Spotlight videos; public story images/videos, selected story item or current public highlight |
+| YouTube | yt-dlp + yt-dlp-ejs + Deno + ffmpeg, plus matching Community post metadata | Videos, Shorts, clips, archived streams and explicit playlists. Community post image attachments and linked video when exposed |
+| Instagram | parth-dl, gallery-dl and yt-dlp | Public Reels, posts, shared links, and ordered mixed image/video carousels |
+| Snapchat | Exact Spotlight ID and public story metadata, with CDN and HLS download | Spotlight videos and public story photos/videos, including a specific snap selected by the link |
 | Pinterest | Exact pin metadata from gallery-dl or embedded page JSON + direct media/HLS | Images, GIFs, video, mixed carousels/Idea Pin pages and exposed audio blocks; no poster substitution |
 
 This is an implementation support matrix, **not a claim that every current URL was tested live**.
 Expired/deleted/private posts, unavailable music, DRM, unsupported page schemas and platform blocks can fail.
-YouTube community image posts and all possible Snapchat share URL variants are not certified.
+Text-only posts have no media attachment. Public community posts and short links depend on the payload returned by the platform.
 
 ## Quality and Telegram behavior
 
-- Automatic mode uses `bv*+ba/b/ba` without a resolution ceiling; an explicit YouTube playlist URL remains a bounded collection. Instagram ranks exposed renditions by pixel area.
+- Automatic YouTube mode prioritizes resolution, frame rate and HDR with no fixed resolution ceiling. For an explicit playlist, each final file must match its own entry. Instagram tries the largest rendition first and can join a separate track from the same carousel item.
 - “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
 - Compatible H.264/AAC videos are remuxed to MP4 without re-encoding and sent as playable videos.
 - Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
-- Photos are always sent as photos, never documents. Telegram may recompress them; the old `PRESERVE_ORIGINALS` setting is no longer used. Oversize/unusual photos are fitted to photo limits.
-- Ordered photo/video collections use albums of at most 10. Longer collections use multiple albums. Audio cannot share a photo/video album and is grouped separately in source order. Animations retain motion; within albums they use playable MP4.
+- Photos are sent as photos by default. Telegram may recompress them. Use `/original <link>` to receive the selected source files as documents without Telegram photo recompression or the bot's playback conversion. Each original file must fit the configured Telegram upload limit.
+- Ordered photo/video collections use albums of at most 10. Audio and documents use separate groups in source order. GIF and animated WebP files retain motion in playback MP4. AVIF stills are sent as photos. If a valid video cannot be converted for playback, the bot can send its file as a document where size permits.
 - An MP3 button appears after every delivered post. The bot attaches it to the last media item or puts it on the status message if Telegram rejects the edit. The Original button carries the source link so a signed callback can fetch audio after a restart or cache write failure. When a delivered carousel has silent videos, the MP3 action checks the source again and keeps the cached tracks if the new attempt finds fewer.
 - Video variants are checked for an actual audio stream. Instagram's dedicated extractor and gallery-dl both read DASH audio for the matching carousel item. The bot can combine complementary results after comparing the affected clips' encoded video streams. A post-wide soundtrack is added to each silent video independently and offered once through MP3. Conversion preserves the video's duration and checks that audio survives. Videos without an exposed track are marked in the delivery caption.
 - Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.

@@ -57,6 +57,15 @@ class MetadataTests(unittest.TestCase):
                'audio': {'audio_url': 'https://cdn.test/music.m4a'}}
         self.assertEqual([entry['kind'] for entry in pinterest_entries(pin)], ['image', 'audio'])
 
+    def test_pinterest_original_image_is_preferred_to_scaled_copies(self):
+        pin = {'images': {'736x': {'url': 'https://i.pinimg.com/736x/ab/cd/ef/abcdef.jpg',
+                                  'width': 736, 'height': 1300}}}
+        formats = pinterest_entries(pin)[0]['formats']
+        self.assertEqual([row['url'] for row in formats], [
+            'https://i.pinimg.com/originals/ab/cd/ef/abcdef.jpg',
+            'https://i.pinimg.com/736x/ab/cd/ef/abcdef.jpg',
+        ])
+
     def test_pinterest_visual_delivery_keeps_music_for_mp3_action(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -254,6 +263,21 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(count, 3)
         self.assertEqual(self.messages, [["photo", "video", "photo"]])
         self.msg.reply_photo.assert_not_called()
+
+    async def test_original_files_use_one_document_album_with_exact_bytes(self):
+        files = self.files(['.jpg', '.mp4'])
+        files[0].write_bytes(b'original photo bytes')
+        files[1].write_bytes(b'original video bytes')
+
+        async def receive(*, media):
+            self.assertEqual([str(item.type) for item in media], ['document', 'document'])
+            self.assertEqual([item.media.input_file_content.read() for item in media],
+                             [b'original photo bytes', b'original video bytes'])
+
+        self.msg.reply_media_group.side_effect = receive
+        self.assertEqual(await bot.send_album(self.msg, files, 'Original files', self.root, originals=True), 2)
+        self.msg.reply_photo.assert_not_called()
+        self.msg.reply_video.assert_not_called()
 
     async def test_more_than_ten_are_not_dropped(self):
         await bot.send_album(self.msg, self.files([".jpg"] * 23), "caption", self.root)

@@ -44,6 +44,25 @@ class MediaFixtures(unittest.TestCase):
         shutil.copyfile(self.video, fake_jpg)
         self.assertEqual(bot.classify(fake_jpg), "video")
 
+    def test_avif_is_a_photo_and_animated_webp_preserves_motion(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            first = Image.new('RGB', (96, 64), color='red')
+            second = Image.new('RGB', (96, 64), color='blue')
+            still = root / 'still.avif'
+            animation = root / 'motion.webp'
+            first.save(still)
+            first.save(animation, save_all=True, append_images=[second], duration=[160, 240], loop=0)
+            self.assertEqual(bot.classify(still), 'image')
+            self.assertEqual(bot.classify(animation), 'animation')
+            result = media_io.native_video(animation, root / 'delivery')
+            metadata = media_io.probe(result)
+            self.assertGreaterEqual(int(metadata['streams'][0]['nb_frames']), 2)
+            self.assertAlmostEqual(float(metadata['format']['duration']), 0.4, delta=0.08)
+            self.assertEqual((metadata['streams'][0]['width'], metadata['streams'][0]['height']), (96, 64))
+
     def test_error_payload_rejected(self):
         bad = self.root / "error.mp4"
         bad.write_text('{"error":"blocked"}')

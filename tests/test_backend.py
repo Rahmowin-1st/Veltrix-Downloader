@@ -31,6 +31,50 @@ class BackendTests(unittest.TestCase):
         self.assertTrue(bot.youtube_playlist_url(playlist))
         self.assertFalse(bot.youtube_playlist_url('https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123'))
 
+    def test_instagram_share_redirect_keeps_the_resolved_post_id(self):
+        short = 'https://www.instagram.com/share/reel/opaqueShareToken/'
+        canonical = 'https://www.instagram.com/reel/realPostId/'
+        response = httpx.Response(200, request=httpx.Request('GET', canonical))
+        with patch('bot.fetch_public_page', return_value=response) as fetch, patch('bot._metadata_cache', {}):
+            self.assertEqual(bot.extractor_candidates(short), [canonical, short])
+            self.assertEqual(bot.resolve_public_redirect(short), canonical)
+        fetch.assert_called_once_with(short)
+
+    def test_youtube_nested_tracking_url_does_not_replace_the_requested_video(self):
+        url = 'https://m.youtube.com/watch?tracking=prev&v=dQw4w9WgXcQ&list=PL123'
+        self.assertEqual(bot.extract_url(url), 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+        url = 'https://youtube.com/playlist?list=PL123&previous=https://youtu.be/dQw4w9WgXcQ'
+        self.assertEqual(bot.extract_url(url), url)
+
+    def test_youtube_community_images_are_exact_ordered_and_ranked(self):
+        from source_metadata import youtube_photo_entries, youtube_post_attachment
+
+        def image(*variants):
+            return {'backstageImageRenderer': {'image': {'thumbnails': list(variants)}}}
+
+        def variant(name, size):
+            return {'url': f'https://yt3.googleusercontent.com/{name}', 'width': size, 'height': size}
+
+        chosen = {'postMultiImageRenderer': {'images': [image(variant('small', 64), variant('large', 2048)),
+                                                      image(variant('second', 256))]}}
+        neighbor = image(variant('unrelated', 8192))
+        document = {'items': [{'backstagePostRenderer': {'postId': 'actual', 'backstageAttachment': chosen}},
+                              {'backstagePostRenderer': {'postId': 'other', 'backstageAttachment': neighbor}}]}
+        page = '<script>window["ytInitialData"] = ' + json.dumps(document) + ';</script>'
+        attachment = youtube_post_attachment(page, 'actual')
+        self.assertEqual([entry['formats'][0]['url'].rsplit('/', 1)[1] for entry in youtube_photo_entries(attachment)],
+                         ['large', 'second'])
+        self.assertEqual(youtube_post_attachment(page, 'missing'), {})
+
+    def test_playlist_with_missing_entry_does_not_use_unrelated_file_in_its_place(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            file = root / 'other.mp4'
+            file.touch()
+            entry = {'requested_downloads': [{'filepath': str(file)}]}
+            info = {'_type': 'playlist', 'entries': [{'requested_downloads': [{'filepath': str(root / 'missing.mp4')}]}, entry]}
+            self.assertEqual(bot.final_downloads(info, root), [])
+
     def test_video_ladder(self):
         chain = bot.video_chain(720)
         self.assertTrue(any("height<=720" in item for item in chain))
@@ -89,6 +133,13 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(bot.platform_of(url), "snapchat")
         candidates = bot.extractor_candidates(url)
         self.assertTrue(any("/@creator/spotlight/" in item for item in candidates))
+
+    def test_snapchat_encoded_handle_uses_the_exact_spotlight(self):
+        url = 'https://www.snapchat.com/%40creator/spotlight/W7_ABC123'
+        with patch('bot.fetch_public_page') as fetch:
+            self.assertEqual(bot._snap_requested_id(url, {}), 'W7_ABC123')
+            self.assertIn('https://www.snapchat.com/spotlight/W7_ABC123', bot.extractor_candidates(url))
+        fetch.assert_not_called()
 
     def test_snapchat_embed_is_used_after_public_route_404(self):
         url = 'https://www.snapchat.com/spotlight/embed_case'

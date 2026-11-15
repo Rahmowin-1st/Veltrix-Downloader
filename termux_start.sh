@@ -35,6 +35,9 @@ if [ -z "${TELEGRAM_RELAY_BASE+x}" ] && [ -z "${TELEGRAM_API_BASE:-}" ]; then
 fi
 
 echo "Veltrix preflight..."
+if ! python -c 'import PIL._webp' 2>/dev/null; then
+  pkg install -y python-pillow
+fi
 if ! python - <<'PY'
 import importlib
 from pathlib import Path
@@ -43,7 +46,7 @@ stamp = Path('.dependencies.sha256')
 wanted = hashlib.sha256(Path('requirements-termux.txt').read_bytes()).hexdigest()
 if not stamp.exists() or stamp.read_text().strip() != wanted:
     raise SystemExit(1)
-for name in ("telegram", "yt_dlp", "gallery_dl", "parth_dl", "httpx"):
+for name in ("telegram", "yt_dlp", "gallery_dl", "parth_dl", "httpx", "PIL"):
     importlib.import_module(name)
 PY
 then
