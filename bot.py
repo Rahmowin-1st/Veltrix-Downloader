@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.10.1"
+VERSION = "9.10.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -674,9 +674,9 @@ def _instagram_format_score(fmt: dict[str, Any], kind: str) -> tuple[float, floa
     return media_quality(fmt)
 
 
-def extract_instagram_public(url: str) -> dict[str, Any]:
+def extract_instagram_public(url: str, *, graphql: bool = False) -> dict[str, Any]:
     """Dedicated public Instagram metadata path for Reels/posts/carousels."""
-    cache_key = f"instagram:{url}"
+    cache_key = f'instagram:{graphql}:{url}'
     cached = metadata_cache_get(cache_key)
     if cached:
         return cached
@@ -695,7 +695,10 @@ def extract_instagram_public(url: str) -> dict[str, Any]:
     match = INSTAGRAM_POST_RE.fullmatch(urlparse(candidate).path)
     if not match:
         return {}
-    info = downloader.get_info(candidate)
+    if graphql:
+        info = downloader.media_extractor._extract_from_graphql(match[2])
+    else:
+        info = downloader.get_info(candidate)
     payload = info if isinstance(info, dict) else {}
     if payload.get('id') not in {None, '', 'unknown', match[2]}:
         raise RuntimeError('Instagram returned media for a different post')
@@ -752,11 +755,13 @@ def download_instagram_dedicated(
     url: str,
     tmpdir: str,
     info: dict[str, Any] | None = None,
+    *,
+    graphql: bool = False,
 ) -> tuple[list[Path], str]:
     """Download exact Instagram entries in original carousel order."""
     if not isinstance(info, dict) or not info.get("entries"):
         try:
-            info = extract_instagram_public(url)
+            info = extract_instagram_public(url, graphql=True) if graphql else extract_instagram_public(url)
         except Exception as exc:
             if fatal_download_error(exc):
                 raise
@@ -1591,7 +1596,10 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
         # The dedicated public parser cannot receive a login session. An
         # owner-authorized cookie file gives gallery-dl the first attempt.
         engines = ([gallery, dedicated] if cookie and Path(cookie).is_file()
-                   else [dedicated, gallery]) + [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
+                   else [dedicated, gallery])
+        if INSTAGRAM_POST_RE.fullmatch(urlparse(url).path):
+            engines.append(lambda folder, _: download_instagram_dedicated(url, folder, graphql=True)[0])
+        engines.append(lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder))
     elif platform == "pinterest":
         # gallery-dl retains page boundaries, audio blocks and carousel order.
         engines = [lambda folder, _: download_gallery(resolve_public_redirect(url), folder),

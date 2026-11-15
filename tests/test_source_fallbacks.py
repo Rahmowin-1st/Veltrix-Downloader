@@ -202,6 +202,17 @@ class RealMediaFallbackTests(unittest.TestCase):
                 self.assertEqual(bot.grab('https://instagram.com/p/test/', mode, job),
                                  [self.audible, self.second_audible])
 
+    def test_silent_instagram_embed_can_use_exact_public_graphql_rendition(self):
+        url = 'https://instagram.com/reel/test/'
+        with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \
+             patch('bot.safe_remote_url', return_value=True), patch('bot.download_gallery', return_value=[]), \
+             patch('bot.download_instagram_dedicated', side_effect=[([self.silent], 'video'),
+                                                                   ([self.audible], 'video')]) as dedicated, \
+             patch('bot.download_ytdlp') as fallback:
+            self.assertEqual(bot.grab(url, 'auto', job), [self.audible])
+            self.assertTrue(dedicated.call_args.kwargs['graphql'])
+            fallback.assert_not_called()
+
     def test_unmatched_video_does_not_replace_another_carousel_child(self):
         original = [self.audible, self.second_silent]
         with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \
