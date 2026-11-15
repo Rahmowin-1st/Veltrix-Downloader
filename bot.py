@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.10.0"
+VERSION = "9.10.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -96,7 +96,8 @@ METADATA_CACHE_TTL = 60.0
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 YT_POST_RE = re.compile(r'^/(?:(?:@|%40)[^/]+/)?post/([A-Za-z0-9_-]+)/?$', re.I)
-INSTAGRAM_POST_RE = re.compile(r"^/(reels?|p|tv)/([A-Za-z0-9_-]+)(?:/embed(?:/captioned)?)?/?$", re.I)
+INSTAGRAM_POST_RE = re.compile(
+    r'^/(?:(?!share/|direct/|stories/)[\w.]+/)?(reels?|p|tv)/([A-Za-z0-9_-]+)(?:/embed(?:/captioned)?)?/?$', re.I)
 PINTEREST_PIN_RE = re.compile(r"^/pin/(?:[^/]+--)?(\d+)/?$", re.I)
 SNAP_SPOTLIGHT_RE = re.compile(r'^/(?:(?:@|%40)[^/]+/)?spotlight/([A-Za-z0-9_-]+)(?:/embed)?/?$', re.I)
 SNAP_PROFILE_RE = re.compile(r'^/(?:add/|@|%40)([A-Za-z0-9_.-]+)(?:/(.*))?$', re.I)
@@ -533,11 +534,14 @@ def resolve_public_redirect(url: str) -> str:
     try:
         response = fetch_public_page(url)
         final = str(response.url)
-        if platform_of(final) == platform:
-            metadata_cache_put(key, {'url': final})
-            return final
+    except httpx.HTTPStatusError as exc:
+        final = str(exc.request.url)
     except Exception as exc:
         log.info("Share resolution failed: %s", type(exc).__name__)
+        return url
+    if platform_of(final) == platform:
+        metadata_cache_put(key, {'url': final})
+        return final
     return url
 
 
@@ -867,9 +871,9 @@ def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
         fields = dict(re.findall(r'([\w:-]+)\s*=\s*["\']([^"\']*)["\']', tag, flags=re.I))
         if 'canonical' in fields.get('rel', '').lower().split() and fields.get('href'):
             canonical.append(urljoin(page_url, html.unescape(fields['href'])))
-    if canonical:
-        return all(platform_of(value) == 'snapchat' and _snap_requested_id(value, {}) == requested
-                   for value in canonical)
+    if canonical and any(platform_of(value) != 'snapchat' or _snap_requested_id(value, {}) != requested
+                         for value in canonical):
+        return False
     match = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', page, re.I | re.S)
     if match:
         try:
@@ -880,8 +884,8 @@ def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
         if query_id:
             return query_id == requested
         stories = _dig_dict(doc, 'props', 'pageProps', 'spotlightFeed').get('spotlightStories') or []
-        return any(str(_dig_dict(item, 'story', 'storyId').get('value') or '') == requested
-                   for item in stories if isinstance(item, dict))
+        return bool(canonical) or any(str(_dig_dict(item, 'story', 'storyId').get('value') or '') == requested
+                                      for item in stories if isinstance(item, dict))
     # Some Snapchat Spotlight HTML has one primary video preload but no
     # canonical or Next.js tags. The page was fetched from the exact ID route
     # and the caller also requires precisely one Snapchat CDN video.
@@ -2063,7 +2067,12 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
             prepared.append(('document', path))
             continue
         if kind == "image":
-            prepared.append(("image", await asyncio.to_thread(fit_image, path, folder)))
+            try:
+                prepared.append(('image', await asyncio.to_thread(fit_image, path, folder)))
+            except (RuntimeError, OSError, subprocess.SubprocessError):
+                if path.stat().st_size > MAX_BYTES:
+                    raise
+                prepared.append(('document', path))
         elif kind in {"video", "animation"}:
             try:
                 final = await asyncio.to_thread(native_video, path, folder)
@@ -2604,12 +2613,14 @@ def snapchat_story_entries(doc: dict, url: str) -> list[dict]:
     highlights = [row for row in (props.get('curatedHighlights') or []) if isinstance(row, dict)]
     snaps = story.get('snapList') or []
     if not requested:
-        if not snaps and len(highlights) == 1:
+        if not snaps and highlights:
             snaps = highlights[0].get('snapList') or []
     else:
         snaps = [snap for group in [story, *highlights] for snap in (group.get('snapList') or [])
                  if isinstance(snap, dict) and _dig_dict(snap, 'snapId').get('value') == requested]
-        if not snaps:
+        if snaps:
+            snaps = snaps[:1]
+        else:
             selected = next((group for group in highlights
                              if _dig_dict(group, 'highlightId').get('value') == requested), {})
             snaps = selected.get('snapList') or []

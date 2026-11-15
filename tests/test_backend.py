@@ -40,6 +40,16 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(bot.resolve_public_redirect(short), canonical)
         fetch.assert_called_once_with(short)
 
+    def test_instagram_creator_link_is_normalized_without_treating_share_as_creator(self):
+        creator = 'https://www.instagram.com/creator.name/reel/realPostId/'
+        canonical = 'https://www.instagram.com/reel/realPostId/'
+        self.assertEqual(bot.extractor_candidates(creator), [canonical, creator])
+        short = 'https://instagram.com/share/reel/opaqueToken/'
+        request = httpx.Request('GET', canonical)
+        error = httpx.HTTPStatusError('status 404', request=request, response=httpx.Response(404, request=request))
+        with patch('bot.fetch_public_page', side_effect=error), patch('bot._metadata_cache', {}):
+            self.assertEqual(bot.extractor_candidates(short), [canonical, short])
+
     def test_youtube_nested_tracking_url_does_not_replace_the_requested_video(self):
         url = 'https://m.youtube.com/watch?tracking=prev&v=dQw4w9WgXcQ&list=PL123'
         self.assertEqual(bot.extract_url(url), 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')
@@ -264,6 +274,11 @@ class BackendTests(unittest.TestCase):
                 '{"query":{"snapID":"unrelated"},"props":{"pageProps":{}}}'
                 '</script><link rel="preload" as="video" '
                 'href="https://cf-st.sc-cdn.net/d/unrelated.mp4">')
+        self.assertFalse(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/wanted'))
+
+    def test_snapchat_canonical_tag_cannot_override_a_conflicting_page_id(self):
+        page = ('<link rel="canonical" href="/spotlight/wanted">'
+                '<script id="__NEXT_DATA__" type="application/json">{"query":{"snapID":"other"}}</script>')
         self.assertFalse(bot._snap_page_owns_spotlight(page, 'https://www.snapchat.com/spotlight/wanted'))
 
     def test_spotlight_candidate_does_not_refetch_redirect(self):
