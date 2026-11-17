@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.11.0"
+VERSION = "9.12.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1017,7 +1017,7 @@ def final_downloads(info: dict, folder: Path) -> list[Path]:
     return files
 
 
-def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
+def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = None) -> list[Path]:
     base = base_ydl_opts(tmpdir)
     base['noplaylist'] = not youtube_playlist_url(url)
     platform = platform_of(url)
@@ -1045,7 +1045,7 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     audio_failure: RuntimeError | None = None
     seen: set[tuple[str, str]] = set()
     attempt_no = 0
-    for candidate in extractor_candidates(url):
+    for candidate in ([url] if manifest is not None else extractor_candidates(url)):
         for fmt, extra in attempts:
             sig = (candidate, fmt)
             if sig in seen:
@@ -1061,7 +1061,11 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
                 opts["outtmpl"] = str(attempt_dir / "%(playlist_index)05d_%(extractor)s_%(id)s_%(title).80B.%(ext)s")
                 opts.update(extra)
                 with YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(candidate, download=True)
+                    if manifest is None:
+                        info = ydl.extract_info(candidate, download=True)
+                    else:
+                        import copy
+                        info = ydl.process_ie_result(copy.deepcopy(manifest), download=True)
                 if not info:
                     raise RuntimeError("Extractor returned no media metadata")
                 entries = list(info.get("entries") or []) if info.get("_type") in {"playlist", "multi_video"} else [info]
@@ -1090,6 +1094,20 @@ def download_ytdlp(url: str, mode: str, tmpdir: str) -> list[Path]:
     if last:
         raise last
     return []
+
+
+def download_youtube_public(url: str, mode: str, tmpdir: str) -> list[Path]:
+    """Try a fresh anonymous visitor context after the normal extractor fails."""
+    from youtube_public import request_manifest
+
+    if youtube_playlist_url(url):
+        return []
+    canonical = extract_url(url) or url
+    video_id = (parse_qs(urlparse(canonical).query).get('v') or [''])[0]
+    if not YT_ID_RE.fullmatch(video_id):
+        return []
+    info = request_manifest(video_id, safe_url=safe_remote_url, proxy=PROXY or None)
+    return download_ytdlp(canonical, mode, tmpdir, manifest=info)
 
 
 def download_youtube_post(url: str, mode: str, tmpdir: str, post_id: str) -> list[Path]:
@@ -1285,6 +1303,9 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
                     if not has_audio(path):
                         silent_fallback = silent_fallback or path
                         continue
+                if entry['kind'] == 'video' and silent_fallback:
+                    from media_io import restore_variant_audio
+                    path = restore_variant_audio(silent_fallback, path, variant_dir / 'restored')
                 completed = path
                 break
             except TransferLimit as exc:
@@ -1596,6 +1617,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
         url = resolve_public_redirect(url)
     if platform == "youtube":
         engines = [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
+        if not youtube_playlist_url(url):
+            engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
     elif platform == "instagram":
         dedicated = lambda folder, _: download_instagram_dedicated(url, folder, (prefetched or {}).get("_instagram_info"))[0]
         gallery = lambda folder, _: download_gallery(url, folder)

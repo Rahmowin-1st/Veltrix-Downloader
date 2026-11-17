@@ -124,7 +124,7 @@ def probe_youtube(ids: str) -> None:
         if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
             continue
         url = f'https://www.youtube.com/watch?v={video_id}'
-        for client in ('default', 'web_safari', 'android_sdkless',
+        for client in ('default', 'web_safari', 'visionos',
                        'web_embedded', 'tv'):
             opts = {
                 'quiet': True, 'no_warnings': True, 'skip_download': True,
@@ -259,9 +259,15 @@ async def probe_downloads(urls: list[str]) -> None:
                     videos_with_audio = sum(kind == 'video' and bot.has_audio(path)
                                             for kind, path in zip(kinds, files))
                     tracks = len(bot.audio_sources(files, root / 'soundtrack'))
+                    from media_io import probe
+                    dimensions = [(s.get('width'), s.get('height')) for path, kind in zip(files, kinds)
+                                  if kind == 'video' for s in probe(path)['streams']
+                                  if s.get('codec_type') == 'video']
                     log.info('Media probe #%s %s: items=%s video=%s image=%s animation=%s audio=%s video_with_audio=%s mp3_sources=%s',
                              index, platform, len(files), kinds.count('video'), kinds.count('image'),
                              kinds.count('animation'), kinds.count('audio'), videos_with_audio, tracks)
+                    log.info('Media probe #%s quality: dimensions=%s total_bytes=%s',
+                             index, dimensions, sum(path.stat().st_size for path in files))
         except bot.WorkerFailure as exc:
             log.info('Media probe #%s %s: %s', index, platform, exc.category)
         except Exception as exc:

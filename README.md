@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.9.0
+# Veltrix Downloader 9.12.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -7,6 +7,14 @@ Instagram's full-object DASH audio tracks are recovered per carousel item when
 exposed in exact-post metadata, then muxed into that item's silent video. Native
 audio is retained. If a video still lacks audio, the delivered caption says so.
 One audible video no longer stops the search for other missing carousel tracks.
+When a larger variant is silent, audio from a smaller rendition of the same item
+can be copied onto the larger video without re-encoding either track. Different
+timelines are never merged.
+
+YouTube has an additional anonymous visitor handshake after yt-dlp fails. It
+uses YouTube's own public player endpoint and the same quality selection,
+audio merge, file validation and Telegram delivery pipeline. It does not need
+a new package or an API key; platform login restrictions can still prevent it.
 
 ## Optional extraction API
 

@@ -1,0 +1,116 @@
+"""Bounded anonymous player fallback; downloads still use yt-dlp's pipeline.
+
+The two-request visitor handshake follows pytubefix's public VISION_OS client.
+No account, API key, age confirmation or third-party download service is used.
+"""
+from __future__ import annotations
+
+import re
+from urllib.parse import urlparse
+
+import httpx
+from yt_dlp.utils import mimetype2ext, parse_codecs
+
+
+PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
+SAFARI_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) '
+             'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15')
+MAX_RESPONSE = 4 * 1024 * 1024
+
+
+def player_request(client, video_id: str, context: dict, client_id: str) -> dict:
+    headers = {'Content-Type': 'application/json', 'User-Agent': SAFARI_UA,
+               'Accept-Language': 'en-US,en', 'X-Youtube-Client-Name': client_id}
+    with client.stream('POST', PLAYER_URL, headers=headers,
+                       json={'context': {'client': context}, 'videoId': video_id}) as response:
+        response.raise_for_status()
+        data = bytearray()
+        for chunk in response.iter_bytes():
+            data.extend(chunk)
+            if len(data) > MAX_RESPONSE:
+                raise RuntimeError('YouTube player response exceeds metadata limit')
+        import json
+        result = json.loads(data)
+    if not isinstance(result, dict):
+        raise RuntimeError('Invalid YouTube player response')
+    return result
+
+
+def visitor_data(document: dict) -> str:
+    context = document.get('responseContext') or {}
+    value = context.get('visitorData')
+    if isinstance(value, str):
+        return value
+    for service in context.get('serviceTrackingParams') or []:
+        for row in service.get('params') or []:
+            if row.get('key') == 'visitor_data' and isinstance(row.get('value'), str):
+                return row['value']
+    return ''
+
+
+def player_manifest(document: dict, video_id: str, *, safe_url) -> dict:
+    status = document.get('playabilityStatus') or {}
+    if status.get('status') != 'OK':
+        # Keep platform errors recognizable by the existing failure classifier.
+        raise RuntimeError('YouTube: ' + str(status.get('reason') or status.get('status') or 'unavailable'))
+    details = document.get('videoDetails') or {}
+    microformat = (document.get('microformat') or {}).get('playerMicroformatRenderer') or {}
+    if details.get('videoId') != video_id:
+        raise RuntimeError('YouTube returned a different video')
+    if microformat.get('isFamilySafe') is False:
+        raise RuntimeError('Age-restricted media is not supported')
+    if details.get('isLive') or (microformat.get('liveBroadcastDetails') or {}).get('isLiveNow'):
+        raise RuntimeError('YouTube live stream has not ended')
+    formats = []
+    streaming = document.get('streamingData') or {}
+    for row in [*(streaming.get('formats') or []), *(streaming.get('adaptiveFormats') or [])]:
+        url = row.get('url')
+        parsed = urlparse(url) if isinstance(url, str) else None
+        if (parsed is None or parsed.scheme != 'https' or parsed.username or parsed.password
+                or not (parsed.hostname or '').endswith('.googlevideo.com') or not safe_url(url)
+                or row.get('drmFamilies') or row.get('drmTrackType')
+                or row.get('type') == 'FORMAT_STREAM_TYPE_OTF'):
+            continue
+        mime = row.get('mimeType') or ''
+        codecs = re.search(r'codecs="([^"]+)"', mime)
+        if not codecs:
+            continue
+        fmt = {'format_id': 'public-' + str(row.get('itag')), 'url': url,
+               'ext': mimetype2ext(mime.split(';')[0]), **parse_codecs(codecs[1]),
+               'width': row.get('width'), 'height': row.get('height'), 'fps': row.get('fps'),
+               'http_headers': {'User-Agent': SAFARI_UA, 'Referer': 'https://www.youtube.com/'},
+               'downloader_options': {'http_chunk_size': 9 * 1024 * 1024}}
+        for source, target, scale in [('contentLength', 'filesize', 1), ('bitrate', 'tbr', 1000),
+                                       ('audioSampleRate', 'asr', 1)]:
+            try:
+                fmt[target] = int(row[source]) / scale
+            except (KeyError, ValueError, TypeError):
+                pass
+        track = row.get('audioTrack') or {}
+        if track:
+            fmt['language'] = str(track.get('id') or '').split('.')[0]
+            fmt['language_preference'] = 10 if track.get('audioIsDefault') else -10
+        formats.append(fmt)
+    if not formats:
+        raise RuntimeError('YouTube returned no accessible download formats')
+    return {'id': video_id, 'title': str(details.get('title') or video_id),
+            'duration': float(details.get('lengthSeconds') or 0), 'formats': formats,
+            'webpage_url': f'https://www.youtube.com/watch?v={video_id}',
+            'extractor': 'youtube_public', 'extractor_key': 'Youtube', 'age_limit': 0}
+
+
+def request_manifest(video_id: str, *, safe_url, proxy=None, client_factory=httpx.Client) -> dict:
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+        raise ValueError('Invalid YouTube video ID')
+    with client_factory(timeout=12, follow_redirects=False, proxy=proxy, trust_env=False) as client:
+        seed = player_request(client, video_id, {
+            'clientName': 'WEB', 'clientVersion': '2.20260708.00.00',
+            'osName': 'Windows', 'osVersion': '10.0', 'platform': 'DESKTOP'}, '1')
+        context = {'clientName': 'VISIONOS', 'clientVersion': '1.02', 'deviceMake': 'Apple',
+                   'platform': 'MOBILE', 'osName': 'visionOS', 'osVersion': '26.5.23O471',
+                   'deviceModel': 'RealityDevice17,1'}
+        visitor = visitor_data(seed)
+        if visitor:
+            context['visitorData'] = visitor
+        document = player_request(client, video_id, context, '101')
+    return player_manifest(document, video_id, safe_url=safe_url)

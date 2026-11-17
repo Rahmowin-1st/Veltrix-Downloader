@@ -379,7 +379,8 @@ class RealMediaFallbackTests(unittest.TestCase):
              patch('bot.safe_remote_url', return_value=True), \
              patch('bot.download_ytdlp', side_effect=RuntimeError("Sign in to confirm you're not a bot")), \
              patch('bot.download_cobalt', return_value=[self.audible]) as provider:
-            files = bot.grab('https://youtube.com/watch?v=BaW_jenozKc', 'auto', job)
+            with patch('bot.download_youtube_public', return_value=[]):
+                files = bot.grab('https://youtube.com/watch?v=BaW_jenozKc', 'auto', job)
             self.assertEqual(files, [self.audible])
             provider.assert_called_once()
 
@@ -399,5 +400,44 @@ class RealMediaFallbackTests(unittest.TestCase):
              patch('bot.safe_remote_url', return_value=True), \
              patch('bot.download_ytdlp', side_effect=RuntimeError("Sign in to confirm you're not a bot")), \
              patch('bot.download_cobalt', side_effect=ProviderError('Provider metadata request failed')):
-            with self.assertRaisesRegex(RuntimeError, 'confirm you'):
+            with self.assertRaisesRegex(RuntimeError, 'confirm you'), patch('bot.download_youtube_public', return_value=[]):
                 bot.grab('https://youtube.com/watch?v=BaW_jenozKc', 'auto', job)
+
+    def test_best_video_keeps_its_frames_and_original_audio_from_smaller_variant(self):
+        with tempfile.TemporaryDirectory() as job:
+            larger = Path(job) / 'larger.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(self.silent),
+                            '-vf', 'scale=320:240', '-c:v', 'libx264', str(larger)], check=True, timeout=20)
+            sources = {'best.mp4': larger, 'small.mp4': self.audible}
+            def download(url, output, **kwargs):
+                shutil.copy2(sources[url.rsplit('/', 1)[-1]], output)
+                return True
+            entries = [{'kind': 'video', 'formats': [{'url': 'https://cdn.test/best.mp4'},
+                                                    {'url': 'https://cdn.test/small.mp4'}]}]
+            with patch('bot.safe_remote_url', return_value=True), patch('bot._download_direct_file', side_effect=download):
+                files = bot.download_source_entries(entries, Path(job) / 'source', 'https://instagram.com/p/test/')
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].is_file())
+            self.assertTrue(bot.has_audio(files[0]))
+            self.assertTrue(same_video_stream(files[0], larger))
+            self.assertEqual(len(bot.audio_sources(files, Path(job) / 'soundtrack')), 1)
+            def audio_hash(path):
+                return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0',
+                                                '-c', 'copy', '-f', 'hash', '-'], timeout=20)
+            self.assertEqual(audio_hash(files[0]), audio_hash(self.audible))
+
+    def test_different_variant_timeline_is_not_given_another_audio_track(self):
+        from media_io import restore_variant_audio
+        with tempfile.TemporaryDirectory() as job:
+            larger = Path(job) / 'larger.mp4'
+            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', str(self.second_silent),
+                            '-vf', 'scale=320:240', '-c:v', 'libx264', str(larger)], check=True, timeout=20)
+            self.assertEqual(restore_variant_audio(larger, self.audible, Path(job) / 'merged'), self.audible)
+
+    def test_public_youtube_recovers_after_default_bot_check(self):
+        with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \
+             patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.download_ytdlp', side_effect=RuntimeError("Sign in to confirm you're not a bot")), \
+             patch('bot.download_youtube_public', return_value=[self.audible]) as fallback:
+            self.assertEqual(bot.grab('https://youtube.com/watch?v=u443WxCOAlY', 'auto', job), [self.audible])
+            fallback.assert_called_once()

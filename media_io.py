@@ -48,6 +48,40 @@ def same_video_stream(first: Path, second: Path) -> bool:
         return False
 
 
+def restore_variant_audio(best: Path, audible: Path, dest: Path) -> Path:
+    """Keep the larger video while borrowing audio from the same item's variant.
+
+    Call only for variants belonging to one exact media item. Different timelines
+    cannot safely share audio; in that case retain the complete audible variant.
+    """
+    first, second = probe(best), probe(audible)
+    def video(info):
+        return next((s for s in info['streams'] if s.get('codec_type') == 'video'
+                     and not s.get('disposition', {}).get('attached_pic')), {})
+    one, two = video(first), video(second)
+    if (one.get('width', 0) * one.get('height', 0) <= two.get('width', 0) * two.get('height', 0)
+            or not any(s.get('codec_type') == 'audio' for s in second['streams'])):
+        return audible
+    duration = float(first.get('format', {}).get('duration') or 0)
+    other_duration = float(second.get('format', {}).get('duration') or 0)
+    if duration <= 0 or abs(duration - other_duration) > max(.25, duration * .01):
+        return audible
+    dest.mkdir(parents=True, exist_ok=True)
+    output = dest / 'restored.mkv'
+    try:
+        run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(best), '-i', str(audible),
+             '-map', '0:V:0', '-map', '1:a:0', '-c', 'copy', '-shortest', str(output)],
+            capture_output=True, check=True, timeout=900)
+        final = probe(output)
+        if (not any(s.get('codec_type') == 'audio' for s in final['streams'])
+                or abs(float(final['format'].get('duration') or 0) - duration) > max(.25, duration * .01)):
+            raise RuntimeError('Restoring audio changed the video duration')
+        return output
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        output.unlink(missing_ok=True)
+        return audible
+
+
 def media_kind(path: Path) -> str:
     info = probe(path)
     streams = info["streams"]
