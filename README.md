@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.12.1
+# Veltrix Downloader 9.12.2
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -15,6 +15,9 @@ YouTube has an additional anonymous visitor handshake after yt-dlp fails. It
 uses YouTube's own public player endpoint and the same quality selection,
 audio merge, file validation and Telegram delivery pipeline. It does not need
 a new package or an API key; platform login restrictions can still prevent it.
+If both public API origins return HTTP 403, that fallback rests for five minutes
+across worker processes. Normal yt-dlp downloads remain enabled. The original
+platform error is retained instead of offering an immediate, ineffective retry.
 Snapchat also tries its public exact-ID lookup when neither modern nor legacy
 page metadata exposes the requested Spotlight. Preview tiles and unrelated IDs
 are excluded.

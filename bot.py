@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.12.1"
+VERSION = "9.12.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1141,7 +1141,24 @@ def download_youtube_public(url: str, mode: str, tmpdir: str) -> list[Path]:
     video_id = (parse_qs(urlparse(canonical).query).get('v') or [''])[0]
     if not YT_ID_RE.fullmatch(video_id):
         return []
-    info = request_manifest(video_id, safe_url=safe_remote_url, proxy=PROXY or None)
+    cooldown = DATA_DIR / 'youtube_public_cooldown'
+    try:
+        if 0 < float(cooldown.read_text()) - time.time() <= 300:
+            return []
+    except (OSError, ValueError):
+        pass
+    try:
+        info = request_manifest(video_id, safe_url=safe_remote_url, proxy=PROXY or None)
+    except httpx.HTTPError as exc:
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403:
+            try:
+                cooldown.parent.mkdir(parents=True, exist_ok=True)
+                cooldown.write_text(str(time.time() + 300))
+            except OSError:
+                pass
+        # An unavailable fallback must not replace the original platform error
+        # or make a definitive bot check offer a futile immediate Retry button.
+        raise ProviderError('Public YouTube player connection failed') from exc
     return download_ytdlp(canonical, mode, tmpdir, manifest=info)
 
 

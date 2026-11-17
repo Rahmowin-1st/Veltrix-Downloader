@@ -441,3 +441,11 @@ class RealMediaFallbackTests(unittest.TestCase):
              patch('bot.download_youtube_public', return_value=[self.audible]) as fallback:
             self.assertEqual(bot.grab('https://youtube.com/watch?v=u443WxCOAlY', 'auto', job), [self.audible])
             fallback.assert_called_once()
+
+    def test_public_player_outage_preserves_original_bot_check(self):
+        with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \
+             patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.download_ytdlp', side_effect=RuntimeError("Sign in to confirm you're not a bot")), \
+             patch('bot.download_youtube_public', side_effect=ProviderError('Public player HTTP403')):
+            with self.assertRaisesRegex(RuntimeError, 'confirm you'):
+                bot.grab('https://youtube.com/watch?v=u443WxCOAlY', 'auto', job)

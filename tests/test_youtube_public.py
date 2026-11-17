@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -21,6 +22,25 @@ def document():
 
 
 class YoutubePublicTests(unittest.TestCase):
+    def test_blocked_fallback_cools_down_across_calls_and_then_recovers(self):
+        from cobalt_provider import ProviderError
+        error = httpx.HTTPStatusError('blocked', request=httpx.Request('POST', 'https://www.youtube.com/'),
+                                      response=httpx.Response(403))
+        with tempfile.TemporaryDirectory() as folder, patch('bot.DATA_DIR', Path(folder)), \
+             patch('youtube_public.request_manifest', side_effect=error) as request, \
+             patch('bot.download_ytdlp', return_value=[]) as download:
+            with self.assertRaises(ProviderError):
+                bot.download_youtube_public('https://youtu.be/' + ID, 'auto', folder)
+            self.assertEqual(bot.download_youtube_public('https://youtu.be/' + ID, 'auto', folder), [])
+            self.assertEqual(request.call_count, 1)
+            download.assert_not_called()
+            (Path(folder) / 'youtube_public_cooldown').write_text('0')
+            request.side_effect = None
+            request.return_value = {'id': ID}
+            bot.download_youtube_public('https://youtu.be/' + ID, 'auto', folder)
+            self.assertEqual(request.call_count, 2)
+            download.assert_called_once()
+
     def test_real_ytdlp_selects_both_best_video_and_original_audio(self):
         from yt_dlp import YoutubeDL
         manifest = player_manifest(document(), ID, safe_url=lambda _: True)
