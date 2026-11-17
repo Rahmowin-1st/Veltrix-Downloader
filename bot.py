@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.10.2"
+VERSION = "9.11.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -898,6 +898,8 @@ def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
 
 
 def extract_snapchat_public(url: str) -> dict[str, Any]:
+    from source_metadata import snapchat_modern_video
+
     cached = metadata_cache_get(f"snapchat:{url}")
     if cached:
         return cached
@@ -922,6 +924,11 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
         except ValueError:
             doc = {}
         if candidate_id:
+            info = snapchat_modern_video(response.text, candidate_id)
+            if info:
+                info['page_url'] = page_url
+                metadata_cache_put(f"snapchat:{url}", info)
+                return info
             info = _snap_info_from_doc(doc, page_url)
             if info:
                 info["entries"] = [{"url": info["url"], "kind": "video"}]
@@ -2137,9 +2144,8 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         mark_state("sending")
         result = await _retry_telegram(send_once)
         if progress is not None:
-            # sendMediaGroup cannot accept reply_markup, but its returned
-            # messages can be edited after the album is delivered.
             progress["last_message"] = result[-1] if isinstance(result, (list, tuple)) and result else result
+            progress["last_message_is_album"] = len(batch) > 1
         sent += len(batch)
         if progress is not None:
             progress["sent"] = sent
@@ -2444,20 +2450,25 @@ async def run_job(
                 await asyncio.gather(ticker, return_exceptions=True)
                 attached = False
                 last_message = progress.get("last_message")
-                if markup is not None and last_message is not None and hasattr(last_message, 'edit_reply_markup'):
+                if (markup is not None and last_message is not None
+                        and not progress.get("last_message_is_album")
+                        and hasattr(last_message, 'edit_reply_markup')):
                     try:
                         await last_message.edit_reply_markup(reply_markup=markup,
                                                              connect_timeout=8, read_timeout=8)
                         attached = True
                     except TelegramError as exc:
                         log.info("Media keyboard attachment failed: %s", type(exc).__name__)
-                updated = await edit_status(status, f"✅ {len(files)} media delivered" +
-                                            (" · MP3" if markup and not attached else ""),
-                                            reply_markup=None if attached else markup)
-                if markup is not None and not attached and not updated:
-                    # An album cannot carry an inline keyboard. If editing its
-                    # status fails, still deliver the saved audio action.
-                    await msg.reply_text("🎵 MP3", reply_markup=markup)
+                if markup is not None and not attached:
+                    # Place the action after the album so it stays visible.
+                    # Telegram rejects inline keyboards on grouped media.
+                    try:
+                        await _retry_telegram(lambda: msg.reply_text("🎵 MP3", reply_markup=markup))
+                        attached = True
+                    except TelegramError as exc:
+                        log.info("MP3 message unavailable: %s", type(exc).__name__)
+                await edit_status(status, f"✅ {len(files)} media delivered",
+                                  reply_markup=None if attached else markup)
             metric_add("jobs_succeeded", 1)
             await report_job_event(event_id, source, 'delivered', items=sent)
     except Exception as exc:

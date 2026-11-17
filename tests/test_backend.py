@@ -144,6 +144,43 @@ class BackendTests(unittest.TestCase):
         candidates = bot.extractor_candidates(url)
         self.assertTrue(any("/@creator/spotlight/" in item for item in candidates))
 
+    def test_snapchat_modern_page_selects_exact_video_not_up_next(self):
+        from source_metadata import snapchat_modern_video
+
+        wanted = {'rawSnapId': 'wanted', 'videoUrl': 'https://cf-st.sc-cdn.net/d/right',
+                  'width': 1080, 'height': 1920}
+        other = {'rawSnapId': 'other', 'videoUrl': 'https://cf-st.sc-cdn.net/d/wrong'}
+        payload = json.dumps({'upNext': {'video': other}, 'video': wanted})
+        stream = f'1a:T{len(payload.encode()):x},{payload}\n'
+        page = ''.join('<script>self.__next_f.push(' + json.dumps([1, part]) + ')</script>'
+                       for part in [stream[:35], stream[35:]])
+        info = snapchat_modern_video(page, 'wanted')
+        self.assertEqual(info['url'], wanted['videoUrl'])
+        self.assertEqual(info['entries'][0]['formats'][0]['height'], 1920)
+        self.assertEqual(snapchat_modern_video(page, 'missing'), {})
+
+    def test_snapchat_json_ld_download_path_preserves_exact_identity(self):
+        url = 'https://www.snapchat.com/@creator/spotlight/modern_ld'
+        media = 'https://cf-st.sc-cdn.net/d/actual'
+        document = {'@graph': [
+            {'@type': 'VideoObject', 'url': url + '_other', 'contentUrl': media + '_wrong'},
+            {'@type': 'VideoObject', 'url': url, 'contentUrl': media, 'name': 'The requested video'},
+        ]}
+        page = f'<script type="application/ld+json">{json.dumps(document)}</script>'
+        response = httpx.Response(200, text=page, request=httpx.Request('GET', url))
+        with patch('bot.fetch_public_page', return_value=response):
+            info = bot.extract_snapchat_public(url)
+        self.assertEqual(info['url'], media)
+        self.assertEqual(info['title'], 'The requested video')
+        self.assertEqual(info['entries'][0]['kind'], 'video')
+
+    def test_snapchat_malformed_script_is_ignored_without_evaluation(self):
+        from source_metadata import snapchat_modern_video
+
+        page = '<script>self.__next_f.push(evil());</script>'
+        page += '<script type="application/ld+json">not JSON</script>'
+        self.assertEqual(snapchat_modern_video(page, 'wanted'), {})
+
     def test_snapchat_encoded_handle_uses_the_exact_spotlight(self):
         url = 'https://www.snapchat.com/%40creator/spotlight/W7_ABC123'
         with patch('bot.fetch_public_page') as fetch:

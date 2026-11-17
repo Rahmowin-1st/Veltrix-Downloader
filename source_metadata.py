@@ -80,6 +80,61 @@ def dictionaries(document):
             pending.extend(node)
 
 
+def snapchat_modern_video(page: str, requested_id: str) -> dict:
+    """Read the requested Spotlight from JSON-LD or streamed Next.js data."""
+    decoder = json.JSONDecoder()
+    documents, chunks = [], []
+    for script in re.finditer(r'<script\b([^>]*)>(.*?)</script\s*>', page, re.I | re.S):
+        body = script[2].strip()
+        if re.search(r'\btype\s*=\s*["\']application/ld\+json["\']', script[1], re.I):
+            try:
+                documents.append(json.loads(body))
+            except ValueError:
+                pass
+        for marker in re.finditer(r'\bself\.__next_f\.push\(\s*', body):
+            try:
+                chunk, _ = decoder.raw_decode(body, marker.end())
+            except ValueError:
+                continue
+            if isinstance(chunk, list) and len(chunk) == 2 and chunk[0] == 1 and isinstance(chunk[1], str):
+                chunks.append(chunk[1])
+    # A record can span several script tags. Text records prefix JSON with
+    # T<byte length>, while model records start directly with the JSON value.
+    stream = ''.join(chunks)
+    for marker in re.finditer(r'(?:^|\n)[0-9a-f]+:(?:T[0-9a-f]+,)?(?=[{\[])', stream):
+        try:
+            document, _ = decoder.raw_decode(stream, marker.end())
+            documents.append(document)
+        except ValueError:
+            continue
+
+    formats, title = [], ''
+    for document in documents:
+        for item in dictionaries(document):
+            if item.get('rawSnapId') == requested_id:
+                url = item.get('videoUrl')
+            elif item.get('@type') == 'VideoObject':
+                identity = item.get('url')
+                parsed = urlparse(identity) if isinstance(identity, str) else None
+                if (parsed is None or parsed.hostname not in {'snapchat.com', 'www.snapchat.com'}
+                        or not re.fullmatch(r'/(?:@[^/]+/)?spotlight/' + re.escape(requested_id) + r'/?', parsed.path)):
+                    continue
+                url = item.get('contentUrl')
+            else:
+                continue
+            if not isinstance(url, str) or not url.startswith('https://'):
+                continue
+            if any(fmt['url'] == url for fmt in formats):
+                continue
+            formats.append({'url': url, 'width': item.get('width'), 'height': item.get('height')})
+            title = title or str(item.get('caption') or item.get('name') or '')
+    if not formats:
+        return {}
+    formats.sort(key=media_quality, reverse=True)
+    return {'id': requested_id, 'url': formats[0]['url'], 'title': title,
+            'entries': [{'kind': 'video', 'formats': formats}]}
+
+
 def instagram_dash_audio_urls(item: dict) -> list[str]:
     """Read full-object audio BaseURLs from this item's DASH metadata only.
 

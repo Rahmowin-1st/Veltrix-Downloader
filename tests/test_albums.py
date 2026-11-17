@@ -237,7 +237,8 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.msg = SimpleNamespace(reply_media_group=AsyncMock(side_effect=receive),
                                    reply_photo=AsyncMock(side_effect=receive),
                                    reply_video=AsyncMock(side_effect=receive),
-                                   reply_audio=AsyncMock(side_effect=receive))
+                                   reply_audio=AsyncMock(side_effect=receive),
+                                   reply_text=AsyncMock())
         self.patches = [patch("bot.classify", side_effect=lambda p: {".jpg": "image", ".mp4": "video", ".m4a": "audio"}[p.suffix]),
                         patch("bot.fit_image", side_effect=lambda path, dest: path),
                         patch("media_io.native_audio", side_effect=lambda path, dest: path),
@@ -308,7 +309,8 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.messages, [["photo", "video", "video"]])
         self.assertEqual(button.call_args.args[2], files[1:])
         self.assertEqual(button.call_count, 1)
-        self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"], markup)
+        self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
+        self.assertIsNone(status.edit_text.call_args.kwargs["reply_markup"])
         status.delete.assert_not_called()
 
     async def test_mp3_button_is_under_the_delivered_video(self):
@@ -347,7 +349,8 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.messages, [["photo", "photo"]])
         button.assert_called_once()
         self.assertEqual(button.call_args.args[2], [])
-        self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"], markup)
+        self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
+        self.assertIsNone(status.edit_text.call_args.kwargs["reply_markup"])
 
     async def test_silent_video_still_gets_mp3_check_action(self):
         files = self.files(['.mp4'])
@@ -385,6 +388,22 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
             await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "auto", status)
         self.assertEqual(self.messages, [["photo", "video"]])
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
+
+    async def test_album_button_follows_media_without_editing_grouped_messages(self):
+        files = self.files([".jpg", ".mp4"])
+        delivered = SimpleNamespace(edit_reply_markup=AsyncMock(side_effect=BadRequest("grouped media")))
+        self.msg.reply_media_group.return_value = [delivered, delivered]
+        self.msg.reply_media_group.side_effect = None
+        status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+        self.msg.chat_id = 42
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with patch("bot.download_in_worker", new_callable=AsyncMock, return_value=files), \
+             patch("bot.has_audio", return_value=True), patch("bot.post_mp3_button") as button, \
+             patch("bot._global_sem", None), patch("bot._job_locks", {}):
+            await bot.run_job(self.msg, context, 42, "https://instagram.com/p/album/", "auto", status)
+        delivered.edit_reply_markup.assert_not_awaited()
+        self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=button.return_value)
+        self.assertIsNone(status.edit_text.call_args.kwargs["reply_markup"])
 
     async def test_expired_post_cache_redownloads_all_items(self):
         query = SimpleNamespace(data="mp3|post", from_user=SimpleNamespace(id=42),
