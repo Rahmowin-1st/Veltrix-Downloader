@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.12.0"
+VERSION = "9.12.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -897,6 +897,36 @@ def _snap_page_owns_spotlight(page: str, page_url: str) -> bool:
     return True
 
 
+def snapchat_lookup(snap_id: str, *, client_factory=httpx.Client) -> dict[str, Any]:
+    """Use Snapchat's exact-ID public lookup if its page has no usable data."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]{30,160}', snap_id):
+        return {}
+    try:
+        with client_factory(timeout=12, follow_redirects=False, proxy=PROXY or None, trust_env=False) as client:
+            with client.stream('POST', 'https://www.snapchat.com/api/spotlight-up-next',
+                               headers=request_headers('https://www.snapchat.com/'),
+                               json={'source': 'lookup', 'videoIds': [snap_id]}) as response:
+                response.raise_for_status()
+                content = bytearray()
+                for chunk in response.iter_bytes(65536):
+                    content.extend(chunk)
+                    if len(content) > 2 * 1024 * 1024:
+                        return {}
+                payload = json.loads(content)
+        for item in payload.get('items') or []:
+            video = item.get('video') if isinstance(item, dict) else None
+            if not isinstance(video, dict) or video.get('rawSnapId') != snap_id:
+                continue
+            url = video.get('videoUrl')
+            if not isinstance(url, str) or not safe_remote_url(url):
+                continue
+            return {'id': snap_id, 'url': url, 'title': str(video.get('caption') or ''),
+                    'entries': [{'kind': 'video', 'formats': [{'url': url}]}]}
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return {}
+
+
 def extract_snapchat_public(url: str) -> dict[str, Any]:
     from source_metadata import snapchat_modern_video
 
@@ -941,6 +971,11 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
                 continue
             entries = snapchat_story_entries(doc, candidate)
             info = {"entries": entries, "title": "Snapchat story"} if entries else {}
+        if info:
+            metadata_cache_put(f"snapchat:{url}", info)
+            return info
+    if snap_id:
+        info = snapchat_lookup(snap_id)
         if info:
             metadata_cache_put(f"snapchat:{url}", info)
             return info

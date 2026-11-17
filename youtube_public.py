@@ -6,6 +6,7 @@ No account, API key, age confirmation or third-party download service is used.
 from __future__ import annotations
 
 import re
+import json
 from urllib.parse import urlparse
 
 import httpx
@@ -13,23 +14,30 @@ from yt_dlp.utils import mimetype2ext, parse_codecs
 
 
 PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
+PLAYER_ENDPOINTS = (PLAYER_URL, 'https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false')
 SAFARI_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) '
              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15')
 MAX_RESPONSE = 4 * 1024 * 1024
 
 
-def player_request(client, video_id: str, context: dict, client_id: str) -> dict:
-    headers = {'Content-Type': 'application/json', 'User-Agent': SAFARI_UA,
+def player_request(client, video_id: str, context: dict, client_id: str, endpoint=PLAYER_URL) -> dict:
+    headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' if client_id == '1' else SAFARI_UA,
                'Accept-Language': 'en-US,en', 'X-Youtube-Client-Name': client_id}
-    with client.stream('POST', PLAYER_URL, headers=headers,
+    with client.stream('POST', endpoint, headers=headers,
                        json={'context': {'client': context}, 'videoId': video_id}) as response:
-        response.raise_for_status()
         data = bytearray()
-        for chunk in response.iter_bytes():
+        for chunk in response.iter_bytes(65536):
             data.extend(chunk)
             if len(data) > MAX_RESPONSE:
                 raise RuntimeError('YouTube player response exceeds metadata limit')
-        import json
+        if not response.is_success:
+            try:
+                detail = str(json.loads(data).get('error', {}).get('message') or '')
+            except (ValueError, AttributeError):
+                detail = ''
+            detail = re.sub(r'https?://\S+', '[url]', detail)[:220]
+            raise httpx.HTTPStatusError(f'YouTube {context["clientName"]} player HTTP{response.status_code}: {detail}',
+                                        request=response.request, response=response)
         result = json.loads(data)
     if not isinstance(result, dict):
         raise RuntimeError('Invalid YouTube player response')
@@ -103,14 +111,23 @@ def request_manifest(video_id: str, *, safe_url, proxy=None, client_factory=http
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
         raise ValueError('Invalid YouTube video ID')
     with client_factory(timeout=12, follow_redirects=False, proxy=proxy, trust_env=False) as client:
-        seed = player_request(client, video_id, {
-            'clientName': 'WEB', 'clientVersion': '2.20260708.00.00',
-            'osName': 'Windows', 'osVersion': '10.0', 'platform': 'DESKTOP'}, '1')
-        context = {'clientName': 'VISIONOS', 'clientVersion': '1.02', 'deviceMake': 'Apple',
-                   'platform': 'MOBILE', 'osName': 'visionOS', 'osVersion': '26.5.23O471',
-                   'deviceModel': 'RealityDevice17,1'}
-        visitor = visitor_data(seed)
-        if visitor:
-            context['visitorData'] = visitor
-        document = player_request(client, video_id, context, '101')
+        for index, endpoint in enumerate(PLAYER_ENDPOINTS):
+            try:
+                seed = player_request(client, video_id, {
+                    'clientName': 'WEB', 'clientVersion': '2.20260708.00.00',
+                    'osName': 'Windows', 'osVersion': '10.0', 'platform': 'DESKTOP'}, '1', endpoint)
+                context = {'clientName': 'VISIONOS', 'clientVersion': '1.02', 'deviceMake': 'Apple',
+                           'platform': 'MOBILE', 'osName': 'visionOS', 'osVersion': '26.5.23O471',
+                           'deviceModel': 'RealityDevice17,1'}
+                visitor = visitor_data(seed)
+                if visitor:
+                    context['visitorData'] = visitor
+                document = player_request(client, video_id, context, '101', endpoint)
+                break
+            except httpx.HTTPStatusError as exc:
+                # The web front door can reject a request before it reaches the
+                # player API. Try Google's fixed API origin once, never a proxy
+                # or an arbitrary redirect, and never retry a rate limit.
+                if exc.response.status_code not in {403, 404} or index == len(PLAYER_ENDPOINTS) - 1:
+                    raise
     return player_manifest(document, video_id, safe_url=safe_url)

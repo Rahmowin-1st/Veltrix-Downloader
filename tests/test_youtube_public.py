@@ -79,6 +79,28 @@ class YoutubePublicTests(unittest.TestCase):
                 request_manifest(ID, safe_url=lambda _: True,
                     client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(lambda _: response), **kw))
 
+    def test_blocked_web_front_door_uses_fixed_api_origin_once(self):
+        requests = []
+        def handle(req):
+            requests.append(req)
+            if req.url.host == 'www.youtube.com':
+                return httpx.Response(403)
+            return httpx.Response(200, json=document() if len(requests) == 3 else {'responseContext': {'visitorData': 'guest'}})
+        data = request_manifest(ID, safe_url=lambda _: True,
+            client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
+        self.assertEqual(data['id'], ID)
+        self.assertEqual([r.url.host for r in requests], ['www.youtube.com', 'youtubei.googleapis.com', 'youtubei.googleapis.com'])
+
+    def test_rate_limit_is_not_replayed_on_another_origin(self):
+        requests = []
+        def handle(req):
+            requests.append(req)
+            return httpx.Response(429)
+        with self.assertRaises(httpx.HTTPStatusError):
+            request_manifest(ID, safe_url=lambda _: True,
+                client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
+        self.assertEqual(len(requests), 1)
+
     def test_short_link_passes_manifest_to_downloader_and_playlists_are_skipped(self):
         manifest = {'id': ID}
         with tempfile.TemporaryDirectory() as folder, patch('youtube_public.request_manifest', return_value=manifest) as request, \

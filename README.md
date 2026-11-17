@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.12.0
+# Veltrix Downloader 9.12.1
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -15,6 +15,9 @@ YouTube has an additional anonymous visitor handshake after yt-dlp fails. It
 uses YouTube's own public player endpoint and the same quality selection,
 audio merge, file validation and Telegram delivery pipeline. It does not need
 a new package or an API key; platform login restrictions can still prevent it.
+Snapchat also tries its public exact-ID lookup when neither modern nor legacy
+page metadata exposes the requested Spotlight. Preview tiles and unrelated IDs
+are excluded.
 
 ## Optional extraction API
 
