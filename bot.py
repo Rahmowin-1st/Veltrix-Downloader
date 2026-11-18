@@ -47,7 +47,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.12.2"
+VERSION = "9.12.3"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':

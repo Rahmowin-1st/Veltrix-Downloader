@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import httpx
 import bot
-from youtube_public import player_manifest, request_manifest
+from youtube_public import player_manifest, request_manifest, watch_visitor
 
 ID = 'u443WxCOAlY'
 
@@ -88,6 +88,8 @@ class YoutubePublicTests(unittest.TestCase):
         self.assertEqual(len(requests), 2)
         bodies = [json.loads(req.content) for req in requests]
         self.assertEqual(bodies[1]['context']['client']['visitorData'], 'guest-only')
+        self.assertEqual(requests[1].headers['X-Goog-Visitor-Id'], 'guest-only')
+        self.assertEqual(requests[1].headers['X-Youtube-Client-Version'], '1.02')
         self.assertTrue(all(body['videoId'] == ID for body in bodies))
         self.assertTrue(all('contentCheckOk' not in body and 'racyCheckOk' not in body for body in bodies))
         self.assertTrue(all('authorization' not in req.headers and 'cookie' not in req.headers for req in requests))
@@ -105,11 +107,80 @@ class YoutubePublicTests(unittest.TestCase):
             requests.append(req)
             if req.url.host == 'www.youtube.com':
                 return httpx.Response(403)
-            return httpx.Response(200, json=document() if len(requests) == 3 else {'responseContext': {'visitorData': 'guest'}})
+            body = json.loads(req.content)
+            return httpx.Response(200, json=document() if body['context']['client']['clientName'] == 'VISIONOS'
+                                  else {'responseContext': {'visitorData': 'guest'}})
         data = request_manifest(ID, safe_url=lambda _: True,
             client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
         self.assertEqual(data['id'], ID)
-        self.assertEqual([r.url.host for r in requests], ['www.youtube.com', 'youtubei.googleapis.com', 'youtubei.googleapis.com'])
+        self.assertEqual([(r.method, r.url.host) for r in requests], [
+            ('POST', 'www.youtube.com'), ('GET', 'www.youtube.com'),
+            ('POST', 'youtubei.googleapis.com'), ('POST', 'youtubei.googleapis.com')])
+
+    def test_watch_context_recovers_blocked_bootstrap_and_survives_origin_switch(self):
+        requests = []
+        def handle(req):
+            requests.append(req)
+            if req.method == 'GET':
+                return httpx.Response(200, headers={'content-type': 'text/html'}, text=
+                    '<script>ytcfg.set("ignored", false);ytcfg.set({"VISITOR_DATA":"watch-guest"});</script>')
+            if req.url.host == 'www.youtube.com':
+                return httpx.Response(403)
+            return httpx.Response(200, json=document())
+        result = request_manifest(ID, safe_url=lambda _: True,
+            client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
+        self.assertEqual(result['id'], ID)
+        self.assertEqual(len(requests), 4)
+        for req in requests[2:]:
+            context = json.loads(req.content)['context']['client']
+            self.assertEqual((context['clientName'], context['visitorData']), ('VISIONOS', 'watch-guest'))
+        self.assertEqual(str(requests[1].url), 'https://www.youtube.com/watch?v=' + ID)
+
+    def test_missing_seed_visitor_uses_watch_context(self):
+        requests = []
+        def handle(req):
+            requests.append(req)
+            if req.method == 'GET':
+                return httpx.Response(200, headers={'content-type': 'text/html'}, text=
+                    'ytcfg.set({"INNERTUBE_CONTEXT":{"client":{"visitorData":"nested-guest"}}});')
+            return httpx.Response(200, json={} if len(requests) == 1 else document())
+        request_manifest(ID, safe_url=lambda _: True,
+            client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
+        self.assertEqual(json.loads(requests[-1].content)['context']['client']['visitorData'], 'nested-guest')
+
+    def test_watch_page_remains_bounded_and_does_not_follow_redirects(self):
+        for response in [httpx.Response(307, headers={'location': 'https://elsewhere.test/'}),
+                         httpx.Response(200, headers={'content-type': 'text/html'}, content=b'x' * (4 * 1024 * 1024 + 1)),
+                         httpx.Response(200, headers={'content-type': 'application/json'}, json={'VISITOR_DATA': 'guest'})]:
+            calls = []
+            def handle(req):
+                calls.append(req)
+                return response
+            with httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False) as client:
+                with self.assertRaises((RuntimeError, httpx.HTTPError)):
+                    watch_visitor(client, ID)
+            self.assertEqual(len(calls), 1)
+
+    def test_watch_bootstrap_cannot_override_video_access_restrictions(self):
+        def handle(req):
+            if req.method == 'GET':
+                return httpx.Response(200, headers={'content-type': 'text/html'}, text='ytcfg.set({"VISITOR_DATA":"guest"});')
+            if json.loads(req.content)['context']['client']['clientName'] == 'WEB':
+                return httpx.Response(403)
+            return httpx.Response(200, json={'playabilityStatus': {'status': 'LOGIN_REQUIRED', 'reason': 'Sign in to confirm your age'}})
+        with self.assertRaisesRegex(RuntimeError, 'Sign in to confirm your age'):
+            request_manifest(ID, safe_url=lambda _: True,
+                client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
+
+    def test_watch_rate_limit_stops_without_another_origin(self):
+        requests = []
+        def handle(req):
+            requests.append(req)
+            return httpx.Response(429 if req.method == 'GET' else 403)
+        with self.assertRaises(httpx.HTTPStatusError):
+            request_manifest(ID, safe_url=lambda _: True,
+                client_factory=lambda **kw: httpx.Client(transport=httpx.MockTransport(handle), **kw))
+        self.assertEqual(len(requests), 2)
 
     def test_rate_limit_is_not_replayed_on_another_origin(self):
         requests = []

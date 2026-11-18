@@ -1,6 +1,7 @@
 """Bounded anonymous player fallback; downloads still use yt-dlp's pipeline.
 
-The two-request visitor handshake follows pytubefix's public VISION_OS client.
+The visitor handshake follows pytubefix's public VISION_OS client. If the WEB
+player bootstrap is unavailable, the public watch page can supply visitorData.
 No account, API key, age confirmation or third-party download service is used.
 """
 from __future__ import annotations
@@ -20,16 +21,24 @@ SAFARI_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) '
 MAX_RESPONSE = 4 * 1024 * 1024
 
 
+def response_bytes(response) -> bytes:
+    data = bytearray()
+    for chunk in response.iter_bytes(65536):
+        data.extend(chunk)
+        if len(data) > MAX_RESPONSE:
+            raise RuntimeError('YouTube response exceeds metadata limit')
+    return bytes(data)
+
+
 def player_request(client, video_id: str, context: dict, client_id: str, endpoint=PLAYER_URL) -> dict:
-    headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' if client_id == '1' else SAFARI_UA,
-               'Accept-Language': 'en-US,en', 'X-Youtube-Client-Name': client_id}
+    headers = {'Content-Type': 'application/json', 'User-Agent': SAFARI_UA,
+               'Accept-Language': 'en-US,en', 'X-Youtube-Client-Name': client_id,
+               'X-Youtube-Client-Version': context['clientVersion']}
+    if context.get('visitorData'):
+        headers['X-Goog-Visitor-Id'] = context['visitorData']
     with client.stream('POST', endpoint, headers=headers,
                        json={'context': {'client': context}, 'videoId': video_id}) as response:
-        data = bytearray()
-        for chunk in response.iter_bytes(65536):
-            data.extend(chunk)
-            if len(data) > MAX_RESPONSE:
-                raise RuntimeError('YouTube player response exceeds metadata limit')
+        data = response_bytes(response)
         if not response.is_success:
             try:
                 detail = str(json.loads(data).get('error', {}).get('message') or '')
@@ -42,6 +51,28 @@ def player_request(client, video_id: str, context: dict, client_id: str, endpoin
     if not isinstance(result, dict):
         raise RuntimeError('Invalid YouTube player response')
     return result
+
+
+def watch_visitor(client, video_id: str) -> str:
+    """Read only the guest context, never execute scripts or follow page links."""
+    with client.stream('GET', f'https://www.youtube.com/watch?v={video_id}',
+                       headers={'User-Agent': SAFARI_UA, 'Accept-Language': 'en-US,en'}) as response:
+        response.raise_for_status()
+        if 'text/html' not in response.headers.get('content-type', '').lower():
+            raise RuntimeError('YouTube watch page returned invalid metadata')
+        page = response_bytes(response).decode('utf-8', errors='replace')
+    decoder = json.JSONDecoder()
+    # ytcfg.set also has calls with non-JSON arguments. Only decode an object.
+    for match in re.finditer(r'\bytcfg\.set\s*\(\s*(?=\{)', page):
+        try:
+            config, _ = decoder.raw_decode(page, match.end())
+        except ValueError:
+            continue
+        context = config.get('INNERTUBE_CONTEXT') or {}
+        value = config.get('VISITOR_DATA') or (context.get('client') or {}).get('visitorData')
+        if isinstance(value, str) and 0 < len(value) <= 4096 and value.isascii() and value.isprintable():
+            return value
+    return ''
 
 
 def visitor_data(document: dict) -> str:
@@ -111,15 +142,31 @@ def request_manifest(video_id: str, *, safe_url, proxy=None, client_factory=http
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
         raise ValueError('Invalid YouTube video ID')
     with client_factory(timeout=12, follow_redirects=False, proxy=proxy, trust_env=False) as client:
+        visitor = ''
+        watch_checked = False
         for index, endpoint in enumerate(PLAYER_ENDPOINTS):
             try:
-                seed = player_request(client, video_id, {
-                    'clientName': 'WEB', 'clientVersion': '2.20260708.00.00',
-                    'osName': 'Windows', 'osVersion': '10.0', 'platform': 'DESKTOP'}, '1', endpoint)
+                if not visitor:
+                    try:
+                        seed = player_request(client, video_id, {
+                            'clientName': 'WEB', 'clientVersion': '2.20260708.00.00',
+                            'osName': 'Windows', 'osVersion': '10.0', 'platform': 'DESKTOP'}, '1', endpoint)
+                        visitor = visitor_data(seed)
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code not in {403, 404}:
+                            raise
+                        if watch_checked:
+                            raise
+                        watch_checked = True
+                        visitor = watch_visitor(client, video_id)
+                        if not visitor:
+                            raise exc
+                    if not visitor and not watch_checked:
+                        watch_checked = True
+                        visitor = watch_visitor(client, video_id)
                 context = {'clientName': 'VISIONOS', 'clientVersion': '1.02', 'deviceMake': 'Apple',
                            'platform': 'MOBILE', 'osName': 'visionOS', 'osVersion': '26.5.23O471',
                            'deviceModel': 'RealityDevice17,1'}
-                visitor = visitor_data(seed)
                 if visitor:
                     context['visitorData'] = visitor
                 document = player_request(client, video_id, context, '101', endpoint)

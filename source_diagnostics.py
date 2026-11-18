@@ -148,6 +148,33 @@ def probe_youtube(ids: str) -> None:
                 log.info('YouTube probe #%s %s: %s', index, client, reason(exc))
 
 
+def probe_youtube_public(ids: str) -> None:
+    """Inspect the guest handshake, then download only if it exposes formats."""
+    import bot
+    import httpx
+    from youtube_public import request_manifest
+
+    for index, video_id in enumerate(ids.split(',')[:2], 1):
+        video_id = video_id.strip()
+        if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+            continue
+        def response_status(response):
+            request = response.request
+            label = 'watch'
+            if request.method == 'POST':
+                label = json.loads(request.content)['context']['client']['clientName']
+            log.info('YouTube guest probe #%s %s: HTTP%s', index, label, response.status_code)
+        try:
+            info = request_manifest(video_id, safe_url=bot.safe_remote_url, proxy=bot.PROXY or None,
+                client_factory=lambda **kw: httpx.Client(event_hooks={'response': [response_status]}, **kw))
+            formats = info.get('formats') or []
+            log.info('YouTube guest probe #%s: formats=%s max_height=%s', index, len(formats),
+                     max((f.get('height') or 0 for f in formats), default=0))
+            asyncio.run(probe_downloads([f'https://www.youtube.com/watch?v={video_id}']))
+        except Exception as exc:
+            log.info('YouTube guest probe #%s: %s', index, reason(exc))
+
+
 def probe_pinterest(short_code: str) -> None:
     if not re.fullmatch(r'[A-Za-z0-9_-]{5,40}', short_code):
         log.warning('Pinterest probe: invalid short code')
@@ -299,5 +326,8 @@ def run() -> None:
         probe_snapchat(snap)
     if youtube:
         probe_youtube(youtube)
+    public_youtube = os.getenv('SOURCE_PROBE_YOUTUBE_PUBLIC_IDS', '').strip()
+    if public_youtube:
+        probe_youtube_public(public_youtube)
     if pinterest:
         probe_pinterest(pinterest)
