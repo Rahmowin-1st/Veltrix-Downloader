@@ -173,6 +173,45 @@ def probe_youtube_public(ids: str) -> None:
             asyncio.run(probe_downloads([f'https://www.youtube.com/watch?v={video_id}']))
         except Exception as exc:
             log.info('YouTube guest probe #%s: %s', index, reason(exc))
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403:
+                probe_youtube_urllib(video_id)
+
+
+def probe_youtube_urllib(video_id: str) -> None:
+    """Compare the standard-library transport on the same fixed public routes."""
+    import urllib.error
+    import urllib.request
+    import bot
+    import httpx
+    from youtube_public import request_manifest, MAX_RESPONSE
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler(
+        {'https': bot.PROXY} if bot.PROXY else {}))
+    def exchange(request):
+        req = urllib.request.Request(str(request.url), data=request.content or None,
+                                     headers=dict(request.headers), method=request.method)
+        try:
+            response = opener.open(req, timeout=12)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        with response:
+            body = response.read(MAX_RESPONSE + 1)
+            label = 'watch' if request.method == 'GET' else json.loads(request.content)['context']['client']['clientName']
+            log.info('YouTube urllib probe %s: HTTP%s type=%s server=%s', label, response.code,
+                     response.headers.get_content_type(), str(response.headers.get('server', ''))[:40])
+            return httpx.Response(response.code, headers=dict(response.headers), content=body, request=request)
+    def client_factory(**kwargs):
+        kwargs.pop('proxy', None)  # Explicit proxy belongs to the opener above.
+        return httpx.Client(transport=httpx.MockTransport(exchange), **kwargs)
+    try:
+        info = request_manifest(video_id, safe_url=bot.safe_remote_url, client_factory=client_factory)
+        log.info('YouTube urllib probe: formats=%s', len(info.get('formats') or []))
+    except Exception as exc:
+        log.info('YouTube urllib probe: %s', reason(exc))
 
 
 def probe_pinterest(short_code: str) -> None:
