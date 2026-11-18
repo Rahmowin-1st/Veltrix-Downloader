@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.12.3
+# Veltrix Downloader 9.13.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -27,7 +27,14 @@ Snapchat also tries its public exact-ID lookup when neither modern nor legacy
 page metadata exposes the requested Spotlight. Preview tiles and unrelated IDs
 are excluded.
 
-## Optional extraction API
+## Optional extraction APIs
+
+Set `NEWISTY_YOUTUBE=1` to enable the [Newisty developer API](https://newisty.com/pages/developers#video-downloader)
+for individual public YouTube videos when direct extraction hits YouTube's bot check.
+The service receives the canonical video URL and requested format. Its queue and
+rate limits apply. The worker verifies the video ID in metadata and checks the
+download's type and duration. `/original` returns the provider's best MP4 when this
+route is used. Leave the setting at `0` to use only the other configured extractors.
 
 An owner-operated or explicitly authorized [Cobalt API](https://github.com/imputnet/cobalt/blob/main/docs/api.md)
 can be used after built-in extractors fail or return silent videos:

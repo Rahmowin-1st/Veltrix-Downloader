@@ -182,6 +182,35 @@ class RealMediaFallbackTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
+    def test_source_tries_next_rendition_after_invalid_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            entries = [{'kind': 'video', 'formats': [{'url': 'https://cdn.test/broken.mp4'},
+                                                     {'url': 'https://cdn.test/valid.mp4'}]}]
+
+            def receive(url, path, **kwargs):
+                if 'broken.mp4' in url:
+                    path.write_bytes(b'this is not a video')
+                else:
+                    shutil.copyfile(self.audible, path)
+                return True
+
+            with patch('bot.safe_remote_url', return_value=True), patch('bot._download_direct_file', side_effect=receive):
+                output, = bot.download_source_entries(entries, Path(folder) / 'media',
+                                                      'https://instagram.com/reel/example/')
+            self.assertTrue(bot.has_audio(output))
+            self.assertEqual(output.read_bytes(), self.audible.read_bytes())
+
+    def test_matching_item_audio_keeps_both_encoded_streams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = bot.attach_post_music(self.silent, self.music, Path(directory), loop_audio=False)
+
+            def audio_hash(path):
+                return subprocess.check_output(['ffmpeg', '-v', 'error', '-i', str(path), '-map', '0:a:0',
+                                                '-c', 'copy', '-f', 'hash', '-'], timeout=10)
+
+            self.assertTrue(same_video_stream(self.silent, output))
+            self.assertEqual(audio_hash(output), audio_hash(self.music))
+
     def test_one_audible_video_does_not_stop_search_for_other_tracks(self):
         with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \
              patch('bot.safe_remote_url', return_value=True), \

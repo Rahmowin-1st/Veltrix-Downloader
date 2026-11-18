@@ -43,11 +43,12 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 from cobalt_provider import ProviderError
+from newisty_provider import ProviderRateLimit
 from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.12.3"
+VERSION = "9.13.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -714,13 +715,24 @@ def attach_post_music(video: Path, music: Path, folder: Path, *, loop_audio: boo
     folder.mkdir(parents=True, exist_ok=True)
     output = folder / f'{video.stem}_post_music.mkv'
     try:
-        ffmpeg(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(video),
-                *(['-stream_loop', '-1'] if loop_audio else []), '-i', str(music),
-                '-map', '0:V:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k',
-                *([] if loop_audio else ['-af', 'apad']), '-shortest', str(output)])
+        source_duration = float(probe(video).get('format', {}).get('duration') or 0)
+        music_duration = float(probe(music).get('format', {}).get('duration') or 0)
+        # A matching soundtrack needs no padding, looping or lossy AAC encode.
+        copied = False
+        if source_duration > 0 and abs(source_duration - music_duration) <= .1:
+            try:
+                ffmpeg(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(video), '-i', str(music),
+                        '-map', '0:V:0', '-map', '1:a:0', '-c', 'copy', str(output)])
+                copied = has_audio(output)
+            except (RuntimeError, subprocess.SubprocessError):
+                pass
+        if not copied:
+            ffmpeg(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(video),
+                    *(['-stream_loop', '-1'] if loop_audio else []), '-i', str(music),
+                    '-map', '0:V:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k',
+                    *([] if loop_audio else ['-af', 'apad']), '-shortest', str(output)])
         if not has_audio(output):
             raise RuntimeError('Could not attach the source audio to its video')
-        source_duration = float(probe(video).get('format', {}).get('duration') or 0)
         output_duration = float(probe(output).get('format', {}).get('duration') or 0)
         if source_duration > 0 and abs(output_duration - source_duration) > max(0.25, source_duration * 0.03):
             raise RuntimeError('Attaching audio changed the video duration')
@@ -1300,6 +1312,8 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
 
 
 def download_source_entries(entries: list[dict], dest: Path, referer: str) -> list[Path]:
+    from media_io import InvalidMedia
+
     if len(entries) > MAX_GALLERY_ITEMS:
         raise RuntimeError("Post exceeds configured item limit")
     outputs = []
@@ -1362,6 +1376,9 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
                 break
             except TransferLimit as exc:
                 source_limit = exc
+            except InvalidMedia:
+                # A corrupt rendition does not make the next rendition incomplete.
+                continue
             except Exception as exc:
                 if fatal_download_error(exc):
                     raise
@@ -1651,6 +1668,29 @@ def download_cobalt(url: str, mode: str, tmpdir: str) -> list[Path]:
     return download_source_entries(entries, Path(tmpdir) / 'cobalt', url)
 
 
+def newisty_enabled() -> bool:
+    return (os.getenv('NEWISTY_YOUTUBE', '').strip() == '1'
+            and not os.getenv('YOUTUBE_COOKIE_FILE') and not os.getenv('YOUTUBE_COOKIES_B64'))
+
+
+def download_newisty(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
+    from newisty_provider import fetch
+
+    if not errors or not re.search(r"confirm you[’']re not a bot", str(errors[0]), re.I):
+        return []
+    canonical = extract_url(url)
+    if not canonical or not canonical.startswith('https://www.youtube.com/watch?v='):
+        return []
+    video_id = canonical.removeprefix('https://www.youtube.com/watch?v=')
+    qualities = {'auto': 'best-mp4', 'original': 'best-mp4', 'best': 'best-mp4',
+                 '1080': '1080p', '720': '720p', '480': '480p', 'm4a': 'audio-m4a'}
+    quality = 'audio-mp3' if mode.startswith('mp3_') else qualities.get(mode)
+    if not quality:
+        return []
+    return fetch(video_id, quality, Path(tmpdir) / 'newisty', safe_url=safe_remote_url,
+                 budget=check_download_budget, max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None)
+
+
 def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = None) -> list[Path]:
     from media_io import same_video_stream
 
@@ -1670,6 +1710,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     if platform == "youtube":
         engines = [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
         if not youtube_playlist_url(url):
+            if newisty_enabled():
+                engines.append(lambda folder, extract_mode: download_newisty(url, extract_mode, folder, errors))
             engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
     elif platform == "instagram":
         dedicated = lambda folder, _: download_instagram_dedicated(url, folder, (prefetched or {}).get("_instagram_info"))[0]
@@ -1756,7 +1798,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 raise
             # A provider configuration/outage error must not hide the actual
             # platform failure (e.g. YouTube's bot check) from the user.
-            if not isinstance(exc, ProviderError) or not errors:
+            if not isinstance(exc, ProviderError) or isinstance(exc, ProviderRateLimit) or not errors:
                 errors.append(exc)
             log.warning("%s extractor failed: %s", platform, type(exc).__name__)
         if not any(p.is_relative_to(attempt) for p in candidate + candidate_tracks):
@@ -1770,7 +1812,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 path.rename(soundtrack / f'{index:05d}{path.suffix}')
         return candidate
     if errors:
-        raise next((exc for exc in errors if isinstance(exc, IncompletePost)), errors[-1])
+        raise next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit))), errors[-1])
     raise RuntimeError("No public downloadable media found")
 
 
@@ -1901,6 +1943,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "⚡ Veltrix Downloader\n\n"
         "YouTube • Instagram • Snapchat • Pinterest\n"
         "Send a media link — I download it automatically."
+        + ("\nFor public YouTube videos, Newisty can process the video link if needed." if newisty_enabled() else "")
     )
 
 
@@ -1910,6 +1953,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎬 Highest available quality; large videos may arrive in parts.\n"
         "🎵 Tap MP3 after delivery to get audio.\n"
         "📎 Use /original followed by the link to receive source files without Telegram photo compression or video conversion."
+        + ("\nIf YouTube blocks the server, the bot can send the video ID to Newisty’s public download API."
+           if newisty_enabled() else "")
     )
 
 
@@ -2656,10 +2701,10 @@ def check_download_budget(progress: dict) -> None:
         return
     _budget_checked_at = time.monotonic()
     if shutil.disk_usage(root).free < 128 * 1024 * 1024:
-        raise RuntimeError("Insufficient storage; download stopped")
+        raise TransferLimit("Insufficient storage; download stopped")
     used = sum(p.stat().st_size for p in Path(root).rglob("*") if p.is_file())
     if used > MAX_JOB_BYTES:
-        raise RuntimeError("Job storage limit exceeded; download stopped")
+        raise TransferLimit("Job storage limit exceeded; download stopped")
 
 
 def fetch_public_page(url: str) -> httpx.Response:

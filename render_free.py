@@ -55,11 +55,11 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
-log.info('Veltrix %s source access: youtube=%s instagram=%s pinterest=%s snapchat=%s proxy=%s cobalt=%s',
+log.info('Veltrix %s source access: youtube=%s instagram=%s pinterest=%s snapchat=%s proxy=%s cobalt=%s newisty=%s',
          bot.VERSION,
          *(bool(os.getenv(f'{name}_COOKIE_FILE')) for name in
            ('YOUTUBE', 'INSTAGRAM', 'PINTEREST', 'SNAPCHAT')),
-         bool(bot.PROXY), bool(os.getenv('COBALT_API_URL', '').strip()))
+         bool(bot.PROXY), bool(os.getenv('COBALT_API_URL', '').strip()), bot.newisty_enabled())
 
 
 def probe_telegram_egress(token: str) -> None:

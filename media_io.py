@@ -10,6 +10,10 @@ from functools import lru_cache
 from pathlib import Path
 
 
+class InvalidMedia(RuntimeError):
+    """A downloaded rendition did not contain readable media."""
+
+
 @lru_cache(maxsize=256)
 def _probe(name: str, size: int, mtime: int) -> dict:
     result = run(
@@ -17,10 +21,10 @@ def _probe(name: str, size: int, mtime: int) -> dict:
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode:
-        raise RuntimeError("Invalid or incomplete media file")
+        raise InvalidMedia("Invalid or incomplete media file")
     info = json.loads(result.stdout)
     if not info.get("streams"):
-        raise RuntimeError("File has no media streams")
+        raise InvalidMedia("File has no media streams")
     return info
 
 
@@ -225,9 +229,9 @@ def native_video(path: Path, dest: Path) -> Path:
         if audio.get('codec_name') not in {'aac', 'mp3'}:
             audio_options.extend([f'-c:a:{index}', 'aac', f'-b:a:{index}', '256k'])
     result = run([
-        "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(path),
+        "ffmpeg", "-nostdin", "-v", "error", "-y", "-threads", "2", "-filter_threads", "1", "-i", str(path),
         "-map", f"0:{video['index']}", "-map", "0:a?", *video_options,
-        *audio_options, "-movflags", "+faststart", str(output),
+        "-threads:v", "2", *audio_options, "-movflags", "+faststart", str(output),
     ], capture_output=True, timeout=1800)
     if result.returncode or not streamable(output) or sum(
             s.get('codec_type') == 'audio' for s in probe(output)['streams']) != audio_count:
