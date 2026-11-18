@@ -48,7 +48,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.13.0"
+VERSION = "9.13.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -285,6 +285,14 @@ def _save_actions(data: dict[str, dict[str, Any]]) -> None:
     tmp.replace(ACTIONS_FILE)
 
 
+def cache_stored_at(path: Path) -> float:
+    # Hard links retain the source modification time, which can be years old.
+    stamp, separator, _ = path.stem.partition('_')
+    if separator and stamp.isdecimal() and len(stamp) == 19:
+        return int(stamp) / 1_000_000_000
+    return path.stat().st_mtime  # Cache entries from older versions.
+
+
 def cleanup_media_cache() -> None:
     now = time.time()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,7 +302,7 @@ def cleanup_media_cache() -> None:
             if not path.is_file():
                 continue
             try:
-                if now - path.stat().st_mtime > CACHE_TTL_SECONDS:
+                if now - cache_stored_at(path) > CACHE_TTL_SECONDS:
                     path.unlink(missing_ok=True)
                 elif path.exists():
                     files.append(path)
@@ -308,7 +316,7 @@ def cleanup_media_cache() -> None:
         files = [p for p in files if p.exists()]
         total = sum(p.stat().st_size for p in files)
         if total > CACHE_TOTAL_MAX_BYTES:
-            for path in sorted(files, key=lambda p: p.stat().st_mtime):
+            for path in sorted(files, key=cache_stored_at):
                 if total <= CACHE_TOTAL_MAX_BYTES:
                     break
                 try:
@@ -332,8 +340,9 @@ def create_action(
     refresh_audio: bool = False,
 ) -> str:
     """Bind an inline action to the exact request and optionally cache its source."""
-    now = int(time.time())
-    raw = f"{uid}:{url}:{time.time_ns()}".encode()
+    stamp = time.time_ns()
+    now = stamp // 1_000_000_000
+    raw = f"{uid}:{url}:{stamp}".encode()
     token = hashlib.sha256(raw).hexdigest()[:20]
     cleanup_media_cache()
 
@@ -343,11 +352,11 @@ def create_action(
             if source_path.exists() and 0 < source_path.stat().st_size <= CACHE_MAX_BYTES:
                 CACHE_DIR.mkdir(parents=True, exist_ok=True)
                 suffix = source_path.suffix.lower() or ".bin"
-                dest = CACHE_DIR / f"{token}{suffix}"
+                dest = CACHE_DIR / f"{stamp}_{token}{suffix}"
                 try:
                     os.link(source_path, dest)
                 except OSError:
-                    shutil.copy2(source_path, dest)
+                    shutil.copyfile(source_path, dest)
                 cache_path = str(dest)
                 cleanup_media_cache()
                 if not dest.exists():
@@ -395,7 +404,7 @@ def resolve_action_data(uid: int, token: str) -> dict[str, Any]:
     if cache_path:
         path = Path(cache_path)
         try:
-            if not path.exists() or time.time() - path.stat().st_mtime > CACHE_TTL_SECONDS:
+            if not path.is_file() or time.time() - cache_stored_at(path) > CACHE_TTL_SECONDS:
                 row["cache_path"] = ""
         except OSError:
             row["cache_path"] = ""

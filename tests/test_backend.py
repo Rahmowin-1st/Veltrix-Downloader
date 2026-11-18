@@ -1,6 +1,8 @@
 import tempfile
 import unittest
 import json
+import os
+import time
 from unittest.mock import patch
 from pathlib import Path
 import httpx
@@ -9,6 +11,25 @@ import bot
 
 
 class BackendTests(unittest.TestCase):
+    def test_mp3_cache_lifetime_starts_at_insertion_even_for_old_source_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source.mp4'
+            source.write_bytes(b'source audio and video')
+            old = int(time.time()) - bot.CACHE_TTL_SECONDS - 600
+            os.utime(source, (old, old))
+            with patch('bot.DATA_DIR', root), patch('bot.ACTIONS_FILE', root / 'actions.json'), \
+                    patch('bot.CACHE_DIR', root / 'cache'):
+                url = 'https://www.youtube.com/watch?v=kOMHkvxfmd4'
+                token = bot.create_action(7, url, source_path=source)
+                cached = Path(bot.resolve_action_data(7, token)['cache_path'])
+                self.assertEqual(cached.read_bytes(), source.read_bytes())
+                self.assertEqual(int(source.stat().st_mtime), old)
+                with patch('bot.time.time', return_value=time.time() + bot.CACHE_TTL_SECONDS + 3):
+                    bot.cleanup_media_cache()
+                    self.assertFalse(cached.exists())
+                    self.assertEqual(bot.resolve_action_data(7, token)['cache_path'], '')
+
     def test_supported_platforms(self):
         self.assertEqual(bot.platform_of("https://youtu.be/dQw4w9WgXcQ"), "youtube")
         self.assertEqual(bot.platform_of("https://www.instagram.com/reel/abc/"), "instagram")
