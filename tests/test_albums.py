@@ -238,6 +238,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                                    reply_photo=AsyncMock(side_effect=receive),
                                    reply_video=AsyncMock(side_effect=receive),
                                    reply_audio=AsyncMock(side_effect=receive),
+                                   reply_document=AsyncMock(),
                                    reply_text=AsyncMock())
         self.patches = [patch("bot.classify", side_effect=lambda p: {".jpg": "image", ".mp4": "video", ".m4a": "audio"}[p.suffix]),
                         patch("bot.fit_image", side_effect=lambda path, dest: path),
@@ -293,6 +294,60 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TimedOut):
             await bot.send_album(self.msg, self.files([".jpg", ".mp4"]), "", self.root)
         self.assertEqual(self.msg.reply_media_group.await_count, 1)
+
+    async def test_rejected_format_retries_whole_batch_with_ordered_source_bytes(self):
+        source_photo, source_video = self.files(['.jpg', '.mp4'])
+        fitted_photo = self.root / 'fitted.jpg'
+        fitted_photo.write_bytes(b'fitted preview')
+        source_photo.write_bytes(b'original photo')
+        source_video.write_bytes(b'original video')
+        uploads = []
+
+        async def send(*, media):
+            kinds = [item.type for item in media]
+            payloads = [item.media.input_file_content.read() for item in media]
+            uploads.append((kinds, payloads))
+            if kinds == ['photo', 'video']:
+                raise BadRequest('Bad Request: failed to process video')
+            return [SimpleNamespace(), SimpleNamespace()]
+
+        self.msg.reply_media_group.side_effect = send
+        progress = {}
+        with patch('bot.fit_image', return_value=fitted_photo):
+            sent = await bot.send_album(self.msg, [source_photo, source_video], 'caption', self.root, progress)
+        self.assertEqual(sent, 2)
+        self.assertEqual(progress['sent'], 2)
+        self.assertEqual(uploads, [
+            (['photo', 'video'], [b'fitted preview', b'original video']),
+            (['document', 'document'], [b'original photo', b'original video']),
+        ])
+
+    async def test_unrelated_telegram_rejection_is_not_retried(self):
+        self.msg.reply_media_group.side_effect = BadRequest('Chat not found')
+        with self.assertRaises(BadRequest):
+            await bot.send_album(self.msg, self.files(['.jpg', '.mp4']), '', self.root)
+        self.assertEqual(self.msg.reply_media_group.await_count, 1)
+
+    async def test_unfit_playback_copy_uses_original_file(self):
+        source, = self.files(['.mp4'])
+        converted = self.root / 'converted.mp4'
+        converted.write_bytes(b'larger version of the same media')
+
+        async def receive(*, document, **kwargs):
+            self.assertEqual(document.input_file_content.read(), source.read_bytes())
+
+        self.msg.reply_document.side_effect = receive
+        from media_io import lossless_parts
+
+        def split(path, *args):
+            if path == converted:
+                raise RuntimeError('Telegram limit: source keyframes are too large')
+            return lossless_parts(path, *args)
+
+        with patch('media_io.native_video', return_value=converted), patch('media_io.lossless_parts', side_effect=split):
+            self.assertEqual(await bot.send_album(self.msg, [source], '', self.root), 1)
+        self.msg.reply_document.assert_awaited_once()
+        self.msg.reply_video.assert_not_called()
 
     async def test_main_job_uses_album_and_one_post_button(self):
         files = self.files([".jpg", ".mp4", ".mp4"])
@@ -417,6 +472,19 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(*list(manager.tasks.values()))
         job.assert_awaited_once()
         self.assertNotIn("selected_audio_index", job.call_args.kwargs)
+
+    async def test_mp3_runs_when_telegram_rejects_callback_acknowledgement(self):
+        url = 'https://www.instagram.com/reel/test/'
+        msg = SimpleNamespace(chat_id=42, reply_text=AsyncMock())
+        q = SimpleNamespace(data='mp3|saved', message=msg, from_user=SimpleNamespace(id=42),
+                            answer=AsyncMock(side_effect=BadRequest('Query is too old')))
+        manager = bot.JobManager(self.root / 'jobs.sqlite3')
+        with patch('bot.resolve_action_data', return_value={'url': url}), patch('bot._jobs', manager), \
+                patch('bot.run_job', new_callable=AsyncMock) as work:
+            await bot.on_callback(SimpleNamespace(callback_query=q), None)
+            await asyncio.gather(*list(manager.tasks.values()))
+        work.assert_awaited_once()
+        self.assertEqual(work.call_args.args[3:5], (url, 'mp3_320'))
 
     async def test_post_button_caches_all_tracks_and_checks_owner(self):
         with patch("bot.DATA_DIR", self.root), patch("bot.CACHE_DIR", self.root / "cache"), patch("bot.ACTIONS_FILE", self.root / "actions.json"):

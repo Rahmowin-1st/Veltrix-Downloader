@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 import time
 from contextlib import ExitStack
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
@@ -48,7 +49,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.13.1"
+VERSION = "9.14.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -2088,21 +2089,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text(text or "No recent downloads. Send a media link.")
 
 
+async def answer_callback(query, *args, **kwargs) -> None:
+    try:
+        await query.answer(*args, **kwargs, connect_timeout=5, read_timeout=5, write_timeout=5, pool_timeout=5)
+    except TelegramError as exc:
+        log.info("Callback acknowledgement unavailable: %s", type(exc).__name__)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     data = q.data or ""
     uid = q.from_user.id
+    if not callable(getattr(q.message, "reply_text", None)):
+        await answer_callback(q, "This message is unavailable. Send the link again.")
+        return
 
     if data.startswith("retry|"):
         action = resolve_action_data(uid, data.split("|", 1)[1])
         if not action.get("url"):
-            await q.answer("This action expired. Send the link again.")
+            await answer_callback(q, "This action expired. Send the link again.")
             return
-        await q.answer()
         await dispatch_job(q.message, context, uid, action["url"], AUTO_MODE)
+        await answer_callback(q)
         return
     if not data.startswith("mp3|"):
-        await q.answer()
+        await answer_callback(q)
         return
 
     parts = data.split("|")
@@ -2112,11 +2123,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         action = recover_mp3_action(q, uid, data)
     url = str(action.get("url") or "")
     if not url:
-        await q.answer("This MP3 action expired. Send the media link again.", show_alert=False)
+        await answer_callback(q, "This MP3 action expired. Send the media link again.", show_alert=False)
         return
 
-    await q.answer()
     await dispatch_job(q.message, context, uid, url, "mp3_320", action=action)
+    await answer_callback(q)
 
 
 def telegram_retry_delay(exc: Exception, attempt: int) -> float:
@@ -2195,11 +2206,27 @@ def audio_sources(files: list[Path], soundtrack_dir: Path) -> list[Path]:
     return [p for p in unique if has_audio(p)]
 
 
+@dataclass(frozen=True)
+class PreparedMedia:
+    kind: str
+    path: Path
+    original: Path | None = None
+
+
+def media_format_rejected(exc: BadRequest) -> bool:
+    description = str(exc).lower().removeprefix('bad request: ').strip()
+    return description.startswith(('failed to process photo', 'failed to process video',
+                                   'failed to process audio', 'failed to process media',
+                                   'photo_invalid_dimensions', 'photo_ext_invalid',
+                                   'image_process_failed', 'video_content_type_invalid',
+                                   'audio_content_type_invalid', 'media_invalid'))
+
+
 async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None,
                      *, originals: bool = False) -> int:
     """Preserve order; group compatible native types in batches of at most ten."""
     from media_io import lossless_parts, native_audio, native_video
-    prepared = []
+    prepared: list[PreparedMedia] = []
     for index, path in enumerate(files):
         if progress is not None:
             progress["phase"] = f"Preparing media {index + 1}/{len(files)}"
@@ -2208,48 +2235,52 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         if originals:
             if path.stat().st_size > MAX_BYTES:
                 raise RuntimeError('Original file exceeds the Telegram upload limit')
-            prepared.append(('document', path))
+            prepared.append(PreparedMedia('document', path))
             continue
+        original = path if path.stat().st_size <= MAX_BYTES else None
         if kind == "image":
             try:
-                prepared.append(('image', await asyncio.to_thread(fit_image, path, folder)))
+                final = await asyncio.to_thread(fit_image, path, folder)
+                prepared.append(PreparedMedia('image', final, original))
             except (RuntimeError, OSError, subprocess.SubprocessError):
-                if path.stat().st_size > MAX_BYTES:
+                if original is None:
                     raise
-                prepared.append(('document', path))
-        elif kind in {"video", "animation"}:
+                prepared.append(PreparedMedia('document', original))
+        elif kind in {"video", "animation", "audio"}:
+            make_compatible = native_audio if kind == "audio" else native_video
+            final = None
             try:
-                final = await asyncio.to_thread(native_video, path, folder)
+                final = await asyncio.to_thread(make_compatible, path, folder)
+                parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", MAX_BYTES)
             except (RuntimeError, OSError, ImportError, subprocess.SubprocessError):
-                if path.stat().st_size > MAX_BYTES:
+                if final == path and original is None:
+                    # Splitting this exact source already failed above.
                     raise
-                prepared.append(('document', path))
+                parts = await asyncio.to_thread(lossless_parts, path, folder / "source_parts", MAX_BYTES)
+                prepared.extend(PreparedMedia('document', part) for part in parts)
                 continue
-            parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", MAX_BYTES)
-            delivery_kind = "animation" if kind == "animation" and len(files) == len(parts) == 1 else "video"
-            prepared.extend((delivery_kind, part) for part in parts)
-        elif kind == "audio":
-            path = await asyncio.to_thread(native_audio, path, folder)
-            parts = await asyncio.to_thread(lossless_parts, path, folder / "parts", MAX_BYTES)
-            prepared.extend(("audio", part) for part in parts)
+            delivery_kind = "video" if kind == "animation" and (len(files) > 1 or len(parts) > 1) else kind
+            prepared.extend(PreparedMedia(delivery_kind, part, original if len(parts) == 1 else None)
+                            for part in parts)
         else:
             raise RuntimeError("Unsupported media type; no photo substitution performed")
     sent = 0
     families = {'image': 'visual', 'video': 'visual', 'animation': 'visual', 'audio': 'audio', 'document': 'document'}
     while sent < len(prepared):
-        family = families[prepared[sent][0]]
+        family = families[prepared[sent].kind]
         batch = []
-        for kind, path in prepared[sent:sent + 10]:
-            if families[kind] != family:
+        for item in prepared[sent:sent + 10]:
+            if families[item.kind] != family:
                 break
-            batch.append((kind, path))
+            batch.append(item)
         label = caption if not sent else ""
         if progress is not None:
             progress["phase"] = f"Sending {sent + 1}-{sent + len(batch)}/{len(prepared)}"
         async def send_once():
             with ExitStack() as stack:
                 media = []
-                for offset, (kind, path) in enumerate(batch):
+                for offset, item in enumerate(batch):
+                    kind, path = item.kind, item.path
                     upload = InputFile(stack.enter_context(path.open("rb")), filename=path.name,
                                        attach=len(batch) > 1, read_file_handle=False)
                     item_caption = label if offset == 0 else None
@@ -2271,7 +2302,16 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         if progress is not None:
             progress["attempted"] = True
         mark_state("sending")
-        result = await _retry_telegram(send_once)
+        try:
+            result = await _retry_telegram(send_once)
+        except BadRequest as exc:
+            if family == 'document' or not media_format_rejected(exc):
+                raise
+            # Telegram rejected this request for its media format before
+            # accepting the batch. Use the source bytes wherever they fit.
+            log.info("Telegram rejected native media format; sending %s documents", len(batch))
+            batch = [PreparedMedia('document', item.original or item.path) for item in batch]
+            result = await _retry_telegram(send_once)
         if progress is not None:
             progress["last_message"] = result[-1] if isinstance(result, (list, tuple)) and result else result
             progress["last_message_is_album"] = len(batch) > 1

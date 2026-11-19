@@ -112,15 +112,21 @@ def probe_webhook(token: str, expected: str) -> None:
                 await asyncio.sleep(3)
                 info = await client.get_webhook_info()
                 if info.url == expected:
-                    return True
-        return False
+                    return info
+        return None
 
     try:
-        ready = asyncio.run(check())
+        info = asyncio.run(check())
     except Exception as exc:
         log.warning('Render webhook verification: %s', type(exc).__name__)
     else:
-        log.info('Render webhook registered: %s', ready)
+        if info is None:
+            log.warning('Render webhook registered: False')
+            return
+        last_error = info.last_error_date
+        recent_error = bool(last_error and time.time() - last_error.timestamp() < 3600)
+        log.info('Render webhook registered: True pending=%s error_within_hour=%s',
+                 info.pending_update_count, recent_error)
 
 
 # The isolated workers inherit cookie file paths; cookie values are never logged.

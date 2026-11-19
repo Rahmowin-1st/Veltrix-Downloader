@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.13.1
+# Veltrix Downloader 9.14.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -76,6 +76,7 @@ Text-only posts have no media attachment. Public community posts and short links
 - Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
 - Photos are sent as photos by default. Telegram may recompress them. Use `/original <link>` to receive the selected source files as documents without Telegram photo recompression or the bot's playback conversion. Each original file must fit the configured Telegram upload limit.
 - Ordered photo/video collections use albums of at most 10. Audio and documents use separate groups in source order. GIF and animated WebP files retain motion in playback MP4. AVIF stills are sent as photos. If a valid video cannot be converted for playback, the bot can send its file as a document where size permits.
+- If Telegram explicitly rejects the media format of an upload, the bot resends that batch as documents in the same order. It uses the source bytes for items that fit in one file. An upload that times out or loses its response still requires checking the chat before retrying.
 - An MP3 button appears after every delivered post. The bot attaches it to the last media item or puts it on the status message if Telegram rejects the edit. The Original button carries the source link so a signed callback can fetch audio after a restart or cache write failure. When a delivered carousel has silent videos, the MP3 action checks the source again and keeps the cached tracks if the new attempt finds fewer.
 - Video variants are checked for an actual audio stream. Instagram's dedicated extractor and gallery-dl both read DASH audio for the matching carousel item. The bot can combine complementary results after comparing the affected clips' encoded video streams. A post-wide soundtrack is added to each silent video independently and offered once through MP3. Conversion preserves the video's duration and checks that audio survives. Videos without an exposed track are marked in the delivery caption.
 - Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
@@ -113,6 +114,8 @@ Render Free sleeps after 15 minutes without inbound traffic and has a 750-hour s
 ## Primary runtime: Render webhook
 
 The existing `veltrix-downloader` Render service runs `python render_free.py` with `TERMUX_PRIMARY=0`. Telegram sends new links to its webhook; Render extracts and uploads media for any Telegram user who can message the bot. Media files live in Render's temporary job directory during extraction, conversion and upload. No phone process is required. Set one active receiver per bot token; switching to the webhook makes the old Termux poller receive a conflict until it is stopped.
+
+Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot) for the active deployment. The startup log verifies the bot username, webhook URL match, pending updates and whether Telegram reported a recent webhook error.
 
 The free service can sleep or restart during long jobs, cannot retain its local SQLite/cache, and has limited CPU/disk/network resources. This setup does **not** promise permanent 24/7 availability, every private post, or success from Render's IP when a platform blocks cloud hosts. Existing authorized cookie files on a phone are not silently copied to Render.
 

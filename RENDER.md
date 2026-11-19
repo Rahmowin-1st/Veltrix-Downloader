@@ -1,19 +1,20 @@
-# 24/7 on Render (correct host)
+# Veltrix Downloader on Render
 
-Do not use Vercel. Vercel functions die after 10–60s. This bot needs a process that stays up, plus ffmpeg and disk.
+The active service is `veltrix-downloader`. It uses a Python web service
+and a Telegram webhook, as configured in [render.yaml](render.yaml).
 
-## One-time setup
+1. Connect the GitHub repository to Render as a **Python Web Service**.
+2. Set the build command to `pip install -r requirements.txt` and the start
+   command to `python render_free.py`.
+3. Set `BOT_TOKEN` in Render's secret environment and set `TERMUX_PRIMARY=0`.
+   For the optional public YouTube fallback, set `NEWISTY_YOUTUBE=1`.
+4. In the startup logs, check the verified bot username and
+   `Render webhook registered: True`. A growing pending count or a recent
+   error means Telegram delivery to the webhook needs investigation.
+5. Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot), send a
+   public link and confirm that the media arrives. Tap **MP3** on an audible
+   video to verify audio delivery too.
 
-1. Open https://dashboard.render.com/select-repo?type=worker
-2. Connect GitHub repo `Rahmowin-1st/Veltrix-Downloader`
-3. Type: **Background Worker**
-4. Runtime: **Docker**
-5. Instance: Starter (free web service sleeps; worker needs a paid starter or any always-on plan)
-6. Environment variable:
-   - `BOT_TOKEN` = your BotFather token
-7. Create Worker → wait until live
-
-Blueprint URL (same repo):
-https://render.com/deploy?repo=https://github.com/Rahmowin-1st/Veltrix-Downloader
-
-After deploy, open @Veltrix_Downloader_bot and send /start.
+Render Free can sleep and its filesystem is temporary. Run a single webhook
+or polling instance per token. See [README.md](README.md#primary-runtime-render-webhook)
+for the limits and the optional Termux setup.
