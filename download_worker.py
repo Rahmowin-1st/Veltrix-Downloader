@@ -37,9 +37,12 @@ def main():
     except Exception as exc:
         detail = re.sub(r"https?://\S+", "[url]", str(exc))
         detail = re.sub(r"\d{5,}:[\w-]+", "[token]", detail)
+        # Only fixed provider messages are added by the downloader as notes.
+        notes = [str(line)[:170] for line in getattr(exc, "__notes__", [])
+                 if str(line).startswith(("Newisty ", "Public download service ", "Public YouTube player "))]
         payload = {"error": bot.friendly_error(bot.platform_of(request["url"]) or "", exc),
                    "category": failure_category(exc),
-                   "diagnostic": f"{type(exc).__name__}: {detail[:600]}"}
+                   "diagnostic": f"{type(exc).__name__}: {detail[:600]}" + (f" | {'; '.join(notes)}" if notes else "")}
     (root / "result.json").write_text(json.dumps(payload))
 
 

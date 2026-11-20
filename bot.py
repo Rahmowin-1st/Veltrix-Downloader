@@ -49,7 +49,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.15.0"
+VERSION = "9.15.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1721,9 +1721,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     if platform == "youtube":
         engines = [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
         if not youtube_playlist_url(url):
-            engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
             if newisty_enabled():
                 engines.append(lambda folder, extract_mode: download_newisty(url, extract_mode, folder, errors))
+            engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
     elif platform == "instagram":
         dedicated = lambda folder, _: download_instagram_dedicated(url, folder, (prefetched or {}).get("_instagram_info"))[0]
         gallery = lambda folder, _: download_gallery(url, folder)
@@ -1751,6 +1751,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     candidate_sound: set[int] = set()
     candidate_tracks: list[Path] = []
     required_layouts: set[tuple[str, ...]] = set()
+    provider_diagnostics: list[str] = []
     audio_mode = mode in AUDIO_PRESETS
     for engine in engines:
         attempt = Path(tempfile.mkdtemp(prefix='extractor_', dir=tmpdir))
@@ -1807,6 +1808,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 required_layouts.add(tuple('image' if kind == 'animation' else kind for kind in exc.expected_kinds))
             elif fatal_download_error(exc) and not lost_audio and (not candidate or not incomplete):
                 raise
+            if platform == 'youtube' and isinstance(exc, ProviderError):
+                provider_diagnostics.append(str(exc)[:170])
             # A provider configuration/outage error must not hide the actual
             # platform failure (e.g. YouTube's bot check) from the user.
             if not isinstance(exc, ProviderError) or isinstance(exc, ProviderRateLimit) or not errors:
@@ -1823,7 +1826,10 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 path.rename(soundtrack / f'{index:05d}{path.suffix}')
         return candidate
     if errors:
-        raise next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit))), errors[-1])
+        error = next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit))), errors[-1])
+        for diagnostic in provider_diagnostics:
+            error.add_note(diagnostic)
+        raise error
     raise RuntimeError("No public downloadable media found")
 
 

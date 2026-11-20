@@ -27,7 +27,10 @@ def metadata(client, method, route, body=None):
     with client.stream(method, API + route, json=body) as response:
         if response.status_code == 429:
             raise ProviderRateLimit('Public download service rate limit; retry later')
-        response.raise_for_status()
+        if not response.is_success:
+            if response.status_code == 404 and route.startswith('progress/'):
+                response.raise_for_status()
+            raise ProviderError(f"Newisty {route.split('/')[0]} HTTP {response.status_code}")
         if 'application/json' not in response.headers.get('content-type', '').lower():
             raise ProviderError('Public download service returned invalid metadata')
         raw = bytearray()
@@ -130,6 +133,9 @@ def fetch(video_id: str, quality: str, folder: Path, *, safe_url, budget, max_by
     except (ProviderError, TransferLimit):
         out.unlink(missing_ok=True)
         raise
+    except httpx.TimeoutException:
+        out.unlink(missing_ok=True)
+        raise ProviderError('Newisty request timed out') from None
     except (ValueError, TypeError, AttributeError, KeyError, httpx.HTTPError, RuntimeError):
         out.unlink(missing_ok=True)
         # Do not expose signed links, job IDs or content returned by the provider.
