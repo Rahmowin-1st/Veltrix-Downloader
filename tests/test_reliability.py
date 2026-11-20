@@ -198,6 +198,28 @@ class MediaFixtures(unittest.TestCase):
         self.assertTrue(bot.has_audio(final))
         self.assertAlmostEqual(float(info["format"]["duration"]), 6, delta=.3)
 
+    def test_already_needed_conversion_can_fit_one_upload_without_touching_audio(self):
+        source = self.root / "compact.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(self.video),
+                        "-c:v", "libvpx-vp9", "-crf", "43", "-b:v", "0", "-cpu-used", "6",
+                        "-c:a", "copy", str(source)], check=True, timeout=15)
+        cap = 315_000
+        original = media_io.probe(source)
+        self.assertGreater(media_io.compatibility_bitrate(source, original, original['streams'][0], cap), 0)
+        final = media_io.native_video(source, self.root / "one-upload", upload_limit=cap)
+        self.assertLessEqual(final.stat().st_size, cap)
+        self.assertTrue(media_io.streamable(final))
+        converted = media_io.probe(final)
+        self.assertEqual((converted['streams'][0]['width'], converted['streams'][0]['height'],
+                          converted['streams'][0]['avg_frame_rate']), (320, 240, '25/1'))
+        self.assertAlmostEqual(float(converted['format']['duration']), 6, delta=.1)
+
+        def audio_fingerprint(path):
+            return subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(path),
+                                            "-map", "0:a:0", "-c", "copy", "-f", "hash", "-"], timeout=10)
+
+        self.assertEqual(audio_fingerprint(final), audio_fingerprint(source))
+
     def test_animation_remains_moving_in_album(self):
         final = media_io.native_video(self.gif, self.root / "native-animation")
         self.assertTrue(media_io.streamable(final))

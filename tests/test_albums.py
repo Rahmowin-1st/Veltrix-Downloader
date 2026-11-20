@@ -243,7 +243,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.patches = [patch("bot.classify", side_effect=lambda p: {".jpg": "image", ".mp4": "video", ".m4a": "audio"}[p.suffix]),
                         patch("bot.fit_image", side_effect=lambda path, dest: path),
                         patch("media_io.native_audio", side_effect=lambda path, dest: path),
-                        patch("media_io.native_video", side_effect=lambda path, dest: path)]
+                        patch("media_io.native_video", side_effect=lambda path, dest, **kwargs: path)]
         for p in self.patches:
             p.start()
 

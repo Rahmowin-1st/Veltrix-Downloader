@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.14.0
+# Veltrix Downloader 9.14.1
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
@@ -73,7 +73,7 @@ Text-only posts have no media attachment. Public community posts and short links
 - Automatic YouTube mode prioritizes resolution, frame rate and HDR with no fixed resolution ceiling. For an explicit playlist, each final file must match its own entry. Instagram tries the largest rendition first and can join a separate track from the same carousel item.
 - “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
 - Compatible H.264/AAC videos are remuxed to MP4 without re-encoding and sent as playable videos.
-- Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. This compatibility conversion is lossy (CRF 18), not byte-identical to the original.
+- Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. During conversion, CRF 18 encoding can use a bitrate ceiling to fit one upload when the size budget allows it. Compatible streams are copied, and videos that do not fit are split. Use `/original` to receive the exact source file when it fits.
 - Photos are sent as photos by default. Telegram may recompress them. Use `/original <link>` to receive the selected source files as documents without Telegram photo recompression or the bot's playback conversion. Each original file must fit the configured Telegram upload limit.
 - Ordered photo/video collections use albums of at most 10. Audio and documents use separate groups in source order. GIF and animated WebP files retain motion in playback MP4. AVIF stills are sent as photos. If a valid video cannot be converted for playback, the bot can send its file as a document where size permits.
 - If Telegram explicitly rejects the media format of an upload, the bot resends that batch as documents in the same order. It uses the source bytes for items that fit in one file. An upload that times out or loses its response still requires checking the chat before retrying.

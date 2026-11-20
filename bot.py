@@ -49,7 +49,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.14.0"
+VERSION = "9.14.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -2247,10 +2247,12 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                     raise
                 prepared.append(PreparedMedia('document', original))
         elif kind in {"video", "animation", "audio"}:
-            make_compatible = native_audio if kind == "audio" else native_video
             final = None
             try:
-                final = await asyncio.to_thread(make_compatible, path, folder)
+                if kind == "audio":
+                    final = await asyncio.to_thread(native_audio, path, folder)
+                else:
+                    final = await asyncio.to_thread(native_video, path, folder, upload_limit=MAX_BYTES)
                 parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", MAX_BYTES)
             except (RuntimeError, OSError, ImportError, subprocess.SubprocessError):
                 if final == path and original is None:

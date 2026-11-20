@@ -6,6 +6,7 @@ import math
 import subprocess
 import tempfile
 from media_process import run
+from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
 
@@ -205,11 +206,37 @@ def lossless_parts(path: Path, dest: Path, limit: int) -> list[Path]:
     raise RuntimeError("Telegram limit: source keyframes are too large. A local Bot API server allows larger original files.")
 
 
-def native_video(path: Path, dest: Path) -> Path:
+def compatibility_bitrate(path: Path, info: dict, video: dict, limit: int | None) -> int:
+    """Bound an already-needed H.264 encode if one upload can retain a healthy bitrate."""
+    if not limit or path.stat().st_size > limit:
+        return 0
+    try:
+        duration = float(info.get('format', {}).get('duration') or 0)
+        fps = float(Fraction(video.get('avg_frame_rate') or '0'))
+        source_rate = int(video.get('bit_rate') or 0)
+        audio_rate = sum(
+            int(track.get('bit_rate') or 256_000) if track.get('codec_name') in {'aac', 'mp3'} else 256_000
+            for track in info['streams'] if track.get('codec_type') == 'audio'
+        )
+        pixels = int(video.get('width') or 0) * int(video.get('height') or 0)
+        if not math.isfinite(duration) or min(duration, pixels, fps) <= 0:
+            return 0
+        if not source_rate:
+            source_rate = max(0, path.stat().st_size * 8 / duration - audio_rate)
+        # Reserve space for the MP4 container and one second of VBV headroom.
+        ceiling = int((limit * .95 * 8 - audio_rate * duration) / (duration + 1))
+        quality_floor = max(pixels * fps * .04, source_rate * 1.5)
+        return ceiling if 0 < quality_floor <= ceiling <= 20_000_000 else 0
+    except (ValueError, TypeError, OverflowError, ZeroDivisionError):
+        return 0
+
+
+def native_video(path: Path, dest: Path, *, upload_limit: int | None = None) -> Path:
     """Prefer remuxing; encode incompatible codecs for Telegram video playback."""
     if animated_webp(path):
         return webp_video(path, dest)
-    streams = probe(path)['streams']
+    info = probe(path)
+    streams = info['streams']
     audio_count = sum(s.get('codec_type') == 'audio' for s in streams)
     final = prepare_video(path, dest)
     if streamable(final):
@@ -224,6 +251,8 @@ def native_video(path: Path, dest: Path) -> Path:
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2", "-pix_fmt", "yuv420p",
     ]
+    if not copy_video and (bitrate := compatibility_bitrate(path, info, video, upload_limit)):
+        video_options.extend(['-maxrate:v', str(bitrate), '-bufsize:v', str(bitrate)])
     audio_options = ['-c:a', 'copy']
     for index, audio in enumerate(s for s in streams if s.get('codec_type') == 'audio'):
         if audio.get('codec_name') not in {'aac', 'mp3'}:
