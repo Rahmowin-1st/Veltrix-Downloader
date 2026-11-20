@@ -97,6 +97,26 @@ class BackendTests(unittest.TestCase):
                          ['large', 'second'])
         self.assertEqual(youtube_post_attachment(page, 'missing'), {})
 
+    def test_youtube_community_video_uses_the_normal_fallback_path(self):
+        post = 'https://www.youtube.com/post/UgkxtestPost'
+        video = 'https://www.youtube.com/watch?v=kOMHkvxfmd4'
+        document = {'backstagePostRenderer': {
+            'postId': 'UgkxtestPost',
+            'backstageAttachment': {'videoRenderer': {'videoId': 'kOMHkvxfmd4'}},
+        }}
+        page = '<script>window["ytInitialData"] = ' + json.dumps(document) + ';</script>'
+        with tempfile.TemporaryDirectory() as folder, \
+                patch('bot.safe_remote_url', return_value=True), \
+                patch('bot.fetch_public_page', return_value=httpx.Response(200, text=page)), \
+                patch('bot.download_ytdlp', side_effect=RuntimeError("Sign in to confirm you're not a bot")), \
+                patch('bot.newisty_enabled', return_value=False), \
+                patch('bot.download_youtube_public', return_value=[]) as fallback, \
+                patch.dict(os.environ, {'COBALT_API_URL': ''}):
+            with self.assertRaisesRegex(RuntimeError, 'confirm you'):
+                bot.grab(post, bot.AUTO_MODE, folder)
+            fallback.assert_called_once()
+            self.assertEqual(fallback.call_args.args[:2], (video, bot.AUTO_MODE))
+
     def test_playlist_with_missing_entry_does_not_use_unrelated_file_in_its_place(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

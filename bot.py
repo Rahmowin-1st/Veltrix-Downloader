@@ -49,7 +49,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.15.1"
+VERSION = "9.15.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1193,7 +1193,7 @@ def download_youtube_post(url: str, mode: str, tmpdir: str, post_id: str) -> lis
         video = attachment.get(name)
         video_id = video.get('videoId') if isinstance(video, dict) else None
         if isinstance(video_id, str) and YT_ID_RE.fullmatch(video_id):
-            return download_ytdlp(f'https://www.youtube.com/watch?v={video_id}', mode, tmpdir)
+            return grab(f'https://www.youtube.com/watch?v={video_id}', mode, tmpdir)
     entries = youtube_photo_entries(attachment)
     if not entries:
         raise RuntimeError('This YouTube Community post has no accessible media attachment')

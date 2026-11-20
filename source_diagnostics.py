@@ -306,11 +306,12 @@ def probe_pinterest(short_code: str) -> None:
         log.info('Pinterest probe: %s', reason(exc))
 
 
-async def probe_downloads(urls: list[str]) -> None:
+async def probe_downloads(urls: list[str]) -> int:
     """Check the release's downloader on explicit public inputs, without Telegram uploads."""
     from pathlib import Path
     import bot
 
+    downloaded = 0
     for index, url in enumerate(urls[:6], 1):
         platform = bot.platform_of(url) if isinstance(url, str) else None
         if not platform or bot.youtube_playlist_url(url):
@@ -336,10 +337,12 @@ async def probe_downloads(urls: list[str]) -> None:
                              index, dimensions, sum(path.stat().st_size for path in files))
                     if all(path.parent.name == 'newisty' for path in files):
                         log.info('Media probe #%s YouTube provider: Newisty', index)
+                    downloaded += 1
         except bot.WorkerFailure as exc:
             log.info('Media probe #%s %s: %s', index, platform, exc.category)
         except Exception as exc:
             log.info('Media probe #%s %s: %s', index, platform, type(exc).__name__)
+    return downloaded
 
 
 def run() -> None:

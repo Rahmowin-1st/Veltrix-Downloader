@@ -1,4 +1,5 @@
 """Read-only runtime check. Never prints credentials or consumes bot updates."""
+import argparse
 import asyncio
 import importlib.metadata
 import os
@@ -145,4 +146,15 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--youtube', metavar='URL', help='Download one video temporarily and check its media streams.')
+    options = parser.parse_args()
+    if options.youtube is None:
+        asyncio.run(main())
+    else:
+        from source_diagnostics import probe_downloads
+
+        url = bot.extract_url(options.youtube) or ''
+        if not re.fullmatch(r'https://www\.youtube\.com/watch\?v=[A-Za-z0-9_-]{11}', url):
+            parser.error('--youtube needs a YouTube video or Shorts link')
+        raise SystemExit(0 if asyncio.run(probe_downloads([url])) == 1 else 1)
