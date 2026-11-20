@@ -115,6 +115,27 @@ class ProviderTests(unittest.TestCase):
 
 
 class InstagramTrackTests(unittest.TestCase):
+    def test_dash_only_carousel_video_uses_highest_representation_instead_of_poster(self):
+        from parth_dl import InstagramDownloader
+        extractor = instagram_extractor(InstagramDownloader(quiet=True)).media_extractor
+        manifest = """<MPD><Period>
+        <AdaptationSet mimeType="video/mp4" frameRate="60000/1001">
+          <Representation width="720" height="1280"><BaseURL>https://cdn.test/720.mp4</BaseURL></Representation>
+          <Representation width="1080" height="1920"><BaseURL>https://cdn.test/1080.mp4</BaseURL></Representation>
+          <Representation width="2160" height="3840"><ContentProtection/>
+            <BaseURL>https://cdn.test/protected.mp4</BaseURL></Representation>
+        </AdaptationSet></Period></MPD>"""
+        child = {'media_type': 2, 'video_dash_manifest': manifest,
+                 'image_versions2': {'candidates': [{'url': 'https://cdn.test/poster.jpg'}]}}
+        data = extractor._parse_media_item({'code': 'test', 'carousel_media': [child]})
+        entry, = data['entries']
+        self.assertEqual(entry['kind'], 'video')
+        self.assertEqual(set(row['url'] for row in entry['formats']),
+                         {'https://cdn.test/720.mp4', 'https://cdn.test/1080.mp4'})
+        with patch('bot.download_source_entries', return_value=[]) as download:
+            bot.download_instagram_dedicated('https://instagram.com/p/test/', '.', data)
+        self.assertEqual(download.call_args.args[0][0]['formats'][0]['url'], 'https://cdn.test/1080.mp4')
+
     def test_dash_reads_full_object_audio_and_ignores_segmented_manifests(self):
         url = 'https://cdn.test/audio.m4a'
         self.assertEqual(instagram_dash_audio_urls({'video_dash_manifest': dash(url)}), [url])

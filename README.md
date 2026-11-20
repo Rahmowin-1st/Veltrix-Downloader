@@ -1,9 +1,9 @@
-# Veltrix Downloader 9.14.1
+# Veltrix Downloader 9.15.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 No quality menu, paid downloader API or per-download subscription.
 
-Instagram's full-object DASH audio tracks are recovered per carousel item when
+Instagram's full-object DASH video and audio variants are recovered per carousel item when
 exposed in exact-post metadata, then muxed into that item's silent video. Native
 audio is retained. If a video still lacks audio, the delivered caption says so.
 One audible video no longer stops the search for other missing carousel tracks.
@@ -72,18 +72,17 @@ Text-only posts have no media attachment. Public community posts and short links
 
 - Automatic YouTube mode prioritizes resolution, frame rate and HDR with no fixed resolution ceiling. For an explicit playlist, each final file must match its own entry. Instagram tries the largest rendition first and can join a separate track from the same carousel item.
 - “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
-- Compatible H.264/AAC videos are remuxed to MP4 without re-encoding and sent as playable videos.
-- Incompatible video codecs are converted to H.264/AAC for native video playback without reducing resolution. During conversion, CRF 18 encoding can use a bitrate ceiling to fit one upload when the size budget allows it. Compatible streams are copied, and videos that do not fit are split. Use `/original` to receive the exact source file when it fits.
-- Photos are sent as photos by default. Telegram may recompress them. Use `/original <link>` to receive the selected source files as documents without Telegram photo recompression or the bot's playback conversion. Each original file must fit the configured Telegram upload limit.
-- Ordered photo/video collections use albums of at most 10. Audio and documents use separate groups in source order. GIF and animated WebP files retain motion in playback MP4. AVIF stills are sent as photos. If a valid video cannot be converted for playback, the bot can send its file as a document where size permits.
+- A plain link or `/original <link>` sends the highest available downloaded files as Telegram documents, preserving their bytes. Separate soundtracks follow the ordered media. Source audio/video tracks may be merged into one container during extraction. Large files are streamed as numbered `.partNNN` documents. Download all parts for a file and concatenate them in numbered order to recover it.
+- `/playable <link>` prepares photos and playable media for Telegram's chat player. Compatible tracks are remuxed. Other video codecs are converted to H.264/AAC without resizing, and Telegram may recompress photos. Large playable videos may be split on existing keyframes.
+- Collections use albums of at most 10 in source order. In playback mode, visual media, audio and documents use separate groups. GIF and animated WebP retain motion, and AVIF stills are sent as photos.
 - If Telegram explicitly rejects the media format of an upload, the bot resends that batch as documents in the same order. It uses the source bytes for items that fit in one file. An upload that times out or loses its response still requires checking the chat before retrying.
 - An MP3 button appears after every delivered post. The bot attaches it to the last media item or puts it on the status message if Telegram rejects the edit. The Original button carries the source link so a signed callback can fetch audio after a restart or cache write failure. When a delivered carousel has silent videos, the MP3 action checks the source again and keeps the cached tracks if the new attempt finds fewer.
 - Video variants are checked for an actual audio stream. Instagram's dedicated extractor and gallery-dl both read DASH audio for the matching carousel item. The bot can combine complementary results after comparing the affected clips' encoded video streams. A post-wide soundtrack is added to each silent video independently and offered once through MP3. Conversion preserves the video's duration and checks that audio survives. Videos without an exposed track are marked in the delivery caption.
 - Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
 - Files are streamed during upload rather than read entirely into RAM.
-- Hosted Bot API: conservative 49,000,000-byte upload ceiling. Oversize audio/videos are split using stream copy, preserving quality. A single request may therefore produce multiple messages.
+- Hosted Bot API: conservative 49,000,000-byte per-file ceiling. Exact delivery splits the file by bytes. Playback mode splits audio/videos by stream copy. A single request may produce multiple messages.
 - An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081`; it supports uploads up to 2,000,000,000 bytes. A server must actually be installed/configured; setting the variable alone does not create it. Switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
-- If even one keyframe-sized segment exceeds the upload limit, the bot reports the limit instead of silently damaging the original.
+- If playback cannot be split at existing keyframes, a plain link still delivers the original in numbered parts.
 
 ## Reliability
 

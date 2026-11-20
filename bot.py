@@ -49,7 +49,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.14.1"
+VERSION = "9.15.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1084,7 +1084,7 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
     if cookie_file and Path(cookie_file).is_file():
         base["cookiefile"] = cookie_file
     attempts: list[tuple[str, dict[str, Any]]] = []
-    if mode in {AUTO_MODE, "original"}:
+    if mode in {AUTO_MODE, "original", "playable"}:
         # yt-dlp ranks all exposed formats; no hidden resolution ceiling.
         # A music-only link may expose no video format at all.
         attempts = [("bv*+ba/b/ba", {})]
@@ -1254,7 +1254,7 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
             raise RuntimeError("Incomplete gallery metadata or unresolved media item")
         raise RuntimeError("Gallery metadata unavailable; no items extracted")
     if platform == "instagram":
-        from source_metadata import instagram_dash_audio_urls
+        from source_metadata import instagram_dash_audio_urls, instagram_dash_formats
         media = []
         requested = INSTAGRAM_POST_RE.fullmatch(urlparse(url).path)
         for _, media_url, meta in entries:
@@ -1269,10 +1269,12 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
                 candidates = [video, *(meta.get('_fallback') or [])]
                 if not str(media_url).startswith('ytdl:'):
                     candidates.insert(0, media_url)
-                media.append({'kind': 'video',
-                              'formats': [{'url': candidate} for candidate in dict.fromkeys(filter(None, candidates))],
-                              'audio_urls': instagram_dash_audio_urls(
-                                  {'video_dash_manifest': meta.get('_ytdl_manifest_data')})})
+                item = {'video_dash_manifest': meta.get('_ytdl_manifest_data')}
+                formats = instagram_dash_formats(item, 'video')
+                formats.extend({'url': candidate, 'width': meta.get('width'), 'height': meta.get('height')}
+                               for candidate in dict.fromkeys(filter(None, candidates)))
+                media.append({'kind': 'video', 'formats': sorted(formats, key=media_quality, reverse=True),
+                              'audio_urls': instagram_dash_audio_urls(item)})
             else:
                 media.append({'kind': 'image', 'formats': [{'url': media_url}]})
         return download_source_entries(media, dest, url)
@@ -1332,9 +1334,8 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
     includes_visual = any(entry['kind'] != 'audio' for entry in entries)
     expected = tuple(entry['kind'] for entry in entries if not includes_visual or entry['kind'] != 'audio')
     for index, entry in enumerate(entries):
-        # An audio block is an optional MP3 source for a visual post. Telegram
-        # cannot put it inside the same photo/video album, and the user asked
-        # to receive it only when pressing MP3.
+        # Keep independent soundtracks separate from the ordered visual slots.
+        # Exact delivery can include them as documents, and MP3 can use them.
         folder = (dest.parent / "soundtrack" if entry["kind"] == "audio" else dest) / f"source_{index:05d}"
         folder.mkdir(parents=True, exist_ok=True)
         completed = None
@@ -1692,7 +1693,7 @@ def download_newisty(url: str, mode: str, tmpdir: str, errors: list) -> list[Pat
     if not canonical or not canonical.startswith('https://www.youtube.com/watch?v='):
         return []
     video_id = canonical.removeprefix('https://www.youtube.com/watch?v=')
-    qualities = {'auto': 'best-mp4', 'original': 'best-mp4', 'best': 'best-mp4',
+    qualities = {'auto': 'best-mp4', 'original': 'best-mp4', 'playable': 'best-mp4', 'best': 'best-mp4',
                  '1080': '1080p', '720': '720p', '480': '480p', 'm4a': 'audio-m4a'}
     quality = 'audio-mp3' if mode.startswith('mp3_') else qualities.get(mode)
     if not quality:
@@ -1720,9 +1721,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     if platform == "youtube":
         engines = [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
         if not youtube_playlist_url(url):
+            engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
             if newisty_enabled():
                 engines.append(lambda folder, extract_mode: download_newisty(url, extract_mode, folder, errors))
-            engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
     elif platform == "instagram":
         dedicated = lambda folder, _: download_instagram_dedicated(url, folder, (prefetched or {}).get("_instagram_info"))[0]
         gallery = lambda folder, _: download_gallery(url, folder)
@@ -1960,9 +1961,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "📥 Send a YouTube, Instagram, Snapchat or Pinterest media link.\n"
-        "🎬 Highest available quality; large videos may arrive in parts.\n"
+        "📎 Source files are delivered at their highest available quality. Large files arrive as numbered parts.\n"
         "🎵 Tap MP3 after delivery to get audio.\n"
-        "📎 Use /original followed by the link to receive source files without Telegram photo compression or video conversion."
+        "▶️ Use /playable followed by the link for a version that plays directly in Telegram."
         + ("\nIf YouTube blocks the server, the bot can send the video ID to Newisty’s public download API."
            if newisty_enabled() else "")
     )
@@ -1973,12 +1974,20 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_original(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await media_command(update, context, 'original')
+
+
+async def cmd_playable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await media_command(update, context, 'playable')
+
+
+async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
     msg = update.effective_message
     url = extract_url(' '.join(context.args or []))
     if not url or not platform_of(url):
-        await msg.reply_text('Use /original followed by a YouTube, Instagram, Snapchat or Pinterest link.')
+        await msg.reply_text(f'Use /{mode} followed by a YouTube, Instagram, Snapchat or Pinterest link.')
         return
-    await dispatch_job(msg, context, update.effective_user.id, url, 'original')
+    await dispatch_job(msg, context, update.effective_user.id, url, mode)
 
 
 async def edit_status(status, text: str, reply_markup=None) -> bool:
@@ -2211,6 +2220,8 @@ class PreparedMedia:
     kind: str
     path: Path
     original: Path | None = None
+    byte_range: tuple[int, int] | None = None
+    filename: str | None = None
 
 
 def media_format_rejected(exc: BadRequest) -> bool:
@@ -2225,18 +2236,22 @@ def media_format_rejected(exc: BadRequest) -> bool:
 async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None,
                      *, originals: bool = False) -> int:
     """Preserve order; group compatible native types in batches of at most ten."""
-    from media_io import lossless_parts, native_audio, native_video
+    from media_io import FileSlice, lossless_parts, native_audio, native_video
     prepared: list[PreparedMedia] = []
     for index, path in enumerate(files):
         if progress is not None:
             progress["phase"] = f"Preparing media {index + 1}/{len(files)}"
         folder = tmp / "delivery" / str(index)
-        kind = await asyncio.to_thread(classify, path)
         if originals:
-            if path.stat().st_size > MAX_BYTES:
-                raise RuntimeError('Original file exceeds the Telegram upload limit')
-            prepared.append(PreparedMedia('document', path))
+            size = path.stat().st_size
+            if size <= MAX_BYTES:
+                prepared.append(PreparedMedia('document', path))
+            else:
+                for part, start in enumerate(range(0, size, MAX_BYTES), 1):
+                    prepared.append(PreparedMedia('document', path, byte_range=(start, min(MAX_BYTES, size - start)),
+                                                  filename=f'{index + 1:03d}_{path.name}.part{part:03d}'))
             continue
+        kind = await asyncio.to_thread(classify, path)
         original = path if path.stat().st_size <= MAX_BYTES else None
         if kind == "image":
             try:
@@ -2267,6 +2282,8 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         else:
             raise RuntimeError("Unsupported media type; no photo substitution performed")
     sent = 0
+    if any(item.byte_range for item in prepared):
+        caption = (caption + "\nJoin matching .part files in numbered order to recover the original.").strip()
     families = {'image': 'visual', 'video': 'visual', 'animation': 'visual', 'audio': 'audio', 'document': 'document'}
     while sent < len(prepared):
         family = families[prepared[sent].kind]
@@ -2283,7 +2300,10 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                 media = []
                 for offset, item in enumerate(batch):
                     kind, path = item.kind, item.path
-                    upload = InputFile(stack.enter_context(path.open("rb")), filename=path.name,
+                    file = stack.enter_context(path.open("rb"))
+                    if item.byte_range:
+                        file = FileSlice(file, *item.byte_range)
+                    upload = InputFile(file, filename=item.filename or path.name,
                                        attach=len(batch) > 1, read_file_handle=False)
                     item_caption = label if offset == 0 else None
                     if len(batch) == 1:
@@ -2598,9 +2618,12 @@ async def run_job(
                 silent_videos = kinds.count('video') - with_sound
                 if silent_videos:
                     caption += f"\n🔇 Audio unavailable in {silent_videos} source video(s)."
-                if mode == 'original':
-                    sent = await send_album(msg, files, caption, tmp, progress, originals=True)
+                if mode in {AUTO_MODE, 'original'}:
+                    soundtracks = await asyncio.to_thread(files_in, tmp / 'soundtrack')
+                    deliveries = list(dict.fromkeys([*files, *soundtracks]))
+                    sent = await send_album(msg, deliveries, caption, tmp, progress, originals=True)
                 else:
+                    deliveries = files
                     sent = await send_album(msg, files, caption, tmp, progress)
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned")
@@ -2638,7 +2661,7 @@ async def run_job(
                         attached = True
                     except TelegramError as exc:
                         log.info("MP3 message unavailable: %s", type(exc).__name__)
-                await edit_status(status, f"✅ {len(files)} media delivered",
+                await edit_status(status, f"✅ {len(deliveries)} media delivered",
                                   reply_markup=None if attached else markup)
             metric_add("jobs_succeeded", 1)
             await report_job_event(event_id, source, 'delivered', items=sent)
@@ -2982,6 +3005,7 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler('original', cmd_original))
+    app.add_handler(CommandHandler('playable', cmd_playable))
     app.add_handler(CallbackQueryHandler(on_callback))
     caption_links = filters.CaptionRegex(URL_RE) | filters.CaptionEntity(MessageEntity.TEXT_LINK)
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | caption_links, on_text))

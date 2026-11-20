@@ -15,6 +15,35 @@ class InvalidMedia(RuntimeError):
     """A downloaded rendition did not contain readable media."""
 
 
+class FileSlice:
+    """A seekable part for multipart upload, without duplicating the source on disk."""
+
+    def __init__(self, file, start: int, size: int):
+        self.file = file
+        self.start = start
+        self.size = size
+        self.seek(0)
+
+    def tell(self) -> int:
+        return self.file.tell() - self.start
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 1:
+            offset += self.tell()
+        elif whence == 2:
+            offset += self.size
+        elif whence != 0:
+            raise ValueError("Invalid seek origin")
+        if not 0 <= offset <= self.size:
+            raise ValueError("Offset is outside the upload part")
+        self.file.seek(self.start + offset)
+        return offset
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self.size - self.tell()
+        return self.file.read(remaining if size < 0 else min(size, remaining))
+
+
 @lru_cache(maxsize=256)
 def _probe(name: str, size: int, mtime: int) -> dict:
     result = run(

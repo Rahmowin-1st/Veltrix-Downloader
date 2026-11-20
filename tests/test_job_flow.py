@@ -116,7 +116,7 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
                                          edit_text=AsyncMock(), delete=AsyncMock())
                 msg = SimpleNamespace(chat_id=1)
                 context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
-                async def send(msg, files, caption, tmp, progress):
+                async def send(msg, files, caption, tmp, progress, **kwargs):
                     progress['attempted'] = True
                     raise TimedOut()
                 with patch('bot.download_in_worker', new_callable=AsyncMock,
@@ -149,7 +149,7 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder:
             clip = Path(folder) / 'clip.mp4'
             clip.write_bytes(b'fixture')
-            async def reject(msg, files, caption, tmp, progress):
+            async def reject(msg, files, caption, tmp, progress, **kwargs):
                 progress['attempted'] = True
                 raise BadRequest("can't parse media JSON object")
             with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=[clip]), \

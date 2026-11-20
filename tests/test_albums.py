@@ -281,6 +281,31 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
         self.msg.reply_photo.assert_not_called()
         self.msg.reply_video.assert_not_called()
 
+    async def test_oversized_source_is_streamed_as_reconstructable_documents(self):
+        import httpx
+        from telegram.request._requestparameter import RequestParameter
+        source, = self.files(['.mp4'])
+        source.write_bytes(b'AAAAABBBBBCC')
+
+        async def receive(*, media):
+            parts = [item.media for item in media]
+            self.assertEqual([p.filename for p in parts],
+                             ['001_0.mp4.part001', '001_0.mp4.part002', '001_0.mp4.part003'])
+            raw = b''.join(part.input_file_content.read() for part in parts)
+            self.assertEqual(raw, source.read_bytes())
+            param = RequestParameter.from_input('media', media)
+            request = httpx.Request('POST', 'https://api.telegram.test', files=param.multipart_data)
+            payload = request.read()
+            self.assertEqual(int(request.headers['Content-Length']), len(payload))
+            self.assertIn(b'\r\n\r\nAAAAA\r\n', payload)
+            self.assertIn(b'\r\n\r\nBBBBB\r\n', payload)
+            self.assertIn(b'\r\n\r\nCC\r\n', payload)
+
+        self.msg.reply_media_group.side_effect = receive
+        with patch('bot.MAX_BYTES', 5), patch('media_io.native_video') as encode:
+            self.assertEqual(await bot.send_album(self.msg, [source], '', self.root, originals=True), 3)
+            encode.assert_not_called()
+
     async def test_more_than_ten_are_not_dropped(self):
         await bot.send_album(self.msg, self.files([".jpg"] * 23), "caption", self.root)
         self.assertEqual([len(m) for m in self.messages], [10, 10, 3])
@@ -361,7 +386,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("bot.post_mp3_button", return_value=markup) as button, \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "auto", status)
-        self.assertEqual(self.messages, [["photo", "video", "video"]])
+        self.assertEqual(self.messages, [["document", "document", "document"]])
         self.assertEqual(button.call_args.args[2], files[1:])
         self.assertEqual(button.call_count, 1)
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
@@ -384,7 +409,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
              patch('bot.has_audio', return_value=True), \
              patch('bot.post_mp3_button', return_value=markup), \
              patch('bot._global_sem', None), patch('bot._job_locks', {}):
-            await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'auto', status)
+            await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'playable', status)
         sent_video.edit_reply_markup.assert_awaited_once()
         self.assertEqual(sent_video.edit_reply_markup.call_args.kwargs['reply_markup'], markup)
         self.assertIsNone(status.edit_text.call_args.kwargs['reply_markup'])
@@ -401,7 +426,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("bot.post_mp3_button", return_value=markup) as button, \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.pinterest.com/pin/42/", "auto", status)
-        self.assertEqual(self.messages, [["photo", "photo"]])
+        self.assertEqual(self.messages, [["document", "document"]])
         button.assert_called_once()
         self.assertEqual(button.call_args.args[2], [])
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
@@ -422,7 +447,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
              patch('bot.has_audio', return_value=False), \
              patch('bot.post_mp3_button', return_value=markup) as button, \
              patch('bot._global_sem', None), patch('bot._job_locks', {}):
-            await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'auto', status)
+            await bot.run_job(self.msg, context, 42, 'https://www.instagram.com/reel/test/', 'playable', status)
         button.assert_called_once()
         self.assertTrue(button.call_args.kwargs['refresh_audio'])
         sent_video.edit_reply_markup.assert_awaited_once()
@@ -441,7 +466,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("bot.post_mp3_button", return_value=markup), \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "auto", status)
-        self.assertEqual(self.messages, [["photo", "video"]])
+        self.assertEqual(self.messages, [["document", "document"]])
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
 
     async def test_album_button_follows_media_without_editing_grouped_messages(self):
@@ -533,7 +558,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
              patch('bot.safe_remote_url', return_value=True), \
              patch('bot.BOT_TOKEN', 'test-bot-token'), \
              patch('bot._global_sem', None), patch('bot._job_locks', {}):
-            await bot.run_job(self.msg, context, 42, url, 'auto', status)
+            await bot.run_job(self.msg, context, 42, url, 'playable', status)
             sent_video.edit_reply_markup.assert_awaited_once()
             markup = sent_video.edit_reply_markup.call_args.kwargs['reply_markup']
             query = SimpleNamespace(message=SimpleNamespace(reply_markup=markup))

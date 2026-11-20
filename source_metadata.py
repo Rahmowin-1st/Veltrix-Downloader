@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import xml.etree.ElementTree as ET
+from fractions import Fraction
 from urllib.parse import urlparse, urlunparse
 
 
@@ -135,8 +136,8 @@ def snapchat_modern_video(page: str, requested_id: str) -> dict:
             'entries': [{'kind': 'video', 'formats': formats}]}
 
 
-def instagram_dash_audio_urls(item: dict) -> list[str]:
-    """Read full-object audio BaseURLs from this item's DASH metadata only.
+def instagram_dash_formats(item: dict, media_type: str) -> list[dict]:
+    """Read full-object representations from this item's DASH metadata only.
 
     SegmentBase byte ranges describe a complete object. SegmentTemplate/List
     need a segmented downloader and must never be mistaken for a complete file.
@@ -152,25 +153,34 @@ def instagram_dash_audio_urls(item: dict) -> list[str]:
             root = ET.fromstring(manifest)
         except ET.ParseError:
             continue
-        def walk(node, inherited_audio=False, segmented=False):
-            mime = node.get('mimeType', '')
-            audio = node.get('contentType') == 'audio' or mime.startswith('audio/') or inherited_audio
+        pending = [(root, {})]
+        while pending:
+            node, inherited = pending.pop()
+            fields = {**inherited, **node.attrib}
             children = list(node)
-            segmented = segmented or any(child.tag.rsplit('}', 1)[-1] in {
-                'SegmentTemplate', 'SegmentList'} for child in children)
-            if node.tag.rsplit('}', 1)[-1] == 'Representation' and audio and not segmented:
+            tags = [child.tag.rsplit('}', 1)[-1] for child in children]
+            if {'SegmentTemplate', 'SegmentList', 'ContentProtection'}.intersection(tags):
+                continue
+            kind = fields.get('contentType') or fields.get('mimeType', '').split('/')[0]
+            if node.tag.rsplit('}', 1)[-1] == 'Representation' and kind == media_type:
                 try:
-                    bandwidth = int(node.get('bandwidth') or 0)
-                except ValueError:
-                    bandwidth = 0
-                for child in children:
+                    fps = float(Fraction(fields.get('frameRate') or '0'))
+                except (ValueError, ZeroDivisionError):
+                    fps = 0
+                for child, tag in zip(children, tags):
                     url = (child.text or '').strip()
-                    if child.tag.rsplit('}', 1)[-1] == 'BaseURL' and url.startswith('https://'):
-                        candidates.append((bandwidth, url))
-            for child in children:
-                walk(child, audio, segmented)
-        walk(root)
-    return list(dict.fromkeys(url for _, url in sorted(candidates, reverse=True)))
+                    if tag == 'BaseURL' and url.startswith('https://'):
+                        candidates.append({'url': url, 'width': fields.get('width'), 'height': fields.get('height'),
+                                           'fps': fps, 'bitrate': fields.get('bandwidth')})
+            pending.extend((child, fields) for child in reversed(children))
+    unique = {}
+    for row in sorted(candidates, key=media_quality, reverse=True):
+        unique.setdefault(row['url'], row)
+    return list(unique.values())
+
+
+def instagram_dash_audio_urls(item: dict) -> list[str]:
+    return [row['url'] for row in instagram_dash_formats(item, 'audio')]
 
 
 def instagram_audio_urls(item: dict, *, include_children: bool = True, include_dash: bool = True) -> list[str]:
@@ -236,33 +246,58 @@ def instagram_extractor(downloader):
     """Extend the pinned parth parser without changing its network behavior."""
     from parth_dl.extractors import MediaExtractor
 
+    def with_api_video(child):
+        if not child.get('video_versions'):
+            if formats := instagram_dash_formats(child, 'video'):
+                return {**child, 'video_versions': formats}
+        return child
+
+    def with_graphql_video(child):
+        if not child.get('video_url'):
+            if formats := instagram_dash_formats(child, 'video'):
+                best = formats[0]
+                return {**child, 'is_video': True, 'video_url': best['url'],
+                        'dimensions': {'width': best['width'], 'height': best['height']}}
+        return child
+
     class CompleteMediaExtractor(MediaExtractor):
         def _parse_media_item(self, item):
-            result = super()._parse_media_item(item)
+            children = item.get('carousel_media') or []
+            prepared = ({**item, 'carousel_media': [with_api_video(child) for child in children]}
+                        if children else with_api_video(item))
+            result = super()._parse_media_item(prepared)
             expected = max(int(item.get("carousel_media_count") or 0), len(item.get("carousel_media") or [item]))
             if len(result.get("entries") or []) != expected:
                 raise RuntimeError("Incomplete Instagram carousel metadata")
-            children = item.get('carousel_media') or []
             result["audio_urls"] = instagram_audio_urls(item, include_children=False, include_dash=False)
             for entry, child in zip(result['entries'], children or [item]):
                 if entry['kind'] == 'image' and child.get('media_type') == 2:
                     raise RuntimeError('Incomplete Instagram video metadata')
                 entry['audio_urls'] = (instagram_audio_urls(child, include_children=False) if children
                                        else instagram_dash_audio_urls(child))
+                if entry['kind'] == 'video':
+                    entry['formats'].extend(instagram_dash_formats(child, 'video'))
             return result
 
         def _parse_graphql_media(self, item):
-            result = super()._parse_graphql_media(item)
             sidecar = item.get("edge_sidecar_to_children") or {}
+            edges = sidecar.get('edges') or []
+            prepared = with_graphql_video(item)
+            if edges:
+                prepared = {**item, 'edge_sidecar_to_children': {
+                    **sidecar, 'edges': [{**edge, 'node': with_graphql_video(edge.get('node') or {})}
+                                         for edge in edges]}}
+            result = super()._parse_graphql_media(prepared)
             expected = max(int(sidecar.get("count") or 0), len(sidecar.get("edges") or [item]))
             if len(result.get("entries") or []) != expected:
                 raise RuntimeError("Incomplete Instagram carousel metadata")
-            edges = sidecar.get('edges') or []
             result["audio_urls"] = instagram_audio_urls(item, include_children=False, include_dash=False)
             for entry, child in zip(result['entries'], [edge.get('node') or {} for edge in edges] or [item]):
                 entry['audio_urls'] = (instagram_audio_urls(child, include_children=False) if edges
                                        else instagram_dash_audio_urls(child))
-                if entry['kind'] == 'image':
+                if entry['kind'] == 'video':
+                    entry['formats'].extend(instagram_dash_formats(child, 'video'))
+                elif entry['kind'] == 'image':
                     entry['formats'].extend({'url': row['src'], 'width': row.get('config_width'),
                                              'height': row.get('config_height')}
                                             for row in (child.get('display_resources') or [])

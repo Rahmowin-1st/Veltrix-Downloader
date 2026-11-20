@@ -174,18 +174,18 @@ class ConnectivityTests(unittest.IsolatedAsyncioTestCase):
             async def upload(**kwargs):
                 self.assertEqual(manager.recent(1, 1)[0]['state'], 'sending')
                 raise TimedOut()
-            msg = SimpleNamespace(chat_id=1, reply_photo=AsyncMock(side_effect=upload))
+            msg = SimpleNamespace(chat_id=1, reply_document=AsyncMock(side_effect=upload))
             status = SimpleNamespace(edit_text=AsyncMock())
             context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
             async def run(_):
                 await bot.run_job(msg, context, 1, row['url'], 'auto', status)
             with patch('bot.download_in_worker', new_callable=AsyncMock, return_value=[photo]), \
-                    patch('bot.classify', return_value='image'), patch('bot.fit_image', side_effect=lambda p, d: p), \
+                    patch('bot.classify', return_value='image'), \
                     patch('bot._global_sem', None), patch('bot._job_locks', {}):
                 await manager.launch(row, run)
             self.assertEqual(manager.recent(1, 1)[0]['state'], 'interrupted')
             self.assertEqual(manager.recover(), ([], []))
-            msg.reply_photo.assert_awaited_once()
+            msg.reply_document.assert_awaited_once()
 
     async def test_queued_cancellation_does_not_leak_metrics(self):
         lock = asyncio.Lock()
