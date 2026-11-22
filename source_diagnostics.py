@@ -318,7 +318,10 @@ async def probe_downloads(urls: list[str]) -> int:
             continue
         log.info('Media probe #%s %s started', index, platform)
         try:
-            async with asyncio.timeout(300 if platform == 'youtube' and bot.newisty_enabled() else 70):
+            timeout = 70
+            if platform == 'youtube' and (bot.newisty_enabled() or bot.vidfetch_enabled()):
+                timeout = 600 if bot.newisty_enabled() and bot.vidfetch_enabled() else 360
+            async with asyncio.timeout(timeout):
                 with tempfile.TemporaryDirectory(prefix='vx_source_probe_') as folder:
                     root = Path(folder)
                     files = await bot.download_in_worker(url, bot.AUTO_MODE, root, {})
@@ -335,8 +338,8 @@ async def probe_downloads(urls: list[str]) -> int:
                              kinds.count('animation'), kinds.count('audio'), videos_with_audio, tracks)
                     log.info('Media probe #%s quality: dimensions=%s total_bytes=%s',
                              index, dimensions, sum(path.stat().st_size for path in files))
-                    if all(path.parent.name == 'newisty' for path in files):
-                        log.info('Media probe #%s YouTube provider: Newisty', index)
+                    if platform == 'youtube' and files and files[0].parent.name in {'newisty', 'vidfetch'}:
+                        log.info('Media probe #%s YouTube provider: %s', index, files[0].parent.name)
                     downloaded += 1
         except bot.WorkerFailure as exc:
             log.info('Media probe #%s %s: %s', index, platform, exc.category)

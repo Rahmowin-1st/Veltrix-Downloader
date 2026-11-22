@@ -49,7 +49,7 @@ from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
 
 load_dotenv()
-VERSION = "9.15.2"
+VERSION = "9.16.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1684,6 +1684,29 @@ def newisty_enabled() -> bool:
             and not os.getenv('YOUTUBE_COOKIE_FILE') and not os.getenv('YOUTUBE_COOKIES_B64'))
 
 
+def vidfetch_enabled() -> bool:
+    return (bool(os.getenv('VIDFETCH_API_KEY', '').strip())
+            and not os.getenv('YOUTUBE_COOKIE_FILE') and not os.getenv('YOUTUBE_COOKIES_B64'))
+
+
+def download_vidfetch(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
+    from vidfetch_provider import fetch
+
+    if not errors or not re.search(r"confirm you[’']re not a bot|unable to download video data: HTTP Error 403",
+                                   str(errors[0]), re.I):
+        return []
+    canonical = extract_url(url) or ''
+    match = re.fullmatch(r'https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})', canonical)
+    if not match:
+        return []
+    if mode in AUDIO_PRESETS:
+        quality = '360p' if mode == 'm4a' else 'mp3'
+    else:
+        quality = f'{mode}p' if mode.isdigit() else '2160p'
+    return fetch(match[1], quality, Path(tmpdir) / 'vidfetch', api_key=os.getenv('VIDFETCH_API_KEY', '').strip(),
+                 safe_url=safe_remote_url, budget=check_download_budget, max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None)
+
+
 def download_newisty(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
     from newisty_provider import fetch
 
@@ -1721,6 +1744,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     if platform == "youtube":
         engines = [lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder)]
         if not youtube_playlist_url(url):
+            if vidfetch_enabled():
+                engines.append(lambda folder, extract_mode: download_vidfetch(url, extract_mode, folder, errors))
             if newisty_enabled():
                 engines.append(lambda folder, extract_mode: download_newisty(url, extract_mode, folder, errors))
             engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
@@ -1961,6 +1986,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "YouTube • Instagram • Snapchat • Pinterest\n"
         "Send a media link — I download it automatically."
         + ("\nFor public YouTube videos, Newisty can process the video link if needed." if newisty_enabled() else "")
+        + ("\nFor public YouTube videos, VidFetch can process the video link if needed." if vidfetch_enabled() else "")
     )
 
 
@@ -1972,6 +1998,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "▶️ Use /playable followed by the link for a version that plays directly in Telegram."
         + ("\nIf YouTube blocks the server, the bot can send the video ID to Newisty’s public download API."
            if newisty_enabled() else "")
+        + ("\nThe VidFetch fallback can process public YouTube videos up to 4K; it may convert the source format."
+           if vidfetch_enabled() else "")
     )
 
 

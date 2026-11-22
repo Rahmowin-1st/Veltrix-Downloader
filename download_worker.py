@@ -39,7 +39,7 @@ def main():
         detail = re.sub(r"\d{5,}:[\w-]+", "[token]", detail)
         # Only fixed provider messages are added by the downloader as notes.
         notes = [str(line)[:170] for line in getattr(exc, "__notes__", [])
-                 if str(line).startswith(("Newisty ", "Public download service ", "Public YouTube player "))]
+                 if str(line).startswith(("VidFetch ", "Newisty ", "Public download service ", "Public YouTube player "))]
         payload = {"error": bot.friendly_error(bot.platform_of(request["url"]) or "", exc),
                    "category": failure_category(exc),
                    "diagnostic": f"{type(exc).__name__}: {detail[:600]}" + (f" | {'; '.join(notes)}" if notes else "")}

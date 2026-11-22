@@ -7,7 +7,9 @@ and a Telegram webhook, as configured in [render.yaml](render.yaml).
 2. Set the build command to `pip install -r requirements.txt` and the start
    command to `python render_free.py`.
 3. Set `BOT_TOKEN` in Render's secret environment and set `TERMUX_PRIMARY=0`.
-   For the optional public YouTube fallback, set `NEWISTY_YOUTUBE=1`.
+   For public YouTube downloads after a server block, set `VIDFETCH_API_KEY` from a
+   [VidFetch account](https://www.vidfetch.dev/). `NEWISTY_YOUTUBE=1` enables the secondary
+   fallback. Keep provider keys in Render's secret environment.
 4. In the startup logs, check the verified bot username and
    `Render webhook registered: True`. A growing pending count or a recent
    error means Telegram delivery to the webhook needs investigation.

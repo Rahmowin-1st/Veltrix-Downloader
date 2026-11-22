@@ -1,7 +1,7 @@
-# Veltrix Downloader 9.15.2
+# Veltrix Downloader 9.16.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
-No quality menu, paid downloader API or per-download subscription.
+Quality selection is automatic. Direct downloads require no provider account.
 
 Instagram's full-object DASH video and audio variants are recovered per carousel item when
 exposed in exact-post metadata, then muxed into that item's silent video. Native
@@ -28,6 +28,15 @@ page metadata exposes the requested Spotlight. Preview tiles and unrelated IDs
 are excluded.
 
 ## Optional extraction APIs
+
+Set `VIDFETCH_API_KEY` in Render Environment to use [VidFetch](https://www.vidfetch.dev/youtube-downloader-api)
+when direct extraction for a single public YouTube video fails the platform's bot check or its media server returns 403.
+Use a key from the Free plan for its monthly allowance. VidFetch receives only the canonical video URL
+and requested format. By default the worker requests the best available video up to 2160p with audio,
+then validates the file and passes its bytes to the usual Telegram delivery pipeline. VidFetch may
+convert the source and serves direct MP3 requests at 128 kbps. The inline MP3 button uses the downloaded
+video's audio when available. Provider secrets are sent only to its API. The worker requests deletion of
+its temporary provider job after the transfer attempt. Playlists stay with the direct extractor.
 
 Set `NEWISTY_YOUTUBE=1` to enable the [Newisty developer API](https://newisty.com/pages/developers#video-downloader)
 for individual public YouTube videos when direct extraction hits YouTube's bot check.
