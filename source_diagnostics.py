@@ -340,6 +340,10 @@ async def probe_downloads(urls: list[str]) -> int:
                              index, dimensions[:20], sum(path.stat().st_size for path in files))
                     if platform == 'youtube' and files and files[0].parent.name in {'newisty', 'vidfetch'}:
                         log.info('Media probe #%s YouTube provider: %s', index, files[0].parent.name)
+                        accepted = re.search(r'VidFetch YouTube file verified: requested_format=(\d+p|mp3) '
+                                             r'accepted_format=(\d+p|mp3)', (root / 'worker.log').read_text(errors='replace'))
+                        if accepted:
+                            log.info('Media probe #%s YouTube format: requested=%s accepted=%s', index, *accepted.groups())
                     downloaded += 1
         except bot.WorkerFailure as exc:
             log.info('Media probe #%s %s: %s', index, platform, exc.category)
@@ -367,6 +371,9 @@ def run() -> None:
             inputs = json.loads(urls)
         except ValueError:
             inputs = []
+        if isinstance(inputs, dict):
+            from bot import VERSION
+            inputs = inputs.get('urls') if inputs.get('version') == VERSION else []
         if isinstance(inputs, list):
             asyncio.run(probe_downloads(inputs))
     if snap:

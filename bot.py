@@ -50,7 +50,7 @@ from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "9.17.0"
+VERSION = "9.17.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -99,6 +99,7 @@ METADATA_CACHE_TTL = 60.0
 URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 YT_POST_RE = re.compile(r'^/(?:(?:@|%40)[^/]+/)?post/([A-Za-z0-9_-]+)/?$', re.I)
+YT_PLAYER_MISSING = 'failed to extract any player response'
 INSTAGRAM_POST_RE = re.compile(
     r'^/(?:(?!share/|direct/|stories/)[\w.]+/)?(reels?|p|tv)/([A-Za-z0-9_-]+)(?:/embed(?:/captioned)?)?/?$', re.I)
 PINTEREST_PIN_RE = re.compile(r"^/pin/(?:[^/]+--)?(\d+)/?$", re.I)
@@ -1142,6 +1143,10 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
             except Exception as exc:
                 if fatal_download_error(exc):
                     raise
+                if (platform == 'youtube' and base['noplaylist'] and vidfetch_enabled()
+                        and YT_PLAYER_MISSING in str(exc).lower()):
+                    # Switching format selectors cannot repair a missing player response.
+                    raise
                 if re.search(r"confirm you[’']re not a bot|login required|sign in to (?:confirm|view|watch)|private video", str(exc), re.I):
                     raise
                 last = exc
@@ -1719,8 +1724,10 @@ def vidfetch_enabled() -> bool:
 def download_vidfetch(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
     from vidfetch_provider import fetch
 
-    if not errors or not re.search(r"confirm you[’']re not a bot|unable to download video data: HTTP Error 403",
-                                   str(errors[0]), re.I):
+    direct_error = str(errors[0]) if errors else ''
+    if (YT_PLAYER_MISSING not in direct_error.lower()
+            and not re.search(r"confirm you[’']re not a bot|unable to download video data: HTTP Error 403",
+                              direct_error, re.I)):
         return []
     canonical = extract_url(url) or ''
     match = re.fullmatch(r'https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})', canonical)

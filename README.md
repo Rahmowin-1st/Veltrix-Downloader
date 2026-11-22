@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.17.0
+# Veltrix Downloader 9.17.1
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 Quality selection is automatic. Direct downloads require no provider account.
@@ -30,7 +30,7 @@ are excluded.
 ## Optional extraction APIs
 
 Set `VIDFETCH_API_KEY` in Render Environment to use [VidFetch](https://www.vidfetch.dev/youtube-downloader-api)
-when direct extraction for a single public YouTube video fails the platform's bot check or its media server returns 403.
+when direct extraction for a single public YouTube video hits the bot check, a missing player response or media HTTP 403.
 Use a key from the Free plan for its monthly allowance. VidFetch receives only the canonical video URL
 and requested format. By default the worker requests the best available video up to 2160p with audio,
 then validates the file and passes its bytes to the usual Telegram delivery pipeline. VidFetch may

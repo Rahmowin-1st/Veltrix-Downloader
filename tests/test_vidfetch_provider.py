@@ -134,3 +134,16 @@ class VidFetchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Private video'):
                 bot.grab(URL, 'auto', folder)
             provider.assert_not_called()
+
+    def test_missing_player_response_skips_redundant_selectors_and_tries_provider(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict('os.environ', {
+                'VIDFETCH_API_KEY': 'test-key', 'NEWISTY_YOUTUBE': '0', 'COBALT_API_URL': '',
+                'YOUTUBE_COOKIE_FILE': '', 'YOUTUBE_COOKIES_B64': ''}), \
+                patch('bot.safe_remote_url', return_value=True), patch('bot.download_youtube_public', return_value=[]), \
+                patch('vidfetch_provider.fetch', return_value=[]) as provider, patch('bot.YoutubeDL') as ydl:
+            extractor = ydl.return_value.__enter__.return_value
+            extractor.extract_info.side_effect = RuntimeError('Failed to extract any player response')
+            with self.assertRaisesRegex(RuntimeError, 'any player response'):
+                bot.grab(URL, 'auto', folder)
+            extractor.extract_info.assert_called_once()
+            self.assertEqual(provider.call_args.args[:2], (VIDEO_ID, '2160p'))
