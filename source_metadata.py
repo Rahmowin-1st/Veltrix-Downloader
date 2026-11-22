@@ -377,3 +377,64 @@ def find_pinterest_pin(document, pin_id: str) -> dict:
                   any(node.get(k) for k in ('images', 'videos', 'carousel_data', 'story_pin_data', 'audio'))]
     return max(candidates, key=lambda p: (bool(p.get("story_pin_data") or p.get("carousel_data")),
                                          bool(p.get("videos")), len(p)), default={})
+
+
+def pinterest_relay_pin(page: str, pin_id: str) -> dict:
+    """Adapt the exact Pin query embedded in the current public web page."""
+    def media(node):
+        video = node.get('videos') or node.get('video')
+        return {'images': {key.removeprefix('images_'): value for key, value in node.items()
+                           if key.startswith('images_') and isinstance(value, dict)},
+                'videos': {'video_list': video.get('videoList')} if video else None,
+                'image_signature': node.get('imageSignature')}
+
+    def story_detail(story):
+        return sum(len(block) for page in (story.get('pages') or []) for block in (page.get('blocks') or []))
+
+    block_types = {'StoryPinImageBlock': 'story_pin_image_block',
+                   'StoryPinVideoBlock': 'story_pin_video_block',
+                   'StoryPinMusicBlock': 'story_pin_music_block',
+                   'StoryPinParagraphBlock': 'story_pin_paragraph_block',
+                   'StoryPinProductStickerBlock': 'story_pin_product_sticker_block',
+                   'StoryPinStaticStickerBlock': 'story_pin_static_sticker_block'}
+    decoder = json.JSONDecoder()
+    comma = re.compile(r'\s*,\s*')
+    exact = {}
+    for match in re.finditer(r'\bwindow\.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__\(\s*', page):
+        try:
+            query, end = decoder.raw_decode(page, match.end())
+            separator = comma.match(page, end)
+            if not isinstance(query, str) or not separator:
+                continue
+            response, _ = decoder.raw_decode(page, separator.end())
+            pin = response['data']['v3GetPinQueryv2']['data']
+        except (ValueError, TypeError, KeyError):
+            continue
+        if (not isinstance(pin, dict) or str(pin.get('entityId')) != pin_id
+                or pin.get('__typename') != 'Pin'):
+            continue
+        if pin.get('isViewerRestricted') or pin.get('carouselData'):
+            # Relay carousel slots can contain covers without their media types.
+            return {}
+        for key, value in pin.items():
+            if value is not None and (key != 'storyPinData' or story_detail(value) >= story_detail(exact.get(key) or {})):
+                exact[key] = value
+
+    if not exact:
+        return {}
+    result = {'id': pin_id, **media(exact), 'is_video': bool(exact.get('videoStatus'))}
+    if story := exact.get('storyPinData'):
+        pages = []
+        for page_data in story.get('pages') or []:
+            blocks = []
+            for block in page_data.get('blocks') or []:
+                kind = block_types.get(block.get('__typename'))
+                if not kind:
+                    raise RuntimeError('Incomplete Pinterest story block metadata')
+                audio = block.get('audio') or block.get('audioUrl')
+                if kind == 'story_pin_music_block' and not audio:
+                    raise RuntimeError('Incomplete Pinterest story music metadata')
+                blocks.append({'type': kind, **media(block), 'audio': audio})
+            pages.append({'blocks': blocks})
+        result['story_pin_data'] = {'pages': pages}
+    return result

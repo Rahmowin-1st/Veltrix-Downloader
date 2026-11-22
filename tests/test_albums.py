@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 from source_metadata import (instagram_audio_urls, instagram_extractor,
-                             pinterest_entries, pinterest_post_audio_urls, find_pinterest_pin)
+                             pinterest_entries, pinterest_post_audio_urls, find_pinterest_pin, pinterest_relay_pin)
 from telegram.error import TimedOut, BadRequest
 
 
@@ -30,6 +30,21 @@ class MetadataTests(unittest.TestCase):
         ]}})
         self.assertEqual([e["kind"] for e in result], ["image", "video"])
         self.assertTrue(result[1]["formats"][0]["url"].endswith("two.mp4"))
+
+    def test_pinterest_relay_uses_exact_pin_and_leaves_untyped_carousel_covers_alone(self):
+        def embedded(pin):
+            response = {'data': {'v3GetPinQueryv2': {'data': {'__typename': 'Pin', **pin}}}}
+            return '<script>window.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__("query", ' + json.dumps(response) + ')</script>'
+
+        image = {'images_orig': {'url': 'https://cdn.test/cover.jpg'}}
+        related = embedded({'entityId': '51', **image})
+        pin = {'entityId': '42', **image, 'videos': {'videoList': {'large': {'url': 'https://cdn.test/clip.mp4'}}}}
+        entries = pinterest_entries(pinterest_relay_pin(related + embedded(pin), '42'))
+        self.assertEqual(entries[0]['kind'], 'video')
+        self.assertEqual(entries[0]['formats'][0]['url'], 'https://cdn.test/clip.mp4')
+        self.assertEqual(pinterest_relay_pin(related, '42'), {})
+        carousel = {'entityId': '42', **image, 'carouselData': {'carouselSlots': [image]}}
+        self.assertEqual(pinterest_relay_pin(embedded(carousel), '42'), {})
 
     def test_pinterest_missing_video_is_not_a_photo(self):
         with self.assertRaisesRegex(RuntimeError, "poster rejected"):

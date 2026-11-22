@@ -9,6 +9,8 @@ import bot
 
 
 def failure_category(exc: Exception) -> str:
+    if isinstance(exc, bot.VidFetchQuotaExceeded):
+        return 'ProviderQuotaExceeded'
     message = str(exc).lower()
     if "confirm you’re not a bot" in message or "confirm you're not a bot" in message:
         return 'PlatformBotCheck'

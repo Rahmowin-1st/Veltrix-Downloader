@@ -17,10 +17,17 @@ API = 'https://api.vidfetch.dev/v1'
 AGENT = 'VeltrixDownloader/1.0'
 MAX_WAIT = 240
 LOG = logging.getLogger('veltrix.provider')
+VIDEO_QUALITIES = ('2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p')
+
+
+class VidFetchQuotaExceeded(ProviderError):
+    """VidFetch rejected the request before creating a download job."""
 
 
 def request_json(client, method, route, *, body=None):
     with client.stream(method, API + route, json=body) as response:
+        if method == 'POST' and route == '/downloads' and response.status_code == 402:
+            raise VidFetchQuotaExceeded('VidFetch create HTTP 402 (download quota)')
         if not response.is_success:
             stage = 'info' if route == '/info' else 'create' if method == 'POST' else 'status'
             raise ProviderError(f'VidFetch {stage} HTTP {response.status_code}')
@@ -35,6 +42,19 @@ def request_json(client, method, route, *, body=None):
     if not isinstance(data, dict):
         raise ProviderError('VidFetch returned invalid metadata')
     return data
+
+
+def create_job(client, url, quality):
+    qualities = ('mp3',) if quality == 'mp3' else VIDEO_QUALITIES[VIDEO_QUALITIES.index(quality):]
+    for requested in qualities:
+        try:
+            job = request_json(client, 'POST', '/downloads', body={
+                'url': url, 'format': requested, 'destination': 'url',
+            })
+            return job, requested
+        except VidFetchQuotaExceeded:
+            if requested == qualities[-1]:
+                raise
 
 
 def await_file(client, job, route, job_id, url, video_id, *, clock, sleep):
@@ -56,8 +76,8 @@ def await_file(client, job, route, job_id, url, video_id, *, clock, sleep):
 
 def fetch(video_id: str, quality: str, folder: Path, *, api_key, safe_url, budget, max_bytes,
           proxy=None, client_factory=httpx.Client, clock=time.monotonic, sleep=time.sleep) -> list[Path]:
-    if not api_key or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id) or quality not in {
-            '144p', '240p', '360p', '480p', '720p', '1080p', '1440p', '2160p', 'mp3'}:
+    if (not api_key or not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id)
+            or quality not in (*VIDEO_QUALITIES, 'mp3')):
         return []
     url = 'https://www.youtube.com/watch?v=' + video_id
     audio = quality == 'mp3'
@@ -80,9 +100,7 @@ def fetch(video_id: str, quality: str, folder: Path, *, api_key, safe_url, budge
                     or info.get('is_live') or info.get('is_private') or info.get('is_unlisted')
                     or int(info.get('age_limit') or 0) >= 18 or info.get('availability') not in (None, 'public')):
                 raise ProviderError('VidFetch could not verify this public video')
-            job = request_json(client, 'POST', '/downloads', body={
-                'url': url, 'format': quality, 'destination': 'url',
-            })
+            job, accepted_quality = create_job(client, url, quality)
             job_id = job.get('id') or ''
             if not re.fullmatch(r'dl_[A-Za-z0-9_-]{1,96}', job_id) or job.get('url') != url:
                 raise ProviderError('VidFetch returned an invalid download job')
@@ -113,7 +131,8 @@ def fetch(video_id: str, quality: str, folder: Path, *, api_key, safe_url, budge
                         pass
                 except httpx.HTTPError:
                     pass
-        LOG.info('VidFetch YouTube file verified: requested_format=%s bytes=%s', quality, out.stat().st_size)
+        LOG.info('VidFetch YouTube file verified: requested_format=%s accepted_format=%s bytes=%s',
+                 quality, accepted_quality, out.stat().st_size)
         return [out]
     except (ProviderError, TransferLimit):
         out.unlink(missing_ok=True)

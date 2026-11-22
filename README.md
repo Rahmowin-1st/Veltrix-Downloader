@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.16.0
+# Veltrix Downloader 9.17.0
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 Quality selection is automatic. Direct downloads require no provider account.
@@ -36,7 +36,8 @@ and requested format. By default the worker requests the best available video up
 then validates the file and passes its bytes to the usual Telegram delivery pipeline. VidFetch may
 convert the source and serves direct MP3 requests at 128 kbps. The inline MP3 button uses the downloaded
 video's audio when available. Provider secrets are sent only to its API. The worker requests deletion of
-its temporary provider job after the transfer attempt. Playlists stay with the direct extractor.
+its temporary provider job after the transfer attempt. If VidFetch rejects job creation for insufficient
+quota, the worker tries progressively smaller video formats. Playlists stay with the direct extractor.
 
 Set `NEWISTY_YOUTUBE=1` to enable the [Newisty developer API](https://newisty.com/pages/developers#video-downloader)
 for individual public YouTube videos when direct extraction hits YouTube's bot check.
@@ -70,8 +71,8 @@ Explicit YouTube playlists stay on the collection-capable built-in route.
 | --- | --- | --- |
 | YouTube | yt-dlp + yt-dlp-ejs + Deno + ffmpeg, plus matching Community post metadata | Videos, Shorts, clips, archived streams and explicit playlists. Community post image attachments and linked video when exposed |
 | Instagram | parth-dl, gallery-dl and yt-dlp | Public Reels, posts, shared links, and ordered mixed image/video carousels |
-| Snapchat | Exact Spotlight ID and public story metadata, with CDN and HLS download | Spotlight videos and public story photos/videos, including a specific snap selected by the link |
-| Pinterest | Exact pin metadata from gallery-dl or embedded page JSON + direct media/HLS | Images, GIFs, video, mixed carousels/Idea Pin pages and exposed audio blocks; no poster substitution |
+| Snapchat | Exact Spotlight, Story and Highlight metadata, with CDN and HLS download | Spotlight videos and public story or highlight photos/videos, including a specific snap selected by the link |
+| Pinterest | Exact Pin Resource, gallery-dl or embedded page JSON + direct media/HLS | Images, GIFs, video, mixed carousels/Idea Pin pages and exposed audio blocks; no poster substitution |
 
 This is an implementation support matrix, **not a claim that every current URL was tested live**.
 Expired/deleted/private posts, unavailable music, DRM, unsupported page schemas and platform blocks can fail.

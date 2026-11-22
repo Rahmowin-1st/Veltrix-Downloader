@@ -8,7 +8,7 @@ from unittest.mock import patch
 import httpx
 
 import bot
-from vidfetch_provider import ProviderError, fetch
+from vidfetch_provider import ProviderError, VidFetchQuotaExceeded, create_job, fetch
 
 
 VIDEO_ID = 'aqz-KE-bpKQ'
@@ -80,6 +80,26 @@ class VidFetchTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ProviderError, 'verify this public video'):
                     self.fetch(handle, folder)
+
+    def test_create_descends_only_for_rejected_quota_requests(self):
+        for responses, expected_error in (([402, 402, 202], None), ([402, 429], ProviderError),
+                                          ([402] * 8, VidFetchQuotaExceeded)):
+            with self.subTest(responses=responses):
+                formats = []
+
+                def handle(request):
+                    status = responses[len(formats)]
+                    formats.append(json.loads(request.content)['format'])
+                    self.assertEqual(request.url.path, '/v1/downloads')
+                    return httpx.Response(status, json={'id': JOB})
+
+                with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+                    if expected_error:
+                        with self.assertRaises(expected_error):
+                            create_job(client, URL, '2160p')
+                    else:
+                        self.assertEqual(create_job(client, URL, '2160p'), ({'id': JOB}, '1080p'))
+                self.assertEqual(formats, ['2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p'][:len(responses)])
 
     def test_rejects_untrusted_media_redirect(self):
         with tempfile.TemporaryDirectory() as folder:

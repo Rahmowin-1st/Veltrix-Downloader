@@ -312,7 +312,7 @@ async def probe_downloads(urls: list[str]) -> int:
     import bot
 
     downloaded = 0
-    for index, url in enumerate(urls[:6], 1):
+    for index, url in enumerate(urls[:8], 1):
         platform = bot.platform_of(url) if isinstance(url, str) else None
         if not platform or bot.youtube_playlist_url(url):
             continue
@@ -330,14 +330,14 @@ async def probe_downloads(urls: list[str]) -> int:
                                             for kind, path in zip(kinds, files))
                     tracks = len(bot.audio_sources(files, root / 'soundtrack'))
                     from media_io import probe
-                    dimensions = [(s.get('width'), s.get('height')) for path, kind in zip(files, kinds)
-                                  if kind == 'video' for s in probe(path)['streams']
+                    dimensions = [(kind, s.get('width'), s.get('height')) for path, kind in zip(files, kinds)
+                                  if kind in {'video', 'image', 'animation'} for s in probe(path)['streams']
                                   if s.get('codec_type') == 'video']
                     log.info('Media probe #%s %s: items=%s video=%s image=%s animation=%s audio=%s video_with_audio=%s mp3_sources=%s',
                              index, platform, len(files), kinds.count('video'), kinds.count('image'),
                              kinds.count('animation'), kinds.count('audio'), videos_with_audio, tracks)
                     log.info('Media probe #%s quality: dimensions=%s total_bytes=%s',
-                             index, dimensions, sum(path.stat().st_size for path in files))
+                             index, dimensions[:20], sum(path.stat().st_size for path in files))
                     if platform == 'youtube' and files and files[0].parent.name in {'newisty', 'vidfetch'}:
                         log.info('Media probe #%s YouTube provider: %s', index, files[0].parent.name)
                     downloaded += 1

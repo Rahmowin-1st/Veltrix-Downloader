@@ -261,6 +261,18 @@ class ExtractorRegressionTests(unittest.TestCase):
         self.assertEqual(bot.snapchat_story_entries(doc, "https://www.snapchat.com/add/user/missing"), [])
         self.assertEqual([x["kind"] for x in bot.snapchat_story_entries(doc, "https://www.snapchat.com/add/user")], ["image", "video"])
 
+    def test_snapchat_highlight_page_uses_exact_group_and_story_excludes_highlights(self):
+        snap = {'snapId': {'value': 'clip'}, 'snapMediaType': 1,
+                'snapUrls': {'mediaUrl': {'value': 'https://cdn.test/clip'}}}
+        highlight = {'highlightId': {'value': 'requested'}, 'snapList': [snap]}
+        related = {'highlightId': {'value': 'other'}, 'snapList': [snap]}
+        doc = {'props': {'pageProps': {'highlight': highlight, 'curatedHighlights': [related]}}}
+        profile = 'https://www.snapchat.com/@user'
+        self.assertEqual(bot.snapchat_story_entries(doc, profile + '/highlight/requested'),
+                         [{'url': 'https://cdn.test/clip', 'kind': 'video'}])
+        self.assertEqual(bot.snapchat_story_entries(doc, profile + '/highlight/missing'), [])
+        self.assertEqual(bot.snapchat_story_entries(doc, profile + '/story'), [])
+
     def test_429_wait_is_never_shortened(self):
         self.assertGreaterEqual(bot.telegram_retry_delay(RetryAfter(90), 0), 90)
 

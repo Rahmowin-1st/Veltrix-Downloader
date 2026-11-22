@@ -32,7 +32,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -47,9 +47,10 @@ from cobalt_provider import ProviderError
 from newisty_provider import ProviderRateLimit
 from source_metadata import IncompletePost, media_quality
 from transfer import TransferLimit
+from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "9.16.0"
+VERSION = "9.17.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1430,8 +1431,32 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
     return outputs or soundtrack
 
 
+def download_pinterest_resource(url: str, tmpdir: str) -> list[Path]:
+    from source_metadata import pinterest_entries
+
+    match = PINTEREST_PIN_RE.fullmatch(urlparse(url).path)
+    if not match:
+        return []
+    pin_id = match[1]
+    source_path = f'/pin/{pin_id}/'
+    source = 'https://www.pinterest.com' + source_path
+    query = urlencode({'source_url': source_path, 'data': json.dumps({
+        'options': {'id': pin_id, 'field_set_key': 'detailed'},
+    }, separators=(',', ':'))})
+    response = fetch_public_page('https://www.pinterest.com/resource/PinResource/get/?' + query,
+                                extra_headers={'Accept': 'application/json', 'Referer': source,
+                                               'X-Requested-With': 'XMLHttpRequest',
+                                               'X-Pinterest-PWS-Handler': 'www/[username].js'})
+    pin = _dig_dict(response.json(), 'resource_response', 'data')
+    if str(pin.get('id')) != pin_id:
+        raise RuntimeError('Pinterest resource returned metadata for a different Pin')
+    if pin.get('is_viewer_restricted'):
+        raise RuntimeError('Pinterest Pin requires sign in')
+    return download_source_entries(pinterest_entries(pin), Path(tmpdir) / 'pinterest_resource', source)
+
+
 def download_pinterest_page(url: str, tmpdir: str) -> list[Path]:
-    from source_metadata import find_pinterest_pin, pinterest_entries
+    from source_metadata import find_pinterest_pin, pinterest_entries, pinterest_relay_pin
     resolved = resolve_public_redirect(url)
     match = PINTEREST_PIN_RE.fullmatch(urlparse(resolved).path)
     if not match:
@@ -1452,10 +1477,10 @@ def download_pinterest_page(url: str, tmpdir: str) -> list[Path]:
         pin = find_pinterest_pin(document, match.group(1))
         if pin:
             matches.append(pin)
-    if not matches:
-        return []
-    pin = find_pinterest_pin(matches, match.group(1))
-    return download_source_entries(pinterest_entries(pin), Path(tmpdir) / "pinterest_page", resolved)
+    pin = find_pinterest_pin(matches, match[1]) or pinterest_relay_pin(page.text, match[1])
+    if pin:
+        return download_source_entries(pinterest_entries(pin), Path(tmpdir) / 'pinterest_page', resolved)
+    return []
 
 
 def og_values(page: str, names: set[str]) -> list[str]:
@@ -1576,6 +1601,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     """User-safe errors only. Full extractor details stay in logs."""
     if isinstance(exc, WorkerFailure):
         return str(exc)
+    if isinstance(exc, VidFetchQuotaExceeded):
+        return 'YouTube: the download quota is too low for this video. Try again when quota is available.'
     if isinstance(exc, BadRequest):
         return "Telegram rejected this media. The rejected album was not delivered; try again."
     if connection_failed_before_send(exc):
@@ -1761,8 +1788,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
             engines.append(lambda folder, _: download_instagram_dedicated(url, folder, graphql=True)[0])
         engines.append(lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder))
     elif platform == "pinterest":
-        # gallery-dl retains page boundaries, audio blocks and carousel order.
-        engines = [lambda folder, _: download_gallery(resolve_public_redirect(url), folder),
+        url = resolve_public_redirect(url)
+        engines = [lambda folder, _: download_pinterest_resource(url, folder),
+                   lambda folder, _: download_gallery(url, folder),
                    lambda folder, _: download_pinterest_page(url, folder)]
     else:
         engines = [lambda folder, _: download_snapchat_dedicated(url, folder, (prefetched or {}).get("_snap_info")),
@@ -1837,7 +1865,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 provider_diagnostics.append(str(exc)[:170])
             # A provider configuration/outage error must not hide the actual
             # platform failure (e.g. YouTube's bot check) from the user.
-            if not isinstance(exc, ProviderError) or isinstance(exc, ProviderRateLimit) or not errors:
+            if not isinstance(exc, ProviderError) or isinstance(exc, (ProviderRateLimit, VidFetchQuotaExceeded)) or not errors:
                 errors.append(exc)
             log.warning("%s extractor failed: %s", platform, type(exc).__name__)
         if not any(p.is_relative_to(attempt) for p in candidate + candidate_tracks):
@@ -1851,7 +1879,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 path.rename(soundtrack / f'{index:05d}{path.suffix}')
         return candidate
     if errors:
-        error = next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit))), errors[-1])
+        error = next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit, VidFetchQuotaExceeded))),
+                     errors[-1])
         for diagnostic in provider_diagnostics:
             error.add_note(diagnostic)
         raise error
@@ -2717,7 +2746,7 @@ async def run_job(
                                items=count, error=exc.category if isinstance(exc, WorkerFailure) else type(exc).__name__)
         markup = None
         definitive = isinstance(exc, WorkerFailure) and exc.category in {
-            'SourceUnavailable', 'PlatformBotCheck', 'AccessRequired',
+            'SourceUnavailable', 'PlatformBotCheck', 'AccessRequired', 'ProviderQuotaExceeded',
         }
         if mode == AUTO_MODE and not count and not uncertain and not definitive:
             try:
@@ -2815,19 +2844,19 @@ def check_download_budget(progress: dict) -> None:
         raise TransferLimit("Job storage limit exceeded; download stopped")
 
 
-def fetch_public_page(url: str) -> httpx.Response:
+def fetch_public_page(url: str, *, extra_headers: dict[str, str] | None = None) -> httpx.Response:
     for attempt in range(3):
         try:
-            return _fetch_public_page_once(url)
+            return _fetch_public_page_once(url, extra_headers=extra_headers)
         except httpx.TransportError:
             if attempt == 2:
                 raise
             time.sleep(2 ** attempt)
 
 
-def _fetch_public_page_once(url: str) -> httpx.Response:
+def _fetch_public_page_once(url: str, *, extra_headers: dict[str, str] | None = None) -> httpx.Response:
     current = url
-    with httpx.Client(headers=request_headers(url), follow_redirects=False, timeout=25,
+    with httpx.Client(headers={**request_headers(url), **(extra_headers or {})}, follow_redirects=False, timeout=25,
                       proxy=PROXY or None, trust_env=False) as client:
         for _ in range(6):
             if not safe_remote_url(current):
@@ -2854,22 +2883,23 @@ def snapchat_story_entries(doc: dict, url: str) -> list[dict]:
     if not match:
         return []
     requested = (match[2] or '').strip('/').rsplit('/', 1)[-1]
-    if requested in {'story', 'stories', 'highlights'}:
-        requested = ''
     story = _dig_dict(props, 'story')
+    highlight = _dig_dict(props, 'highlight')
     highlights = [row for row in (props.get('curatedHighlights') or []) if isinstance(row, dict)]
     snaps = story.get('snapList') or []
-    if not requested:
+    if requested in {'', 'highlights'}:
         if not snaps and highlights:
             snaps = highlights[0].get('snapList') or []
-    else:
-        snaps = [snap for group in [story, *highlights] for snap in (group.get('snapList') or [])
+    elif requested not in {'story', 'stories'}:
+        groups = [story, highlight, *highlights]
+        snaps = [snap for group in groups for snap in (group.get('snapList') or [])
                  if isinstance(snap, dict) and _dig_dict(snap, 'snapId').get('value') == requested]
         if snaps:
             snaps = snaps[:1]
         else:
-            selected = next((group for group in highlights
-                             if _dig_dict(group, 'highlightId').get('value') == requested), {})
+            selected = next((group for group in groups if requested in {
+                _dig_dict(group, 'highlightId').get('value'), _dig_dict(group, 'storyId').get('value'),
+            }), {})
             snaps = selected.get('snapList') or []
     output = []
     for snap in snaps:
