@@ -1,5 +1,7 @@
 # Veltrix Downloader release audit — 2026-10-16
 
+> Historical release evidence. See the [project map](PROJECT_MAP.md#version-and-evidence) for the latest verified runtime and test results.
+
 ## v9.9.0 per-item audio and optional provider fallback
 
 - Baseline: `b3bc031`. The existing Instagram parser discarded full-object audio

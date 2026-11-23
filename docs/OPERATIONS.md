@@ -1,0 +1,176 @@
+# Runtime and operations
+
+Use the [project map](PROJECT_MAP.md) to find the code, active service and verification results. The [Render setup](../RENDER.md) lists the deployment commands.
+
+## Extraction and fallback behavior
+
+- YouTube tries yt-dlp first. For eligible single public videos, configured providers can help with a bot check, missing player response or media HTTP 403. The anonymous public player fallback tries the public watch page for its initial context. It waits five minutes across worker processes after HTTP 403 from both public API origins.
+- Instagram checks exact post metadata and verifies carousel length and type order. When the highest video rendition lacks audio, the worker can copy audio from a compatible rendition of the same item. Separate post-wide audio stays associated with that post.
+- Snapchat looks for the requested Spotlight ID on the direct and embed pages, then tries its exact-ID public lookup. Pinterest reads the exact Pin Resource and falls back to gallery-dl or embedded page data. A public page can explicitly report unavailable media.
+
+## Optional extraction APIs
+
+Set `VIDFETCH_API_KEY` in Render Environment to use [VidFetch](https://www.vidfetch.dev/youtube-downloader-api)
+when direct extraction for a single public YouTube video hits the bot check, a missing player response or media HTTP 403.
+Use a key from the Free plan for its monthly allowance. VidFetch receives only the canonical video URL
+and requested format. By default the worker requests the best available video up to 2160p with audio,
+then validates the file and passes its bytes to the usual Telegram delivery pipeline. VidFetch may
+convert the source and serves direct MP3 requests at 128 kbps. The inline MP3 button uses the downloaded
+video's audio when available. Provider secrets are sent only to its API. The worker requests deletion of
+its temporary provider job after the transfer attempt. If VidFetch rejects job creation for insufficient
+quota, the worker tries progressively smaller video formats. Playlists stay with the direct extractor.
+
+Set `NEWISTY_YOUTUBE=1` to enable the [Newisty developer API](https://newisty.com/pages/developers#video-downloader)
+for individual public YouTube videos when direct extraction hits YouTube's bot check.
+The service receives the canonical video URL and requested format. Its queue and
+rate limits apply. The worker verifies the video ID in metadata and checks the
+download's type and duration. `/original` returns the provider's best MP4 when this
+route is used. Leave the setting at `0` to use only the other configured extractors.
+
+An owner-operated or explicitly authorized [Cobalt API](https://github.com/imputnet/cobalt/blob/main/docs/api.md)
+can be used after built-in extractors fail or return silent videos:
+
+```dotenv
+COBALT_API_URL=https://your-authorized-cobalt-host.example/
+COBALT_API_KEY=
+```
+
+Leave these empty to disable it. Cobalt does not provide an official unrestricted
+public API endpoint; this repository does not include an instance or API key.
+Self-hosting on the same blocked IP does not guarantee YouTube access. A provider
+must actually expose the requested post and audio; integration alone cannot
+establish live success.
+
+The adapter requests maximum quality with sound, downloads all picker items in
+order, keeps background audio for MP3, and checks real media streams. API keys
+are sent only to the configured HTTPS endpoint, never to media/CDN hosts.
+Explicit YouTube playlists stay on the collection-capable built-in route.
+
+## Platform routes
+
+| Platform | Implemented route | Media handled by that route |
+| --- | --- | --- |
+| YouTube | yt-dlp + yt-dlp-ejs + Deno + ffmpeg, plus matching Community post metadata | Videos, Shorts, clips, archived streams and explicit playlists. Community post image attachments and linked video when exposed |
+| Instagram | parth-dl, gallery-dl and yt-dlp | Public Reels, posts, shared links, and ordered mixed image/video carousels |
+| Snapchat | Exact Spotlight, Story and Highlight metadata, with CDN and HLS download | Spotlight videos and public story or highlight photos/videos, including a specific snap selected by the link |
+| Pinterest | Exact Pin Resource, gallery-dl or embedded page JSON + direct media/HLS | Images, GIFs, video, mixed carousels/Idea Pin pages and exposed audio blocks; no poster substitution |
+
+This is an implementation support matrix, **not a claim that every current URL was tested live**.
+Expired/deleted/private posts, unavailable music, DRM, unsupported page schemas and platform blocks can fail.
+Text-only posts have no media attachment. Public community posts and short links depend on the payload returned by the platform.
+
+## Quality and Telegram behavior
+
+- Automatic YouTube mode prioritizes resolution, frame rate and HDR with no fixed resolution ceiling. For an explicit playlist, each final file must match its own entry. Instagram tries the largest rendition first and can join a separate track from the same carousel item.
+- “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
+- A plain link or `/original <link>` sends the highest available downloaded files as Telegram documents, preserving their bytes. Separate soundtracks follow the ordered media. Source audio/video tracks may be merged into one container during extraction. Large files are streamed as numbered `.partNNN` documents. Download all parts for a file and concatenate them in numbered order to recover it.
+- `/playable <link>` prepares photos and playable media for Telegram's chat player. Compatible tracks are remuxed. Other video codecs are converted to H.264/AAC without resizing, and Telegram may recompress photos. Large playable videos may be split on existing keyframes.
+- Collections use albums of at most 10 in source order. In playback mode, visual media, audio and documents use separate groups. GIF and animated WebP retain motion, and AVIF stills are sent as photos.
+- If Telegram explicitly rejects the media format of an upload, the bot resends that batch as documents in the same order. It uses the source bytes for items that fit in one file. An upload that times out or loses its response still requires checking the chat before retrying.
+- An MP3 button appears after every delivered post. The bot attaches it to the last media item or puts it on the status message if Telegram rejects the edit. The Original button carries the source link so a signed callback can fetch audio after a restart or cache write failure. When a delivered carousel has silent videos, the MP3 action checks the source again and keeps the cached tracks if the new attempt finds fewer.
+- Video variants are checked for an actual audio stream. Instagram's dedicated extractor and gallery-dl both read DASH audio for the matching carousel item. The bot can combine complementary results after comparing the affected clips' encoded video streams. A post-wide soundtrack is added to each silent video independently and offered once through MP3. Conversion preserves the video's duration and checks that audio survives. Videos without an exposed track are marked in the delivery caption.
+- Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
+- Files are streamed during upload rather than read entirely into RAM.
+- Hosted Bot API: conservative 49,000,000-byte per-file ceiling. Exact delivery splits the file by bytes. Playback mode splits audio/videos by stream copy. A single request may produce multiple messages.
+- An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081`; it supports uploads up to 2,000,000,000 bytes. A server must actually be installed/configured; setting the variable alone does not create it. Switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
+- If playback cannot be split at existing keyframes, a plain link still delivers the original in numbered parts.
+
+## Reliability
+
+- Downloads run outside Telegram update handlers, so long jobs do not occupy all command-processing slots. Progress messages show the stage/time and `/status` shows your recent jobs.
+- A SQLite journal admits at most 20 pending jobs overall and 3 per user. Links and MP3 buttons share admission and duplicate checks; Instagram tracking parameters do not create another active job.
+- Queued/downloading jobs are re-extracted after a restart, up to 3 recoveries and within 24 hours. Jobs that had started sending are marked interrupted and never replayed automatically; check received media before retrying.
+- Direct CDN transfers resume within a job using Range/If-Range when the server supplies a stable validator. If a server ignores Range, the file is restarted cleanly. Resume across a process/device restart is not byte-level: the source is extracted again.
+- Download failures offer a retry button before any media upload is attempted. Unsupported input gets a short explanation.
+- Rate limits allow the next source-aware extractor to run; incomplete collections remain failures. MP3 mode accepts audio-only results for video links.
+- H.264 video is copied when only its audio codec needs conversion. Existing MP3 streams are not re-encoded.
+- Render can run the bot with a Telegram webhook and download media without Termux. The webhook authenticates Telegram's secret header. Termux remains available as an optional, mutually exclusive runtime when Render is configured only as a relay.
+- Per-user serialization and bounded global work concurrency.
+- Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
+- ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.
+- Carousel order is retained; failed entries, extractor error records and item caps are reported instead of silently truncating a post.
+- Snapchat will not substitute a recommended item when the requested Spotlight ID is missing.
+- No generic page-wide download fallback: these can return thumbnails, recommendations or unrelated media.
+- Telegram flood-control delays are honored in full. Proven connection-establishment failures may retry. For relay uploads, a unique request ID lets the phone retrieve a cached Telegram result after a lost reply; when the result is still unknown, the upload is not replayed.
+- The carousel previously produced Telegram HTTP 400: multipart album files lacked their `attach://` names. Attachments now receive a unique name and the serialized Telegram request is checked in tests. Telegram's explicit HTTP 400 is reported as a rejection and allows a safe retry; uncertain timeouts still require inspection.
+- A source's definitive HTTP 404 or YouTube automated-traffic check does not offer a futile immediate retry button. Snapchat Spotlight extraction can use the one Snapchat CDN video preloaded by the exact public post even when the page omits canonical tags; mismatched page IDs are still rejected.
+- If the album arrives but editing the status to add the MP3 button fails, the bot sends a small fallback button message. Render records only a short job ID, platform, stage, item count and error class, without chat contents or links; historic chat messages and the phone's local log are not available from Render.
+- Long uploads have dedicated timeouts; MP3 conversions share the same resource semaphore.
+- Conversion processes and download process groups are stopped on shutdown. A local process lock prevents two workers using the same data directory. Separate devices/services must still avoid polling the same token.
+- Dependency changes are detected during normal restart. Pending Telegram updates are preserved.
+
+Render Free sleeps after 15 minutes without inbound traffic and has a 750-hour shared monthly limit; webhook traffic wakes it, with a possible cold-start delay. Its local files, MP3 cache and SQLite job journal vanish on a restart or sleep, so admitted or unfinished work is not recoverable on that tier. A paid persistent runtime or a separately provisioned durable database is needed for strict always-on and crash recovery. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
+
+## Primary runtime: Render webhook
+
+The existing `veltrix-downloader` Render service runs `python render_free.py` with `TERMUX_PRIMARY=0`. Telegram sends new links to its webhook; Render extracts and uploads media for any Telegram user who can message the bot. Media files live in Render's temporary job directory during extraction, conversion and upload. No phone process is required. Set one active receiver per bot token; switching to the webhook makes the old Termux poller receive a conflict until it is stopped.
+
+Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot) for the active deployment. The startup log verifies the bot username, webhook URL match, pending updates and whether Telegram reported a recent webhook error.
+
+The free service can sleep or restart during long jobs, cannot retain its local SQLite/cache, and has limited CPU/disk/network resources. This setup does **not** promise permanent 24/7 availability, every private post, or success from Render's IP when a platform blocks cloud hosts. Existing authorized cookie files on a phone are not silently copied to Render.
+
+## Optional phone runtime: Termux
+
+Update:
+
+```bash
+cd ~/Veltrix-Downloader
+git pull --ff-only
+bash termux_start.sh
+```
+
+Fresh installation:
+
+```bash
+git clone https://github.com/Rahmowin-1st/Veltrix-Downloader.git
+cd Veltrix-Downloader
+bash termux_setup.sh
+```
+
+If operating in phone mode, set `TERMUX_PRIMARY=1` on Render and use Termux. Keep Termux battery optimization disabled. Normal startup installs a missing reboot script; reboot startup also requires Termux:Boot to be installed from the same source as Termux and opened once. Android can still terminate the process.
+
+`.env.example` documents normal settings. Default caps: 100 items, 4 GiB per source, 6 GiB total download workspace, 128 MiB disk reserve, one concurrent job. Remuxing/splitting also needs additional free disk space.
+
+`BOT_TOKEN` stays in `.env` on the phone and in Render's secret environment for cloud mode. Never commit tokens, cookies, sessions or proxy credentials. Existing optional authorized YouTube cookie configuration on Render is passed to the isolated worker; age restrictions remain enforced.
+
+With `TERMUX_PRIMARY=1`, Render only relays Telegram API traffic; it never polls, sets a webhook or downloads source media. The relay verifies the bot token in an HTTPS request header. Public Render URLs and access logs never contain the token. Existing Termux installs add `TELEGRAM_RELAY_BASE=https://veltrix-downloader.onrender.com` once on startup if no custom Bot API server or relay setting is present; `TELEGRAM_RELAY_BASE=0` disables that default. **Do not expose your `.env` or relay authorization header.**
+
+In phone mode, a relay request needs connectivity from the phone to Render and from Render to Telegram. Render free instances have [monthly shared instance-hour limits, network usage limits and spin-down behavior](https://render.com/docs/free). The free Render filesystem is temporary.
+
+`bash termux_start.sh` now waits for the first successful Telegram update poll (up to 90 seconds, including relay wake time). It prints `Telegram polling verified` only when the bot can fetch updates; a startup timeout leaves the supervised worker retrying and reports the safe poll error. After a verified start, send `/start` and a public media link for the first live delivery check. On phones with aggressive battery management, exempt Termux from battery restrictions so Android does not suspend polling.
+
+## Validation
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py telegram_relay.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
+bash -n termux_start.sh termux_setup.sh termux_supervisor.sh termux_process.sh
+```
+
+The regression suite includes real generated MP4/M4A/PNG/GIF media, native animation/video conversion, MP3 extraction, stream-copy splits, mixed albums, cache ownership, exact-pin metadata, partial Instagram rejection and async delivery failures. Source-page and Telegram delivery tests use controlled fixtures; passing them is not live-platform certification.
+
+See the [project map](PROJECT_MAP.md#version-and-evidence) for the current release and verified results. The [release audit](RELEASE_AUDIT.md) records older results.
+
+For a temporary Render source check, set `SOURCE_PROBE_UNTIL` to a short future UTC ISO 8601 time and `SOURCE_PROBE_URLS` to a JSON object such as `{"version":"9.17.2","urls":["https://www.youtube.com/watch?v=PUBLIC_VIDEO_ID"]}`. Use the target build's version and a real public test URL. On startup, `source_diagnostics.py` checks the worker output and logs media counts, dimensions and audio. It expires automatically. Use one relevant URL when possible to limit provider usage. For Telegram delivery, check the result and MP3 button in an authorized test chat.
+
+## Runtime diagnosis
+
+Run `python diagnose.py` on the phone for package/runtime checks, parallel DNS checks, free storage, saved job counts, local worker readiness and error categories. It independently tests authenticated `getMe` over the automatic and IPv4 routes, a direct IPv4 curl homepage request, and `getMe` through an available configured environment proxy before checking the bot identity and webhook. These direct checks are skipped when an explicit Telegram proxy or custom Bot API server is configured. With the relay it relies on authenticated `getMe` rather than a second health request. It never consumes updates, changes the webhook or prints raw log lines/tokens. It does not prove downloader success or exclude a second remote polling instance. `status=initializing` means no successful API call yet; `waiting for first poll` means `getMe` succeeded but fetching updates has not; `poll failing` reports a failed poll; `polling` requires a recent successful update fetch.
+
+The worker log prints the authenticated bot username when initialization succeeds. Termux defaults `TELEGRAM_IPV4=1`: IPv4 is attempted first, with automatic address selection as a fallback only after a connection-establishment failure. `TELEGRAM_IPV4=0` prefers automatic selection, with IPv4 as a fallback on connection failure. A command setting such as `TELEGRAM_IPV4=1 bash termux_start.sh` overrides `.env` for that run. The worker health response reports the effective preference without revealing secrets. Explicit `TELEGRAM_PROXY` takes precedence; if absent, the worker uses a configured `HTTPS_PROXY`/`ALL_PROXY` HTTP(S) tunnel only after **both** direct connections fail before transmitting any request. `NO_PROXY` exclusions are respected. Unsupported proxy schemes are ignored. No hardcoded IP, DNS override or disabled TLS verification is used. A 302 response to `curl -4 -I https://api.telegram.org` checks the homepage, not the authenticated Bot API request; `getMe` is the relevant test. If all `getMe` routes time out, an accessible network or a working HTTPS proxy is still required.
+
+To check a device's YouTube download before changing the active Telegram receiver, run `python diagnose.py --youtube '<video URL>'`. It downloads to a temporary folder, reports resolution, file size and whether audio is present, and removes the files when done. It does not call the Telegram API.
+
+Restarting Termux waits for the previous supervisor to finish, identifies its direct `python bot.py` child and signals that child if graceful shutdown stalls. After a further bounded wait it terminates only that verified child. Restart never starts a second bot while the previous supervisor remains active. An upload interrupted by restart may need manual inspection before retrying; check `/status` rather than resending the same link blindly. `python diagnose.py` can be run on its own even when startup reports a shutdown delay.
+
+Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, `PINTEREST_COOKIE_FILE`, and `SNAPCHAT_COOKIE_FILE`. On Render, the corresponding `INSTAGRAM_COOKIES_B64`, `YOUTUBE_COOKIES_B64`, `PINTEREST_COOKIES_B64`, `SNAPCHAT_COOKIES_B64` secret environment variables create permission-restricted temporary cookie files for supported extractors. Base64 is encoding, **not encryption**: set these directly as Render secrets, never in chat or GitHub. Instagram's authenticated gallery route runs first when a cookie file exists. Cookies may help with content the signed-in owner is authorized to view; a link or cookies alone do not guarantee extraction, and private Snapchat/Friends media may have no extractable web URL. Worker failures include a URL/token-redacted diagnostic in `logs/termux.log`.
+
+## Upstream references reviewed
+
+- [yt-dlp EJS requirements](https://github.com/yt-dlp/yt-dlp/wiki/EJS)
+- [yt-dlp YouTube token constraints](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)
+- [gallery-dl Pinterest extractor](https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/pinterest.py)
+- [Cobalt Snapchat implementation](https://github.com/imputnet/cobalt/blob/main/api/src/processing/services/snapchat.js)
+- [Telegram local Bot API limits](https://core.telegram.org/bots/api#using-a-local-bot-api-server)
+
+Cobalt was studied for behavior and public schema structure. No Cobalt service or paid endpoint is required.

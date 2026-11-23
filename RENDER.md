@@ -18,5 +18,5 @@ and a Telegram webhook, as configured in [render.yaml](render.yaml).
    video to verify audio delivery too.
 
 Render Free can sleep and its filesystem is temporary. Run a single webhook
-or polling instance per token. See [README.md](README.md#primary-runtime-render-webhook)
+or polling instance per token. See the [operations guide](docs/OPERATIONS.md#primary-runtime-render-webhook)
 for the limits and the optional Termux setup.
