@@ -395,3 +395,52 @@ class KeepAwakeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DeliveryFeedbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mp3_button_keeps_post_title_and_creator(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = make_video(root / 'clip.mp4', 1)
+            with patch('bot.DATA_DIR', root), patch('bot.CACHE_DIR', root / 'cache'), \
+                    patch('bot.ACTIONS_FILE', root / 'actions.json'), patch('bot.BOT_TOKEN', '123:test'):
+                markup = bot.post_mp3_button(42, 'https://www.instagram.com/reel/abc/', [source], 'Robert and mom',
+                                             uploader='family.page')
+                token = markup.inline_keyboard[0][0].callback_data.split('|')[2]
+                action = bot.resolve_action_data(42, token)
+                self.assertEqual((action['title'], action['uploader']), ('Robert and mom', 'family.page'))
+                manager = bot.JobManager(root / 'jobs.sqlite3')
+                msg = SimpleNamespace(chat_id=42, reply_text=AsyncMock())
+                with patch('bot._jobs', manager), patch('bot.run_job', new_callable=AsyncMock) as job:
+                    await bot.dispatch_job(msg, None, 42, action['url'], 'mp3_320', action=action)
+                    await asyncio.gather(*list(manager.tasks.values()))
+        self.assertEqual(job.call_args.kwargs['known_meta'], {'title': 'Robert and mom', 'uploader': 'family.page'})
+        self.assertEqual(len(job.call_args.kwargs['cached_sources']), 1)
+
+    def test_mp3_names_never_fall_back_to_unknown_artist(self):
+        self.assertEqual(bot.mp3_meta({'title': 'Media'}, 'Instagram'),
+                         {'title': 'Instagram audio', 'uploader': 'Instagram'})
+        self.assertEqual(bot.mp3_meta({'title': 'Surah Al-Hashr', 'uploader': 'Ahmed'}, 'YouTube'),
+                         {'title': 'Surah Al-Hashr', 'uploader': 'Ahmed'})
+        self.assertEqual(bot.mp3_meta({}, 'Unsupported')['uploader'], 'Veltrix')
+
+    def test_messages_explain_silent_sources_and_unavailable_media(self):
+        from source_metadata import PublicMediaUnavailable
+        self.assertIn('Pinterest provides 3 of these videos without sound',
+                      bot.delivery_caption('https://pin.it/x', {}, 3))
+        self.assertIn('Instagram provides this video without sound',
+                      bot.delivery_caption('https://www.instagram.com/reel/x/', {}, 1))
+        snap = bot.friendly_error('snapchat', PublicMediaUnavailable('x'))
+        self.assertIn('only in the app', snap)
+        quota = bot.friendly_error('youtube', bot.VidFetchQuotaExceeded('VidFetch create HTTP 402'))
+        self.assertIn('allowance is used up', quota)
+        self.assertIn('Instagram, Snapchat and Pinterest links still work', quota)
+
+    def test_youtube_providers_back_up_an_expired_cookie(self):
+        with patch.dict('os.environ', {'YOUTUBE_COOKIES_B64': 'x', 'YOUTUBE_COOKIE_FILE': '/tmp/cookies',
+                                       'VIDFETCH_API_KEY': 'key', 'NEWISTY_YOUTUBE': '1'}):
+            self.assertTrue(bot.vidfetch_enabled())
+            self.assertTrue(bot.newisty_enabled())
+        with patch.dict('os.environ', {'VIDFETCH_API_KEY': '', 'NEWISTY_YOUTUBE': '0'}):
+            self.assertFalse(bot.vidfetch_enabled())
+            self.assertFalse(bot.newisty_enabled())

@@ -12,7 +12,11 @@ and a Telegram webhook, as configured in [render.yaml](render.yaml).
    fallback. Keep provider keys in Render's secret environment.
 4. Optional, for files up to 2 GB instead of 50 MB parts: create an app at
    [my.telegram.org](https://my.telegram.org) (*API development tools*) and set
-   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` as secrets. The startup log then shows
+   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` as secrets.
+   YouTube blocks cloud servers, so YouTube needs VidFetch quota or cookies:
+   add a Secret File `youtube_cookies.txt` (Netscape format, exported from a
+   secondary Google account in a private window) under Environment → Secret
+   Files. VidFetch stays the fallback when the cookies expire. The startup log then shows
    `Large uploads (MTProto, up to 2 GB): configured`. `KEEP_AWAKE=1` keeps the free
    instance warm between requests; while a job runs it stays awake automatically.
 5. In the startup logs, check the verified bot username and
