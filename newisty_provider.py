@@ -12,7 +12,21 @@ import httpx
 
 from cobalt_provider import ProviderError
 from media_io import media_kind, probe
+from source_metadata import MediaTooLong
 from transfer import TransferLimit, download
+
+# Conservative MP4 rates (kbit/s) used to keep long videos within delivery limits.
+QUALITY_KBPS = {'best-mp4': 5000, '1080p': 5000, '720p': 2700, '480p': 1300}
+
+
+def choose_quality(quality, duration, budget_bytes):
+    if quality not in QUALITY_KBPS or not budget_bytes or duration <= 0:
+        return quality
+    order = ['best-mp4', '1080p', '720p', '480p']
+    for tier in order[order.index(quality):]:
+        if QUALITY_KBPS[tier] * 125 * duration <= budget_bytes:
+            return tier
+    return '480p'
 
 API = 'https://newisty.com/api/video-downloader/'
 AGENT = 'VeltrixDownloader/1.0'
@@ -67,7 +81,8 @@ def completed_file(client, job_id, max_bytes, *, clock, sleep):
 
 
 def fetch(video_id: str, quality: str, folder: Path, *, safe_url, budget, max_bytes,
-          proxy=None, client_factory=httpx.Client, clock=time.monotonic, sleep=time.sleep) -> list[Path]:
+          proxy=None, client_factory=httpx.Client, clock=time.monotonic, sleep=time.sleep,
+          budget_bytes=None, on_info=None, progress=None) -> list[Path]:
     if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id) or quality not in {
             'best-mp4', '1080p', '720p', '480p', 'audio-mp3', 'audio-m4a'}:
         return []
@@ -94,6 +109,9 @@ def fetch(video_id: str, quality: str, folder: Path, *, safe_url, budget, max_by
                     or int(info.get('age_limit') or 0) >= 18
                     or info.get('availability') not in {None, 'public'}):
                 raise ProviderError('Public download service could not verify this video')
+            if on_info is not None:
+                on_info(info)
+            quality = choose_quality(quality, duration, budget_bytes)
             start = metadata(client, 'POST', 'start', {'url': url, 'format': quality})
             mode = start.get('mode', 'queued')
             if mode == 'direct':
@@ -121,7 +139,7 @@ def fetch(video_id: str, quality: str, folder: Path, *, safe_url, budget, max_by
                 raise ProviderError('Public download service returned an unknown delivery mode')
         if not download(file_url, out, headers={'User-Agent': AGENT, 'Accept': '*/*'},
                         safe_url=allowed_file, budget=budget, max_bytes=max_bytes, proxy=proxy,
-                        client_factory=client_factory, timeout=45, attempts=1):
+                        client_factory=client_factory, timeout=45, attempts=1, progress=progress):
             raise ProviderError('Public download service file unavailable')
         actual = probe(out)
         length = float(actual['format'].get('duration') or 0)
@@ -130,7 +148,7 @@ def fetch(video_id: str, quality: str, folder: Path, *, safe_url, budget, max_by
             raise ProviderError('Public download service returned mismatched media')
         LOG.info('Public YouTube download verified: kind=%s bytes=%s', 'audio' if audio else 'video', out.stat().st_size)
         return [out]
-    except (ProviderError, TransferLimit):
+    except (ProviderError, TransferLimit, MediaTooLong):
         out.unlink(missing_ok=True)
         raise
     except httpx.TimeoutException:

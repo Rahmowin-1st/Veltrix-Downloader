@@ -129,6 +129,33 @@ def probe_webhook(token: str, expected: str) -> None:
                  info.pending_update_count, recent_error)
 
 
+def keep_awake(url: str, *, sleep=time.sleep, clock=time.monotonic, rounds=None) -> None:
+    """Render Free stops an instance after 15 minutes without inbound requests,
+    which would cut a long download or upload. While a job is queued or running,
+    request the service's own public address every four minutes. KEEP_AWAKE=1
+    also keeps an idle bot warm so the first reply is immediate (this uses the
+    plan's monthly instance hours)."""
+    import httpx
+
+    always = os.getenv('KEEP_AWAKE', '').strip() == '1'
+    last = None
+    while rounds is None or rounds > 0:
+        if rounds is not None:
+            rounds -= 1
+        sleep(60)
+        metrics = bot.metric_snapshot()
+        busy = metrics.get('active_jobs', 0) + metrics.get('queued_jobs', 0) > 0
+        interval = 240 if busy else 600
+        if not (busy or always) or (last is not None and clock() - last < interval):
+            continue
+        try:
+            with httpx.Client(timeout=20, trust_env=False, follow_redirects=False) as client:
+                client.get(url)
+            last = clock()
+        except httpx.HTTPError as exc:
+            log.info('Keep-awake request: %s', type(exc).__name__)
+
+
 # The isolated workers inherit cookie file paths; cookie values are never logged.
 
 
@@ -174,6 +201,8 @@ def main() -> None:
     webhook_url = f"https://{hostname}/telegram"
     log.info("webhook :%s -> %s", port, webhook_url)
     threading.Thread(target=probe_webhook, args=(token, webhook_url), daemon=True).start()
+    threading.Thread(target=keep_awake, args=(f"https://{hostname}/",), daemon=True).start()
+    log.info('Large uploads (MTProto, up to 2 GB): %s', 'configured' if bot.mtproto_configured() else 'off')
     if os.getenv('SOURCE_PROBE_UNTIL'):
         from source_diagnostics import run as probe_actual_sources
         threading.Thread(target=probe_actual_sources, daemon=True).start()

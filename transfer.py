@@ -12,7 +12,7 @@ class TransferLimit(RuntimeError):
 
 
 def download(url, out: Path, *, headers, safe_url, budget, max_bytes, proxy=None,
-             timeout=45, attempts=4, client_factory=httpx.Client, sleep=time.sleep):
+             timeout=45, attempts=4, client_factory=httpx.Client, sleep=time.sleep, progress=None):
     partial = out.with_name(out.name + '.part')
     partial.unlink(missing_ok=True)
     validator = None
@@ -74,6 +74,8 @@ def download(url, out: Path, *, headers, safe_url, budget, max_bytes, proxy=None
                                         raise TransferLimit('Source file exceeds configured storage limit')
                                     budget({})
                                     stream.write(chunk)
+                                    if progress is not None:
+                                        progress(written, total_size or 0)
                             if not written or (total_size and written != total_size):
                                 raise httpx.ReadError('Incomplete media response')
                             partial.replace(out)

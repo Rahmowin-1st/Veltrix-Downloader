@@ -11,7 +11,11 @@ import bot
 def failure_category(exc: Exception) -> str:
     if isinstance(exc, bot.VidFetchQuotaExceeded):
         return 'ProviderQuotaExceeded'
+    if isinstance(exc, bot.MediaTooLong):
+        return 'MediaTooLong'
     message = str(exc).lower()
+    if 'live stream has not ended' in message:
+        return 'LiveStream'
     if "confirm you’re not a bot" in message or "confirm you're not a bot" in message:
         return 'PlatformBotCheck'
     if any(word in message for word in ('429', 'rate limit', 'too many requests')):
@@ -35,7 +39,9 @@ def main():
     request = json.loads((root / "request.json").read_text())
     try:
         paths = bot.grab(request["url"], request["mode"], str(root), request.get("meta"))
-        payload = {"files": [str(p.resolve()) for p in paths]}
+        payload = {"files": [str(p.resolve()) for p in paths],
+                   "meta": {key: value for key, value in bot.JOB_META.items()
+                            if key in {"title", "uploader", "duration"}}}
     except Exception as exc:
         detail = re.sub(r"https?://\S+", "[url]", str(exc))
         detail = re.sub(r"\d{5,}:[\w-]+", "[token]", detail)

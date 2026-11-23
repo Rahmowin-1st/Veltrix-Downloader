@@ -410,12 +410,23 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("bot.post_mp3_button", return_value=markup) as button, \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "auto", status)
-        self.assertEqual(self.messages, [["document", "document", "document"]])
+        self.assertEqual(self.messages, [["photo", "video", "video"]])
         self.assertEqual(button.call_args.args[2], files[1:])
         self.assertEqual(button.call_count, 1)
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
         self.assertIsNone(status.edit_text.call_args.kwargs["reply_markup"])
         status.delete.assert_not_called()
+
+    async def test_original_mode_keeps_exact_documents(self):
+        files = self.files([".jpg", ".mp4"])
+        status = SimpleNamespace(edit_text=AsyncMock(), delete=AsyncMock())
+        self.msg.chat_id = 42
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        with patch("bot.download_in_worker", new_callable=AsyncMock, return_value=files), \
+                patch("bot.has_audio", return_value=True), patch("bot.post_mp3_button"), \
+                patch("bot._global_sem", None), patch("bot._job_locks", {}):
+            await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "original", status)
+        self.assertEqual(self.messages, [["document", "document"]])
 
     async def test_mp3_button_is_under_the_delivered_video(self):
         files = self.files(['.mp4'])
@@ -450,7 +461,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("bot.post_mp3_button", return_value=markup) as button, \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.pinterest.com/pin/42/", "auto", status)
-        self.assertEqual(self.messages, [["document", "document"]])
+        self.assertEqual(self.messages, [["photo", "photo"]])
         button.assert_called_once()
         self.assertEqual(button.call_args.args[2], [])
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
@@ -490,7 +501,7 @@ class AlbumTests(unittest.IsolatedAsyncioTestCase):
                 patch("bot.post_mp3_button", return_value=markup), \
                 patch("bot._global_sem", None), patch("bot._job_locks", {}):
             await bot.run_job(self.msg, context, 42, "https://www.instagram.com/p/test/", "auto", status)
-        self.assertEqual(self.messages, [["document", "document"]])
+        self.assertEqual(self.messages, [["photo", "video"]])
         self.msg.reply_text.assert_awaited_once_with("🎵 MP3", reply_markup=markup)
 
     async def test_album_button_follows_media_without_editing_grouped_messages(self):

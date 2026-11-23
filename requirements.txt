@@ -6,4 +6,5 @@ gallery-dl>=1.32.20
 Pillow>=12.2,<14
 deno>=2.9.0,<3
 parth-dl==1.2.1
-
+telethon==1.46.0
+cryptg==0.6.1; platform_system == "Linux" and platform_machine == "x86_64"
