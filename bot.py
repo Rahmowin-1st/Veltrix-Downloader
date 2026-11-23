@@ -478,6 +478,7 @@ def create_action(
     *,
     children: list[str] | None = None,
     refresh_audio: bool = False,
+    uploader: str = "",
 ) -> str:
     """Bind an inline action to the exact request and optionally cache its source."""
     stamp = time.time_ns()
@@ -517,6 +518,7 @@ def create_action(
             "created_at": now,
             "cache_path": cache_path,
             "title": safe_media_title(title) if title else "",
+            "uploader": safe_media_title(uploader)[:64] if uploader else "",
             "item_index": max(0, int(item_index)),
         }
         if children is not None:
@@ -1875,8 +1877,14 @@ def friendly_error(platform: str, exc: Exception) -> str:
     if isinstance(exc, WorkerFailure):
         return str(exc)
     if isinstance(exc, VidFetchQuotaExceeded):
-        return 'YouTube: the download quota is too low for this video. Try again when quota is available.'
+        return ('YouTube: the bot’s YouTube download allowance is used up for now. Instagram, Snapchat and '
+                'Pinterest links still work; YouTube will work again once the allowance is renewed.')
     if isinstance(exc, PublicMediaUnavailable):
+        if platform == 'snapchat':
+            return ('Snapchat: Snapchat does not show this Spotlight on its public website (it may be visible '
+                    'only in the app, restricted or removed), so it cannot be downloaded.')
+        if platform == 'pinterest':
+            return 'Pinterest: this Pin is not available on the public site (it may be private or removed).'
         label = PLATFORMS.get(platform, {}).get('label', 'Media')
         return f'{label}: this media is unavailable on the public site.'
     if isinstance(exc, MediaTooLong):
@@ -1987,13 +1995,13 @@ def download_cobalt(url: str, mode: str, tmpdir: str) -> list[Path]:
 
 
 def newisty_enabled() -> bool:
-    return (os.getenv('NEWISTY_YOUTUBE', '').strip() == '1'
-            and not os.getenv('YOUTUBE_COOKIE_FILE') and not os.getenv('YOUTUBE_COOKIES_B64'))
+    # Providers stay available as a backup when YouTube cookies exist: an
+    # expired session then still falls back for a public video instead of failing.
+    return os.getenv('NEWISTY_YOUTUBE', '').strip() == '1'
 
 
 def vidfetch_enabled() -> bool:
-    return (bool(os.getenv('VIDFETCH_API_KEY', '').strip())
-            and not os.getenv('YOUTUBE_COOKIE_FILE') and not os.getenv('YOUTUBE_COOKIES_B64'))
+    return bool(os.getenv('VIDFETCH_API_KEY', '').strip())
 
 
 def download_vidfetch(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
@@ -2480,8 +2488,12 @@ async def dispatch_job(msg, context, uid: int, url: str, mode: str, action=None)
             sources = [Path(r["cache_path"]) for r in rows if r.get("cache_path")]
             if not sources or len(sources) != len(rows) or not all(p.is_file() for p in sources):
                 sources = []
+        # The MP3 action remembers the post title and creator, so audio made
+        # from cached files is still named after the post.
+        known = {"title": str((action or {}).get("title") or "Media"),
+                 "uploader": str((action or {}).get("uploader") or "")}
         await run_job(msg, context, uid, url, mode, status,
-                      cached_sources=sources or None, known_meta={"title": "Media"},
+                      cached_sources=sources or None, known_meta=known,
                       refresh_audio=bool(action and action.get('refresh_audio')))
     manager.launch(row, execute)
 
@@ -2880,10 +2892,13 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
     return sent
 
 
-def post_mp3_button(uid: int, url: str, sources: list[Path], title: str, *, refresh_audio: bool = False) -> InlineKeyboardMarkup:
+def post_mp3_button(uid: int, url: str, sources: list[Path], title: str, *, refresh_audio: bool = False,
+                    uploader: str = "") -> InlineKeyboardMarkup:
     try:
-        children = [create_action(uid, url, path, title, index) for index, path in enumerate(sources)]
-        token = create_action(uid, url, title=title, children=children, refresh_audio=refresh_audio)
+        children = [create_action(uid, url, path, title, index, uploader=uploader)
+                    for index, path in enumerate(sources)]
+        token = create_action(uid, url, title=title, children=children, refresh_audio=refresh_audio,
+                              uploader=uploader)
     except OSError as exc:
         log.warning('MP3 cache unavailable: %s', type(exc).__name__)
         token = secrets.token_hex(10)
@@ -3149,6 +3164,17 @@ def progress_text(label: str, progress: dict, worker: dict, elapsed: float, samp
     return f"⏳ {progress.get('phase') or 'Working'}{clock}"
 
 
+def mp3_meta(meta: dict[str, Any], label: str) -> dict[str, Any]:
+    """Name an MP3 after its post; never leave Telegram's 'Unknown artist'."""
+    platform = label if label and label != 'Unsupported' else 'Veltrix'
+    result = dict(meta)
+    if not clean_title(result.get('title')):
+        result['title'] = f'{platform} audio'
+    if not str(result.get('uploader') or '').strip():
+        result['uploader'] = platform
+    return result
+
+
 def delivery_caption(url: str, meta: dict[str, Any], silent_videos: int = 0) -> str:
     lines = []
     title = clean_title(meta.get('title'))
@@ -3156,7 +3182,9 @@ def delivery_caption(url: str, meta: dict[str, Any], silent_videos: int = 0) -> 
         lines.append('🎬 ' + (title[:97] + '…' if len(title) > 100 else title))
     lines.append(f"⚡ Veltrix Downloader · {platform_label(url)}")
     if silent_videos:
-        lines.append(f"🔇 Audio unavailable in {silent_videos} source video(s).")
+        # Every rendition was checked: the platform itself serves no sound.
+        lines.append(f"🔇 {platform_label(url)} provides this video without sound." if silent_videos == 1
+                     else f"🔇 {platform_label(url)} provides {silent_videos} of these videos without sound.")
     return '\n'.join(lines)
 
 
@@ -3263,7 +3291,7 @@ async def run_job(
                         raise RuntimeError("Requested media item is no longer available")
                     files = [files[selected_audio_index]]
                 sources = await asyncio.to_thread(audio_sources, files, tmp / "soundtrack")
-                sent = await send_mp3_album(msg, sources, tmp, progress, meta=meta)
+                sent = await send_mp3_album(msg, sources, tmp, progress, meta=mp3_meta(meta, label))
                 if not sent:
                     raise RuntimeError("No accessible audio track")
                 delivered = True
@@ -3300,7 +3328,8 @@ async def run_job(
                 markup = None
                 try:
                     markup = await asyncio.to_thread(post_mp3_button, uid, url, sources,
-                                                     str(meta.get('title') or ''), refresh_audio=bool(silent_videos))
+                                                     str(meta.get('title') or ''), refresh_audio=bool(silent_videos),
+                                                     uploader=str(meta.get('uploader') or ''))
                 except OSError:
                     log.warning("Media delivered; MP3 action could not be saved")
                 ticker.cancel()
