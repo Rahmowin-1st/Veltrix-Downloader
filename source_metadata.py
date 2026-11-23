@@ -20,6 +20,10 @@ class PublicMediaUnavailable(RuntimeError):
     """The exact post's public page explicitly marked the media unavailable."""
 
 
+class MediaTooLong(RuntimeError):
+    """The media is longer than the bot's configured maximum duration."""
+
+
 def media_quality(fmt: dict) -> tuple[float, float, float]:
     def number(value):
         try:

@@ -195,7 +195,7 @@ class YoutubePublicTests(unittest.TestCase):
     def test_short_link_passes_manifest_to_downloader_and_playlists_are_skipped(self):
         manifest = {'id': ID}
         with tempfile.TemporaryDirectory() as folder, patch('youtube_public.request_manifest', return_value=manifest) as request, \
-             patch('bot.download_ytdlp', return_value=[]) as download:
+             patch('bot.DATA_DIR', Path(folder)), patch('bot.download_ytdlp', return_value=[]) as download:
             bot.download_youtube_public(f'https://youtu.be/{ID}?si=tracking', 'mp3_320', folder)
             self.assertEqual(request.call_args.args[0], ID)
             self.assertEqual(download.call_args.kwargs['manifest'], manifest)

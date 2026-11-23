@@ -186,7 +186,7 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
                     msg = SimpleNamespace(chat_id=1)
                     context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
 
-                    async def send(msg, sources, tmp, progress):
+                    async def send(msg, sources, tmp, progress, **kwargs):
                         expected = [first, second] if available == 2 else [cached]
                         self.assertEqual([p.read_bytes() for p in sources], [p.read_bytes() for p in expected])
                         return len(sources)

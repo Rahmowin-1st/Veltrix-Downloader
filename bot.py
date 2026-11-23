@@ -45,12 +45,12 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 from cobalt_provider import ProviderError
 from newisty_provider import ProviderRateLimit
-from source_metadata import IncompletePost, PublicMediaUnavailable, media_quality
+from source_metadata import IncompletePost, MediaTooLong, PublicMediaUnavailable, media_quality
 from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "9.17.2"
+VERSION = "10.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -60,12 +60,20 @@ TELEGRAM_API_BASE = os.getenv("TELEGRAM_API_BASE", "").rstrip("/")
 TELEGRAM_LOCAL = bool(TELEGRAM_API_BASE)
 API_UPLOAD_LIMIT = 2_000_000_000 if TELEGRAM_LOCAL else 49_000_000
 MAX_BYTES = min(int(os.getenv("TELEGRAM_MAX_BYTES", str(API_UPLOAD_LIMIT))), API_UPLOAD_LIMIT)
-JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "1800"))
+# Telegram accepts files up to 2000 MiB from a bot's MTProto session. Keep a
+# margin for the container header of each part.
+LARGE_FILE_BYTES = 2_000 * 1024 * 1024 - 16 * 1024 * 1024
+JOB_TIMEOUT = int(os.getenv("JOB_TIMEOUT_SECONDS", "3600"))
 MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(4 * 1024 * 1024 * 1024)))
-MAX_JOB_BYTES = int(os.getenv("MAX_JOB_BYTES", str(6 * 1024 * 1024 * 1024)))
+MAX_JOB_BYTES = int(os.getenv("MAX_JOB_BYTES", str(9 * 1024 * 1024 * 1024)))
 MAX_PHOTO_BYTES = int(os.getenv("MAX_PHOTO_BYTES", str(9 * 1024 * 1024)))
 MAX_GALLERY_ITEMS = max(1, min(int(os.getenv("MAX_GALLERY_ITEMS", "100")), 1000))
-MAX_CONCURRENT_JOBS = max(1, min(int(os.getenv("MAX_CONCURRENT_JOBS", "1")), 3))
+MAX_CONCURRENT_JOBS = max(1, min(int(os.getenv("MAX_CONCURRENT_JOBS", "2")), 4))
+# Videos up to three hours are supported; four leaves room for long uploads.
+MAX_MEDIA_SECONDS = max(60, int(os.getenv("MAX_MEDIA_SECONDS", str(4 * 3600))))
+# Playable delivery stays within Telegram's chat player: H.264 is preferred
+# and provider renditions above this height are requested only by /original.
+NATIVE_MAX_HEIGHT = max(144, int(os.getenv("NATIVE_MAX_HEIGHT", "1080")))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
 ACTIONS_FILE = DATA_DIR / "actions.json"
@@ -128,7 +136,136 @@ AUDIO_PRESETS = {
 }
 DEFAULT_QUALITY = "best"
 AUTO_MODE = "auto"
+ORIGINAL_MODE = "original"
 DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+# Conservative audio+video bitrates (kbit/s) when a source does not publish sizes.
+HEIGHT_KBPS = {4320: 45000, 2160: 20000, 1440: 10000, 1080: 5000, 720: 2700,
+               480: 1300, 360: 800, 240: 450, 144: 250}
+HEIGHT_LADDER = tuple(sorted(HEIGHT_KBPS, reverse=True))
+# Metadata of the current extraction, written to the worker result.
+JOB_META: dict[str, Any] = {}
+
+
+GENERIC_TITLES = {'media', 'spotlight', 'spotlight snap', 'snapchat story', 'snapchat', 'video',
+                  'instagram', 'pinterest', 'youtube'}
+
+
+def clean_title(value: Any) -> str:
+    """A short human title: first caption line without hashtags or mentions."""
+    text = str(value or '').strip().split('\n', 1)[0]
+    text = re.sub(r'(?:^|\s)[#@][\w.]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip(' -–—|·:,.')
+    if text.lower() in GENERIC_TITLES or text.startswith('Media by '):
+        return ''
+    return text[:120]
+
+
+def remember_meta(**fields: Any) -> None:
+    """Keep the first useful title/creator/duration reported by an extractor."""
+    for key, value in fields.items():
+        if key == 'title':
+            value = clean_title(value)
+        if value in (None, '', 0) or JOB_META.get(key):
+            continue
+        if key in {'title', 'uploader'}:
+            value = re.sub(r'\s+', ' ', str(value)).strip()[:200]
+        elif key == 'duration':
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0:
+                continue
+        JOB_META[key] = value
+
+
+def check_duration(seconds: Any) -> None:
+    try:
+        value = float(seconds or 0)
+    except (TypeError, ValueError):
+        return
+    if math.isfinite(value) and value > MAX_MEDIA_SECONDS:
+        raise MediaTooLong('Media duration exceeds the configured maximum')
+
+
+_progress_state = {'last': 0.0, 'phase': ''}
+
+
+def report_progress(phase: str, done: float = 0, total: float = 0, *, label: str = '', speed: float = 0) -> None:
+    """Share worker progress with the bot process through the job folder."""
+    root = os.getenv('VELTRIX_JOB_ROOT')
+    if not root:
+        return
+    now = time.monotonic()
+    if phase == _progress_state['phase'] and now - _progress_state['last'] < 0.8:
+        return
+    _progress_state.update(last=now, phase=phase)
+    path = Path(root) / 'progress.json'
+    try:
+        tmp = path.with_name('progress.tmp')
+        tmp.write_text(json.dumps({'phase': phase, 'done': int(max(0, done or 0)),
+                                   'total': int(max(0, total or 0)), 'label': label,
+                                   'speed': float(max(0, speed or 0)), 'at': time.time()}))
+        tmp.replace(path)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def ytdlp_progress(state: dict) -> None:
+    if not isinstance(state, dict) or state.get('status') != 'downloading':
+        return
+    info = state.get('info_dict') if isinstance(state.get('info_dict'), dict) else {}
+    label = 'audio' if info.get('vcodec') == 'none' else 'video' if info.get('vcodec') else ''
+    total = state.get('total_bytes') or state.get('total_bytes_estimate') or 0
+    report_progress('download', state.get('downloaded_bytes') or 0, total, label=label,
+                    speed=state.get('speed') or 0)
+
+
+def mtproto_configured() -> bool:
+    if TELEGRAM_LOCAL:
+        return False
+    from telegram_mtproto import configured
+    return configured()
+
+
+def delivery_limit() -> int:
+    """Largest single file the active Telegram route accepts."""
+    if not TELEGRAM_LOCAL:
+        from telegram_mtproto import available
+        if available():
+            return LARGE_FILE_BYTES
+    return MAX_BYTES
+
+
+def delivery_budget(mode: str, folder: str | Path | None = None) -> int:
+    """Bytes a source may use so delivery needs a reasonable number of parts."""
+    if mode == ORIGINAL_MODE:
+        limit = MAX_SOURCE_BYTES
+    else:
+        large = TELEGRAM_LOCAL or mtproto_configured()
+        per_file = LARGE_FILE_BYTES if large and not TELEGRAM_LOCAL else MAX_BYTES
+        parts = int(os.getenv('MAX_VIDEO_PARTS', '4' if large else '20'))
+        limit = per_file * max(1, parts)
+    try:
+        free = shutil.disk_usage(folder or os.getenv('VELTRIX_JOB_ROOT') or tempfile.gettempdir()).free
+    except OSError:
+        free = limit * 3
+    # Playable delivery may hold the source and its split parts at once.
+    return int(max(64 * 1024 * 1024, min(limit, MAX_SOURCE_BYTES, free * .42)))
+
+
+MIN_BUDGET_HEIGHT = 360
+
+
+def height_for_budget(duration: float, budget: int, ceiling: int = 4320) -> int:
+    """Highest ladder height whose estimated size fits ``budget`` (360p floor)."""
+    duration = float(duration or 0)
+    ladder = [height for height in HEIGHT_LADDER if MIN_BUDGET_HEIGHT <= height <= ceiling] or [HEIGHT_LADDER[-1]]
+    for height in ladder:
+        if HEIGHT_KBPS[height] * 125 * duration <= budget:
+            return height
+    # A lower resolution would no longer be worth watching: accept more parts.
+    return ladder[-1]
 
 
 def ensure_ffmpeg() -> None:
@@ -675,7 +812,7 @@ def base_ydl_opts(tmpdir: str) -> dict[str, Any]:
         "playlistend": MAX_GALLERY_ITEMS + 1,
         "max_filesize": MAX_SOURCE_BYTES,
         "http_headers": request_headers(),
-        "progress_hooks": [check_download_budget],
+        "progress_hooks": [check_download_budget, ytdlp_progress],
     }
     if PROXY:
         opts["proxy"] = PROXY
@@ -796,6 +933,8 @@ def download_instagram_dedicated(
     entries = info.get("entries") if isinstance(info.get("entries"), list) else []
     if not entries:
         return [], str(info.get("type") or "").lower()
+    remember_meta(title=info.get('title'), uploader=info.get('uploader'), duration=info.get('duration'))
+    check_duration(info.get('duration'))
 
     media = []
     for entry in entries:
@@ -1020,6 +1159,7 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
 
 def download_snapchat_dedicated(url: str, tmpdir: str, info: dict[str, Any] | None = None) -> list[Path]:
     info = info or extract_snapchat_public(url)
+    remember_meta(title=info.get('title'), uploader=info.get('uploader'))
     entries = info.get("entries") or ([{"url": info["url"], "kind": "video"}] if info.get("url") else [])
     media = [{**entry, 'formats': entry.get('formats') or [{'url': entry['url']}]} for entry in entries]
     return download_source_entries(media, Path(tmpdir) / 'snapchat', 'https://www.snapchat.com/')
@@ -1088,12 +1228,74 @@ def final_downloads(info: dict, folder: Path) -> list[Path]:
     return files
 
 
+def youtube_format_sort(mode: str, cap: int = 4320) -> list[str]:
+    """Telegram's player needs H.264; /original keeps the absolute best stream."""
+    if mode == ORIGINAL_MODE:
+        return [f'res:{cap}', 'fps', 'hdr:12']
+    return ['vcodec:h264', f'res:{cap}', 'fps', 'acodec:m4a']
+
+
+def youtube_height_cap(raw: dict, mode: str, budget: int) -> int:
+    """Pick the tallest rendition whose published size fits the delivery budget."""
+    duration = float(raw.get('duration') or 0)
+    formats = [f for f in raw.get('formats') or [] if isinstance(f, dict)]
+    native = mode != ORIGINAL_MODE
+
+    def size(fmt: dict) -> float:
+        for key in ('filesize', 'filesize_approx'):
+            try:
+                value = float(fmt.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        try:
+            rate = float(fmt.get('tbr') or 0)
+        except (TypeError, ValueError):
+            rate = 0
+        return rate * 125 * duration if rate > 0 and duration > 0 else 0.0
+
+    def tier(fmt: dict) -> int:
+        # yt-dlp's "res" is the smaller side, so vertical Shorts rank correctly.
+        width, height = int(fmt.get('width') or 0), int(fmt.get('height') or 0)
+        return min(width, height) if width and height else height
+
+    audio = [f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') not in (None, 'none')]
+    video = [f for f in formats if f.get('vcodec') not in (None, 'none') and tier(f) > 0]
+    if native:
+        audio = [f for f in audio if str(f.get('acodec') or '').startswith('mp4a')] or audio
+        video = [f for f in video if str(f.get('vcodec') or '').startswith(('avc1', 'h264'))] or video
+    if not video:
+        return height_for_budget(duration, budget)
+    audio_size = max((size(f) for f in audio), default=0.0)
+    watchable = [f for f in video if tier(f) >= MIN_BUDGET_HEIGHT]
+    for height in HEIGHT_LADDER:
+        if height < MIN_BUDGET_HEIGHT and watchable:
+            break
+        options = [f for f in video if tier(f) <= height]
+        if not options:
+            continue
+        best = max(options, key=lambda f: (tier(f), size(f)))
+        muxed = best.get('acodec') not in (None, 'none')
+        total = size(best) + (0 if muxed else audio_size)
+        if not total and duration > 0:
+            rate = HEIGHT_KBPS[min((h for h in HEIGHT_LADDER if h >= tier(best)), default=4320)]
+            total = rate * 125 * duration
+        if total <= budget:
+            return tier(best)
+    # Nothing fits: the smallest watchable rendition keeps the parts fewest.
+    return min(tier(f) for f in (watchable or video))
+
+
 def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = None) -> list[Path]:
     base = base_ydl_opts(tmpdir)
     base['noplaylist'] = not youtube_playlist_url(url)
     platform = platform_of(url)
     if platform == 'youtube' and mode not in AUDIO_PRESETS:
-        base.update(format_sort=['res', 'fps', 'hdr:12'], format_sort_force=True)
+        base.update(format_sort=youtube_format_sort(mode), format_sort_force=True)
+        if mode != ORIGINAL_MODE:
+            # H.264 and AAC merge straight into a playable MP4.
+            base['merge_output_format'] = 'mp4/mkv'
     cookie_file = os.getenv(f"{(platform or '').upper()}_COOKIE_FILE", "")
     if cookie_file and Path(cookie_file).is_file():
         base["cookiefile"] = cookie_file
@@ -1102,7 +1304,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
         # yt-dlp ranks all exposed formats; no hidden resolution ceiling.
         # A music-only link may expose no video format at all.
         attempts = [("bv*+ba/b/ba", {})]
-        if platform == 'youtube' and base['noplaylist']:
+        # A public player manifest has adaptive streams only; "b" cannot help it.
+        if platform == 'youtube' and base['noplaylist'] and manifest is None:
             attempts.append(("b", {}))
     elif mode in VIDEO_PRESETS:
         attempts = [(fmt, {}) for fmt in video_chain(int(VIDEO_PRESETS[mode]["height"]))]
@@ -1132,13 +1335,25 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
                 opts["outtmpl"] = str(attempt_dir / "%(playlist_index)05d_%(extractor)s_%(id)s_%(title).80B.%(ext)s")
                 opts.update(extra)
                 with YoutubeDL(opts) as ydl:
-                    if manifest is None:
+                    if manifest is None and platform == 'youtube' and base['noplaylist']:
+                        # Read the player once, check duration and sizes, then
+                        # download the rendition that Telegram can deliver.
+                        raw = ydl.extract_info(candidate, download=False, process=False)
+                        if not raw:
+                            raise RuntimeError("Extractor returned no media metadata")
+                        prepare_youtube_selection(ydl, raw, mode, tmpdir)
+                        info = ydl.process_ie_result(raw, download=True)
+                    elif manifest is None:
                         info = ydl.extract_info(candidate, download=True)
                     else:
                         import copy
-                        info = ydl.process_ie_result(copy.deepcopy(manifest), download=True)
+                        prepared = copy.deepcopy(manifest)
+                        prepare_youtube_selection(ydl, prepared, mode, tmpdir)
+                        info = ydl.process_ie_result(prepared, download=True)
                 if not info:
                     raise RuntimeError("Extractor returned no media metadata")
+                remember_meta(title=info.get('title'), uploader=info.get('uploader') or info.get('channel'),
+                              duration=info.get('duration'))
                 entries = list(info.get("entries") or []) if info.get("_type") in {"playlist", "multi_video"} else [info]
                 complete = final_downloads(info, attempt_dir)
                 if platform == 'youtube' or is_video_post_url(url):
@@ -1171,6 +1386,21 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
     return []
 
 
+def prepare_youtube_selection(ydl, raw: dict, mode: str, tmpdir: str) -> None:
+    """Reject live/overlong media and cap the rendition to the delivery budget."""
+    if raw.get('is_live') or raw.get('live_status') in {'is_live', 'is_upcoming', 'post_live'}:
+        raise RuntimeError('YouTube live stream has not ended')
+    check_duration(raw.get('duration'))
+    remember_meta(title=raw.get('title'), uploader=raw.get('uploader') or raw.get('channel'),
+                  duration=raw.get('duration'))
+    if mode in AUDIO_PRESETS:
+        return
+    cap = youtube_height_cap(raw, mode, delivery_budget(mode, tmpdir))
+    ydl.params['format_sort'] = youtube_format_sort(mode, cap)
+    ydl.params['format_sort_force'] = True
+    log.info('YouTube rendition cap: %sp for %s mode', cap, 'original' if mode == ORIGINAL_MODE else 'playable')
+
+
 def download_youtube_public(url: str, mode: str, tmpdir: str) -> list[Path]:
     """Try a fresh anonymous visitor context after the normal extractor fails."""
     from youtube_public import request_manifest
@@ -1199,7 +1429,20 @@ def download_youtube_public(url: str, mode: str, tmpdir: str) -> list[Path]:
         # An unavailable fallback must not replace the original platform error
         # or make a definitive bot check offer a futile immediate Retry button.
         raise ProviderError('Public YouTube player connection failed') from exc
-    return download_ytdlp(canonical, mode, tmpdir, manifest=info)
+    try:
+        return download_ytdlp(canonical, mode, tmpdir, manifest=info)
+    except Exception as exc:
+        if fatal_download_error(exc) or isinstance(exc, ProviderError):
+            raise
+        if re.search(r'HTTP Error 403|Forbidden', str(exc), re.I):
+            try:
+                cooldown.parent.mkdir(parents=True, exist_ok=True)
+                cooldown.write_text(str(time.time() + 300))
+            except OSError:
+                pass
+        # The media servers refused this anonymous context. Report the
+        # platform's own error (usually its bot check) rather than this one.
+        raise ProviderError('Public YouTube player media unavailable') from exc
 
 
 def download_youtube_post(url: str, mode: str, tmpdir: str, post_id: str) -> list[Path]:
@@ -1227,13 +1470,18 @@ def _pinterest_target_height(formats: list[dict[str, Any]]) -> int:
     return max((int(f.get("height") or 0) for f in formats), default=0)
 
 
+def transfer_progress(done: int, total: int) -> None:
+    report_progress('download', done, total)
+
+
 def _download_direct_file(media_url: str, out: Path, *, referer: str, timeout: int = 45) -> bool:
     from transfer import download
     try:
         return download(media_url, out,
                         headers={"User-Agent": DESKTOP_UA, "Referer": referer, "Accept": "*/*"},
                         safe_url=safe_remote_url, budget=check_download_budget,
-                        max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None, timeout=timeout)
+                        max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None, timeout=timeout,
+                        progress=transfer_progress)
     except RuntimeError as exc:
         if fatal_download_error(exc):
             raise
@@ -1338,7 +1586,7 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
             if not any(_download_direct_file(candidate, out, referer=url) for candidate in candidates):
                 raise RuntimeError(f"Incomplete carousel: downloaded {len(outputs)}/{len(entries)} items")
             outputs.append(out)
-    return validate_media_files(outputs)
+    return [canonical_media_name(path) for path in validate_media_files(outputs)]
 
 
 def download_source_entries(entries: list[dict], dest: Path, referer: str) -> list[Path]:
@@ -1388,6 +1636,7 @@ def download_source_entries(entries: list[dict], dest: Path, referer: str) -> li
                     if not _download_direct_file(url, path, referer=referer):
                         continue
                 validate_media_files([path])
+                path = canonical_media_name(path)
                 actual = classify(path)
                 if actual != entry["kind"] and not (entry["kind"] == "image" and actual == "animation"):
                     continue
@@ -1469,6 +1718,8 @@ def download_pinterest_resource(url: str, tmpdir: str) -> list[Path]:
         raise RuntimeError('Pinterest resource returned metadata for a different Pin')
     if pin.get('is_viewer_restricted'):
         raise RuntimeError('Pinterest Pin requires sign in')
+    remember_meta(title=pin.get('title') or pin.get('grid_title'),
+                  uploader=_dig_dict(pin, 'pinner').get('full_name') or _dig_dict(pin, 'pinner').get('username'))
     return download_source_entries(pinterest_entries(pin), Path(tmpdir) / 'pinterest_resource', source)
 
 
@@ -1496,6 +1747,7 @@ def download_pinterest_page(url: str, tmpdir: str) -> list[Path]:
             matches.append(pin)
     pin = find_pinterest_pin(matches, match[1]) or pinterest_relay_pin(page.text, match[1])
     if pin:
+        remember_meta(title=pin.get('title') or pin.get('grid_title') or pin.get('gridTitle'))
         return download_source_entries(pinterest_entries(pin), Path(tmpdir) / 'pinterest_page', resolved)
     return []
 
@@ -1607,7 +1859,11 @@ class WorkerFailure(RuntimeError):
 
 
 def fatal_download_error(exc: Exception) -> bool:
+    if isinstance(exc, MediaTooLong):
+        return True
     low = str(exc).lower()
+    if 'live stream has not ended' in low:
+        return True
     if re.search(r"\bage(?:\b|_)", low) and any(word in low for word in ("restricted", "limit", "confirm", "verify")):
         return True
     return any(word in low for word in ("incomplete", "truncated", "storage", "deadline",
@@ -1623,6 +1879,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     if isinstance(exc, PublicMediaUnavailable):
         label = PLATFORMS.get(platform, {}).get('label', 'Media')
         return f'{label}: this media is unavailable on the public site.'
+    if isinstance(exc, MediaTooLong):
+        return f'This media is longer than {MAX_MEDIA_SECONDS // 3600} hours, the bot’s maximum length.'
     if isinstance(exc, BadRequest):
         return "Telegram rejected this media. The rejected album was not delivered; try again."
     if connection_failed_before_send(exc):
@@ -1634,6 +1892,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     label = PLATFORMS.get(platform, {}).get("label", "Media")
     if 'no accessible media attachment' in low:
         return f'{label}: this post has no accessible media attachment.'
+    if 'live stream has not ended' in low:
+        return f'{label}: this live stream has not finished yet. Send the link again after it ends.'
     if 'original file exceeds the telegram upload limit' in low:
         return 'This original file exceeds Telegram’s upload limit. Send the link on its own to try playable parts.'
     if "429" in low or "too many requests" in low or "rate-limit" in low or "rate limit" in low:
@@ -1751,9 +2011,29 @@ def download_vidfetch(url: str, mode: str, tmpdir: str, errors: list) -> list[Pa
     if mode in AUDIO_PRESETS:
         quality = '360p' if mode == 'm4a' else 'mp3'
     else:
-        quality = f'{mode}p' if mode.isdigit() else '2160p'
+        # VidFetch prefers H.264 MP4. Its taller tiers are VP9/AV1, which
+        # Telegram's player may not show inline, so they are kept for /original.
+        ceiling = int(mode) if mode.isdigit() else 2160 if mode == ORIGINAL_MODE else NATIVE_MAX_HEIGHT
+        quality = next((tier for tier in ('2160p', '1440p', '1080p', '720p', '480p', '360p', '240p', '144p')
+                        if int(tier[:-1]) <= ceiling), '144p')
+
+    def on_info(info: dict) -> None:
+        check_duration(info.get('duration'))
+        remember_meta(title=info.get('title'), uploader=info.get('uploader') or info.get('channel'),
+                      duration=info.get('duration'))
+        report_progress('provider')
+
+    def on_status(state: str, value: Any) -> None:
+        try:
+            done = float(value or 0)
+        except (TypeError, ValueError):
+            done = 0
+        report_progress('provider', done if 0 < done <= 100 else 0, 100 if 0 < done <= 100 else 0, label=state)
+
     return fetch(match[1], quality, Path(tmpdir) / 'vidfetch', api_key=os.getenv('VIDFETCH_API_KEY', '').strip(),
-                 safe_url=safe_remote_url, budget=check_download_budget, max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None)
+                 safe_url=safe_remote_url, budget=check_download_budget, max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None,
+                 budget_bytes=None if mode in AUDIO_PRESETS else delivery_budget(mode, tmpdir),
+                 on_info=on_info, progress=transfer_progress, status=on_status)
 
 
 def download_newisty(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
@@ -1770,8 +2050,17 @@ def download_newisty(url: str, mode: str, tmpdir: str, errors: list) -> list[Pat
     quality = 'audio-mp3' if mode.startswith('mp3_') else qualities.get(mode)
     if not quality:
         return []
+
+    def on_info(info: dict) -> None:
+        check_duration(info.get('duration'))
+        remember_meta(title=info.get('title'), uploader=info.get('uploader') or info.get('channel'),
+                      duration=info.get('duration'))
+        report_progress('provider')
+
     return fetch(video_id, quality, Path(tmpdir) / 'newisty', safe_url=safe_remote_url,
-                 budget=check_download_budget, max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None)
+                 budget=check_download_budget, max_bytes=MAX_SOURCE_BYTES, proxy=PROXY or None,
+                 budget_bytes=None if mode in AUDIO_PRESETS else delivery_budget(mode, tmpdir),
+                 on_info=on_info, progress=transfer_progress)
 
 
 def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = None) -> list[Path]:
@@ -1783,6 +2072,9 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
     Path(tmpdir).mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(tmpdir).free < 128 * 1024 * 1024:
         raise RuntimeError("Not enough free storage for a download")
+    if not youtube_post_id(url):
+        JOB_META.clear()
+    report_progress('extract')
     # Source-aware parsers only: page-wide URL scans can leak recommendations/posters.
     errors = []
     youtube_post = youtube_post_id(url) if platform == 'youtube' else ''
@@ -2036,46 +2328,62 @@ def fit_image(path: Path, dest: Path) -> Path:
     raise RuntimeError("Image could not fit Telegram photo limits")
 
 
+def large_delivery_note() -> str:
+    if TELEGRAM_LOCAL or mtproto_configured():
+        return "Large videos arrive as files of up to 2 GB."
+    return "Telegram limits bots to 50 MB per file here, so long videos arrive in playable parts."
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "⚡ Veltrix Downloader\n\n"
         "YouTube • Instagram • Snapchat • Pinterest\n"
-        "Send a media link — I download it automatically."
-        + ("\nFor public YouTube videos, Newisty can process the video link if needed." if newisty_enabled() else "")
-        + ("\nFor public YouTube videos, VidFetch can process the video link if needed." if vidfetch_enabled() else "")
+        "Send a link — photos arrive as photos and videos as playable videos with sound, "
+        f"in the best quality available. Videos up to {MAX_MEDIA_SECONDS // 3600} hours are supported.\n\n"
+        "🎵 Tap MP3 under any delivery, or send /mp3 with a link.\n"
+        "📎 /original <link> sends the untouched source files.\n"
+        "📊 /status shows your recent requests."
     )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "📥 Send a YouTube, Instagram, Snapchat or Pinterest media link.\n"
-        "📎 Source files are delivered at their highest available quality. Large files arrive as numbered parts.\n"
-        "🎵 Tap MP3 after delivery to get audio.\n"
-        "▶️ Use /playable followed by the link for a version that plays directly in Telegram."
+        "📥 Send a public YouTube, Instagram, Snapchat or Pinterest link. Carousels keep their order.\n"
+        "🎬 Videos play directly in Telegram with their audio; photos arrive as photos.\n"
+        f"⏱ Videos up to {MAX_MEDIA_SECONDS // 3600} hours. {large_delivery_note()}\n"
+        "🎵 MP3: tap the MP3 button after a delivery, or send /mp3 <link>.\n"
+        "📎 /original <link>: exact source files (highest stream, e.g. 4K) as documents.\n"
+        "📊 /status: your recent requests."
         + ("\nIf YouTube blocks the server, the bot can send the video ID to Newisty’s public download API."
            if newisty_enabled() else "")
-        + ("\nThe VidFetch fallback can process public YouTube videos up to 4K; it may convert the source format."
+        + ("\nPublic YouTube videos can be processed by the VidFetch service when the server is blocked."
            if vidfetch_enabled() else "")
     )
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("⚙️ Quality is automatic. No setup needed.")
+    await update.effective_message.reply_text("⚙️ Quality is automatic: the best version Telegram can play. "
+                                              "Use /original <link> for untouched source files.")
 
 
 async def cmd_original(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await media_command(update, context, 'original')
+    await media_command(update, context, ORIGINAL_MODE)
 
 
 async def cmd_playable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await media_command(update, context, 'playable')
+    await media_command(update, context, AUTO_MODE)
+
+
+async def cmd_mp3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await media_command(update, context, 'mp3_320')
 
 
 async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str) -> None:
     msg = update.effective_message
     url = extract_url(' '.join(context.args or []))
     if not url or not platform_of(url):
-        await msg.reply_text(f'Use /{mode} followed by a YouTube, Instagram, Snapchat or Pinterest link.')
+        command = {'mp3_320': 'mp3', AUTO_MODE: 'playable'}.get(mode, mode)
+        await msg.reply_text(f'Use /{command} followed by a YouTube, Instagram, Snapchat or Pinterest link.')
         return
     await dispatch_job(msg, context, update.effective_user.id, url, mode)
 
@@ -2312,6 +2620,11 @@ class PreparedMedia:
     original: Path | None = None
     byte_range: tuple[int, int] | None = None
     filename: str | None = None
+    # (number, total) when one source video is delivered as several parts.
+    part: tuple[int, int] | None = None
+    meta: dict[str, Any] | None = None
+    # Bot API file_id after a large MTProto upload.
+    remote: str | None = None
 
 
 def media_format_rejected(exc: BadRequest) -> bool:
@@ -2323,54 +2636,164 @@ def media_format_rejected(exc: BadRequest) -> bool:
                                    'audio_content_type_invalid', 'media_invalid'))
 
 
+def audio_tags(path: Path) -> dict[str, Any]:
+    """Title, performer and duration for Telegram's audio player."""
+    from media_io import duration_of, probe
+    try:
+        info = probe(path)
+    except (RuntimeError, OSError):
+        return {}
+    tags = {str(k).lower(): str(v) for k, v in (info.get('format', {}).get('tags') or {}).items()}
+    meta = {'duration': duration_of(info)}
+    if tags.get('title'):
+        meta['title'] = tags['title'][:64]
+    if tags.get('artist'):
+        meta['performer'] = tags['artist'][:64]
+    return meta
+
+
+def visual_meta(path: Path) -> dict[str, Any]:
+    from media_io import video_info
+    try:
+        return video_info(path)
+    except (RuntimeError, OSError, ValueError):
+        return {}
+
+
+async def prepare_delivery(path: Path, index: int, total_files: int, folder: Path,
+                           limit: int, *, originals: bool) -> list[PreparedMedia]:
+    """Turn one source file into Telegram-ready items without changing its order."""
+    from media_io import lossless_parts, native_audio, native_video, video_thumbnail
+    if originals:
+        size = path.stat().st_size
+        if size <= limit:
+            return [PreparedMedia('document', path)]
+        return [PreparedMedia('document', path, byte_range=(start, min(limit, size - start)),
+                              filename=f'{index + 1:03d}_{path.name}.part{part:03d}')
+                for part, start in enumerate(range(0, size, limit), 1)]
+    kind = await asyncio.to_thread(classify, path)
+    original = path if path.stat().st_size <= MAX_BYTES else None
+    if kind == "image":
+        try:
+            final = await asyncio.to_thread(fit_image, path, folder)
+            return [PreparedMedia('image', final, original)]
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            if original is None:
+                raise
+            return [PreparedMedia('document', original)]
+    if kind not in {"video", "animation", "audio"}:
+        raise RuntimeError("Unsupported media type; no photo substitution performed")
+    final = None
+    try:
+        if kind == "audio":
+            final = await asyncio.to_thread(native_audio, path, folder)
+        else:
+            final = await asyncio.to_thread(native_video, path, folder, upload_limit=limit)
+        parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", limit)
+    except (RuntimeError, OSError, ImportError, subprocess.SubprocessError):
+        if final == path and original is None:
+            # Splitting this exact source already failed above.
+            raise
+        parts = await asyncio.to_thread(lossless_parts, path, folder / "source_parts", limit)
+        return [PreparedMedia('document', part, part=(number, len(parts)) if len(parts) > 1 else None)
+                for number, part in enumerate(parts, 1)]
+    if len(parts) > 1 and final != path and all(p != final for p in parts):
+        # The parts hold every frame; drop the intermediate copy to save disk.
+        final.unlink(missing_ok=True)
+    delivery_kind = "video" if kind == "animation" and (total_files > 1 or len(parts) > 1) else kind
+    thumb = None
+    if delivery_kind == 'video' and kind == 'video':
+        thumb = await asyncio.to_thread(video_thumbnail, parts[0], folder / 'thumb')
+    items = []
+    for number, part in enumerate(parts, 1):
+        if delivery_kind in {'video', 'animation'}:
+            meta = await asyncio.to_thread(visual_meta, part)
+        else:
+            meta = await asyncio.to_thread(audio_tags, part)
+            if len(parts) > 1 and meta.get('title'):
+                # Telegram's player lists parts by title; keep them apart.
+                meta['title'] = f"{meta['title'][:52]} ({number}/{len(parts)})"
+        if thumb is not None:
+            meta['thumb'] = thumb
+        items.append(PreparedMedia(delivery_kind, part, original if len(parts) == 1 else None,
+                                   part=(number, len(parts)) if len(parts) > 1 else None, meta=meta))
+    return items
+
+
+class LargeUploadFailed(RuntimeError):
+    """MTProto could not take a large file; the Bot API route is used instead."""
+
+
+async def upload_large_items(items: list[PreparedMedia], progress: dict | None) -> list[PreparedMedia]:
+    """Upload files above the Bot API limit through the bot's MTProto session."""
+    import telegram_mtproto
+    result = []
+    for item in items:
+        size = item.byte_range[1] if item.byte_range else item.path.stat().st_size
+        if item.remote or size <= MAX_BYTES:
+            result.append(item)
+            continue
+        if progress is not None:
+            progress.update(up_done=0, up_total=size, up_started=time.monotonic(),
+                            phase='Uploading large file' + (f' · part {item.part[0]}/{item.part[1]}' if item.part else ''))
+
+        def counted(done: int, total: int) -> None:
+            if progress is not None:
+                progress['up_done'] = done
+
+        meta = item.meta or {}
+        try:
+            remote = await telegram_mtproto.upload(
+                item.path, kind=item.kind, bot_token=BOT_TOKEN, filename=item.filename or item.path.name,
+                byte_range=item.byte_range,
+                duration=meta.get('duration') or 0, width=meta.get('width') or 0, height=meta.get('height') or 0,
+                title=meta.get('title'), performer=meta.get('performer'), thumb=meta.get('thumb'),
+                on_progress=counted)
+        except Exception as exc:
+            telegram_mtproto.mark_failed(exc)
+            raise LargeUploadFailed('Large upload unavailable') from exc
+        result.append(PreparedMedia(item.kind, item.path, item.original, item.byte_range, item.filename,
+                                    item.part, item.meta, remote))
+    return result
+
+
+def _input_file(item: PreparedMedia, stack: ExitStack, progress: dict | None, attach: bool):
+    from media_io import CountingReader, FileSlice
+    if item.remote:
+        return item.remote
+    file = stack.enter_context(item.path.open("rb"))
+    if item.byte_range:
+        file = FileSlice(file, *item.byte_range)
+    if progress is not None:
+        def counted(amount: int) -> None:
+            progress['up_done'] = progress.get('up_done', 0) + amount
+        file = CountingReader(file, counted, item.filename or item.path.name)
+    return InputFile(file, filename=item.filename or item.path.name, attach=attach, read_file_handle=False)
+
+
 async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: dict | None = None,
                      *, originals: bool = False) -> int:
     """Preserve order; group compatible native types in batches of at most ten."""
-    from media_io import FileSlice, lossless_parts, native_audio, native_video
+    large = (not TELEGRAM_LOCAL) and delivery_limit() > MAX_BYTES
+    limit = delivery_limit()
     prepared: list[PreparedMedia] = []
     for index, path in enumerate(files):
         if progress is not None:
             progress["phase"] = f"Preparing media {index + 1}/{len(files)}"
+            progress['up_total'] = 0
         folder = tmp / "delivery" / str(index)
-        if originals:
-            size = path.stat().st_size
-            if size <= MAX_BYTES:
-                prepared.append(PreparedMedia('document', path))
-            else:
-                for part, start in enumerate(range(0, size, MAX_BYTES), 1):
-                    prepared.append(PreparedMedia('document', path, byte_range=(start, min(MAX_BYTES, size - start)),
-                                                  filename=f'{index + 1:03d}_{path.name}.part{part:03d}'))
-            continue
-        kind = await asyncio.to_thread(classify, path)
-        original = path if path.stat().st_size <= MAX_BYTES else None
-        if kind == "image":
+        items = await prepare_delivery(path, index, len(files), folder, limit, originals=originals)
+        if large and any((item.byte_range[1] if item.byte_range else item.path.stat().st_size) > MAX_BYTES
+                         for item in items):
             try:
-                final = await asyncio.to_thread(fit_image, path, folder)
-                prepared.append(PreparedMedia('image', final, original))
-            except (RuntimeError, OSError, subprocess.SubprocessError):
-                if original is None:
-                    raise
-                prepared.append(PreparedMedia('document', original))
-        elif kind in {"video", "animation", "audio"}:
-            final = None
-            try:
-                if kind == "audio":
-                    final = await asyncio.to_thread(native_audio, path, folder)
-                else:
-                    final = await asyncio.to_thread(native_video, path, folder, upload_limit=MAX_BYTES)
-                parts = await asyncio.to_thread(lossless_parts, final, folder / "parts", MAX_BYTES)
-            except (RuntimeError, OSError, ImportError, subprocess.SubprocessError):
-                if final == path and original is None:
-                    # Splitting this exact source already failed above.
-                    raise
-                parts = await asyncio.to_thread(lossless_parts, path, folder / "source_parts", MAX_BYTES)
-                prepared.extend(PreparedMedia('document', part) for part in parts)
-                continue
-            delivery_kind = "video" if kind == "animation" and (len(files) > 1 or len(parts) > 1) else kind
-            prepared.extend(PreparedMedia(delivery_kind, part, original if len(parts) == 1 else None)
-                            for part in parts)
-        else:
-            raise RuntimeError("Unsupported media type; no photo substitution performed")
+                items = await upload_large_items(items, progress)
+            except LargeUploadFailed:
+                # Nothing was sent yet. Split this source for the Bot API limit.
+                log.warning('Large upload unavailable; using %s-byte parts', MAX_BYTES)
+                large, limit = False, MAX_BYTES
+                shutil.rmtree(folder, ignore_errors=True)
+                items = await prepare_delivery(path, index, len(files), folder, limit, originals=originals)
+        prepared.extend(items)
     sent = 0
     if any(item.byte_range for item in prepared):
         caption = (caption + "\nJoin matching .part files in numbered order to recover the original.").strip()
@@ -2379,36 +2802,58 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         family = families[prepared[sent].kind]
         batch = []
         for item in prepared[sent:sent + 10]:
-            if families[item.kind] != family:
+            if families[item.kind] != family or (batch and item.part):
                 break
             batch.append(item)
+            if item.part:
+                # Parts of one long video arrive one by one, each playable.
+                break
         label = caption if not sent else ""
+        if len(batch) == 1 and batch[0].part:
+            number, total = batch[0].part
+            label = f"{label}\n🎞 Part {number}/{total}".strip()
         if progress is not None:
-            progress["phase"] = f"Sending {sent + 1}-{sent + len(batch)}/{len(prepared)}"
+            progress["phase"] = (f"Sending part {batch[0].part[0]}/{batch[0].part[1]}" if batch[0].part
+                                 else f"Sending {sent + 1}-{sent + len(batch)}/{len(prepared)}")
+            progress['up_done'] = 0
+            progress['up_total'] = sum(0 if item.remote else (item.byte_range[1] if item.byte_range
+                                                               else item.path.stat().st_size) for item in batch)
+            progress['up_started'] = time.monotonic()
+
         async def send_once():
+            if progress is not None:
+                progress['up_done'] = 0
             with ExitStack() as stack:
                 media = []
                 for offset, item in enumerate(batch):
-                    kind, path = item.kind, item.path
-                    file = stack.enter_context(path.open("rb"))
-                    if item.byte_range:
-                        file = FileSlice(file, *item.byte_range)
-                    upload = InputFile(file, filename=item.filename or path.name,
-                                       attach=len(batch) > 1, read_file_handle=False)
+                    kind = item.kind
+                    upload = _input_file(item, stack, progress, len(batch) > 1)
                     item_caption = label if offset == 0 else None
+                    meta = item.meta or {}
+                    video_fields = {key: int(round(meta[key])) for key in ('duration', 'width', 'height')
+                                    if kind in {'video', 'animation'} and meta.get(key)}
+                    audio_fields = {key: meta[key] for key in ('title', 'performer') if kind == 'audio' and meta.get(key)}
+                    if kind == 'audio' and meta.get('duration'):
+                        audio_fields['duration'] = int(round(meta['duration']))
                     if len(batch) == 1:
                         if kind == "image":
                             return await msg.reply_photo(photo=upload, caption=item_caption)
                         if kind == "video":
-                            return await msg.reply_video(video=upload, caption=item_caption, supports_streaming=True)
+                            thumb = meta.get('thumb')
+                            extra = {}
+                            if thumb is not None and not item.remote and thumb.is_file():
+                                extra['thumbnail'] = InputFile(stack.enter_context(thumb.open('rb')),
+                                                               filename='thumb.jpg', read_file_handle=False)
+                            return await msg.reply_video(video=upload, caption=item_caption, supports_streaming=True,
+                                                         **video_fields, **extra)
                         if kind == "animation":
-                            return await msg.reply_animation(animation=upload, caption=item_caption)
+                            return await msg.reply_animation(animation=upload, caption=item_caption, **video_fields)
                         if kind == 'document':
                             return await msg.reply_document(document=upload, caption=item_caption, disable_content_type_detection=True)
-                        return await msg.reply_audio(audio=upload, caption=item_caption)
+                        return await msg.reply_audio(audio=upload, caption=item_caption, **audio_fields)
                     cls = {'image': InputMediaPhoto, 'video': InputMediaVideo, 'audio': InputMediaAudio,
                            'document': InputMediaDocument}[kind]
-                    kwargs = {"supports_streaming": True} if kind == "video" else {}
+                    kwargs = {"supports_streaming": True, **video_fields} if kind == "video" else audio_fields if kind == 'audio' else {}
                     media.append(cls(media=upload, caption=item_caption, **kwargs))
                 return await msg.reply_media_group(media=media)
         if progress is not None:
@@ -2417,12 +2862,12 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         try:
             result = await _retry_telegram(send_once)
         except BadRequest as exc:
-            if family == 'document' or not media_format_rejected(exc):
+            if family == 'document' or not media_format_rejected(exc) or any(item.remote for item in batch):
                 raise
             # Telegram rejected this request for its media format before
             # accepting the batch. Use the source bytes wherever they fit.
             log.info("Telegram rejected native media format; sending %s documents", len(batch))
-            batch = [PreparedMedia('document', item.original or item.path) for item in batch]
+            batch = [PreparedMedia('document', item.original or item.path, part=item.part) for item in batch]
             result = await _retry_telegram(send_once)
         if progress is not None:
             progress["last_message"] = result[-1] if isinstance(result, (list, tuple)) and result else result
@@ -2558,22 +3003,50 @@ async def send_document(msg, path: Path, caption: str, reply_markup=None) -> int
     return 1
 
 
-async def send_mp3_album(msg, sources: list[Path], tmp: Path, progress: dict | None = None) -> int:
+def file_title(value: str, fallback: str) -> str:
+    """A readable, filesystem-safe name for a delivered file."""
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', ' ', value or '')
+    value = re.sub(r'\s+', ' ', value).strip(' .')[:80]
+    return value or fallback
+
+
+async def send_mp3_album(msg, sources: list[Path], tmp: Path, progress: dict | None = None,
+                         *, meta: dict[str, Any] | None = None) -> int:
+    from media_io import duration_of, mp3_bitrate, probe
+    meta = meta or {}
+    limit = delivery_limit()
+    audible = [source for source in sources if await asyncio.to_thread(has_audio, source)]
     outputs = []
-    for index, source in enumerate(sources):
+    title = clean_title(meta.get('title'))
+    performer = re.sub(r'\s+', ' ', str(meta.get('uploader') or '')).strip()
+    for index, source in enumerate(audible):
         if progress is not None:
-            progress["phase"] = f"Extracting audio {index + 1}/{len(sources)}"
-        if not await asyncio.to_thread(has_audio, source):
-            continue
+            progress["phase"] = f"Converting to MP3 {index + 1}/{len(audible)}"
         folder = tmp / "mp3" / str(index)
         folder.mkdir(parents=True, exist_ok=True)
-        output = folder / f"audio_{index + 1:02d}.mp3"
-        from media_io import probe
         info = await asyncio.to_thread(probe, source)
         track = next(s for s in info["streams"] if s.get("codec_type") == "audio")
-        codec_options = ["-c:a", "copy"] if track.get("codec_name") == "mp3" else ["-c:a", "libmp3lame", "-b:a", "320k"]
+        duration = duration_of(info)
+        name = title + (f' ({index + 1})' if title and len(audible) > 1 else '')
+        output = folder / f"{file_title(name, f'audio_{index + 1:02d}')}.mp3"
+        tags = ['-map_metadata', '-1', '-id3v2_version', '3']
+        if name:
+            tags += ['-metadata', f'title={name[:120]}']
+        if performer:
+            tags += ['-metadata', f'artist={performer[:120]}']
+        if track.get("codec_name") == "mp3":
+            # An MP3 source is copied: re-encoding could only lose quality.
+            codec_options = ["-c:a", "copy"]
+        else:
+            # 320 kbps while it fits one Telegram upload; long audio steps down
+            # so a podcast or a three-hour video stays in few parts.
+            rate = mp3_bitrate(duration, limit)
+            codec_options = ["-c:a", "libmp3lame", "-b:a", f"{rate}k"]
+            if duration > 1200:
+                codec_options += ["-compression_level", "7"]
         await asyncio.to_thread(ffmpeg, ["ffmpeg", "-nostdin", "-y", "-i", str(source),
-                                        "-map", "0:a:0", "-vn", *codec_options, str(output)])
+                                        "-map", "0:a:0", "-vn", *tags, *codec_options, str(output)],
+                                max(900, int(duration * .6) + 300))
         outputs.append(output)
     if not outputs:
         raise RuntimeError("No accessible audio track was found in this post.")
@@ -2607,6 +3080,93 @@ async def report_job_event(job: str, platform: str, stage: str, *, items: int = 
         pass
 
 
+def human_bytes(value: float) -> str:
+    value = float(value or 0)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if value < 1024 or unit == 'GB':
+            return f'{value:.0f} {unit}' if unit in {'B', 'KB'} else f'{value:.1f} {unit}'
+        value /= 1024
+    return f'{value:.1f} GB'
+
+
+def human_time(seconds: float) -> str:
+    seconds = max(0, int(seconds or 0))
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f'{hours}:{minutes:02d}:{seconds:02d}' if hours else f'{minutes}:{seconds:02d}'
+
+
+def progress_bar(fraction: float) -> str:
+    filled = max(0, min(10, int(round(fraction * 10))))
+    return '▰' * filled + '▱' * (10 - filled)
+
+
+def read_worker_progress(tmp: Path | None) -> dict[str, Any]:
+    if tmp is None:
+        return {}
+    try:
+        data = json.loads((tmp / 'progress.json').read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def progress_text(label: str, progress: dict, worker: dict, elapsed: float, samples: list) -> str:
+    """One compact status line: what is happening, how far, how fast."""
+    stage = progress.get('stage')
+    clock = f' · {human_time(elapsed)}'
+    if progress.get('up_total') and stage == 'upload':
+        done, total = min(progress.get('up_done', 0), progress['up_total']), progress['up_total']
+        speed = done / max(0.5, time.monotonic() - progress.get('up_started', time.monotonic()))
+        fraction = done / total if total else 0
+        return (f"📤 {progress.get('phase')}\n{progress_bar(fraction)} {int(fraction * 100)}% · "
+                f"{human_bytes(done)} / {human_bytes(total)} · {human_bytes(speed)}/s{clock}")
+    if stage == 'download':
+        phase = worker.get('phase')
+        if phase == 'download':
+            done, total = worker.get('done', 0), worker.get('total', 0)
+            speed = worker.get('speed') or 0
+            samples.append((worker.get('at') or time.time(), done))
+            del samples[:-6]
+            if not speed and len(samples) > 1 and samples[-1][0] > samples[0][0]:
+                speed = max(0, (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0]))
+            part = f" ({worker['label']})" if worker.get('label') in {'video', 'audio'} else ''
+            if total:
+                fraction = min(1, done / total)
+                rate = f' · {human_bytes(speed)}/s' if speed > 0 else ''
+                eta = f' · ~{human_time((total - done) / speed)} left' if speed > 0 else ''
+                return (f"⬇️ Downloading from {label}{part}\n{progress_bar(fraction)} {int(fraction * 100)}% · "
+                        f"{human_bytes(done)} / {human_bytes(total)}{rate}{eta}")
+            return f"⬇️ Downloading from {label}{part} · {human_bytes(done)}" + (
+                f" · {human_bytes(speed)}/s" if speed else '') + clock
+        if phase == 'provider':
+            percent = f" · {int(worker['done'])}%" if worker.get('total') == 100 and worker.get('done') else ''
+            return f"⏳ {label}: the download service is preparing the video{percent}{clock}"
+        if phase == 'extract':
+            return f"🔎 Reading the {label} link{clock}"
+    return f"⏳ {progress.get('phase') or 'Working'}{clock}"
+
+
+def delivery_caption(url: str, meta: dict[str, Any], silent_videos: int = 0) -> str:
+    lines = []
+    title = clean_title(meta.get('title'))
+    if title:
+        lines.append('🎬 ' + (title[:97] + '…' if len(title) > 100 else title))
+    lines.append(f"⚡ Veltrix Downloader · {platform_label(url)}")
+    if silent_videos:
+        lines.append(f"🔇 Audio unavailable in {silent_videos} source video(s).")
+    return '\n'.join(lines)
+
+
+def delivered_summary(kinds: list[str], sent: int) -> str:
+    names = {'image': ('photo', 'photos'), 'video': ('video', 'videos'), 'animation': ('GIF', 'GIFs'),
+             'audio': ('audio', 'audio files'), 'document': ('file', 'files')}
+    counts = [(kind, kinds.count(kind)) for kind in names if kinds.count(kind)]
+    text = ', '.join(f"{count} {names[kind][count != 1]}" for kind, count in counts) or f'{sent} media'
+    extra = f' in {sent} messages' if sent > max(1, len(kinds)) else ''
+    return f"✅ Delivered · {text}{extra}"
+
+
 async def run_job(
     msg, context, uid: int, url: str, mode: str, status=None,
     selected_audio_index: int | None = None,
@@ -2615,9 +3175,10 @@ async def run_job(
     refresh_audio: bool = False,
 ) -> None:
     lock = job_lock(uid)
-    progress = {"sent": 0, "phase": "Queued"}
+    progress = {"sent": 0, "phase": "Waiting for a free download slot", "stage": "queue"}
     event_id = secrets.token_hex(6)
     source = platform_of(url) or 'unknown'
+    label = platform_label(url)
     status = status if status is not None else DeferredStatus(msg)
     started_at = time.monotonic()
     tmp = None
@@ -2630,14 +3191,20 @@ async def run_job(
 
     async def typing():
         previous = ""
+        samples: list = []
+        edited_at = 0.0
+        # Groups allow fewer edits per minute than private chats.
+        spacing = 4 if int(getattr(msg, 'chat_id', 0) or 0) >= 0 else 9
         while True:
             try:
-                await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT,
-                                                   connect_timeout=8, read_timeout=8)
-                text = f"⏳ {progress['phase']} · {int(time.monotonic() - started_at) // 15 * 15}s"
-                if text != previous:
+                action = ChatAction.UPLOAD_VOICE if mode in AUDIO_PRESETS else (
+                    ChatAction.UPLOAD_VIDEO if progress.get('stage') == 'upload' else ChatAction.TYPING)
+                await context.bot.send_chat_action(msg.chat_id, action, connect_timeout=8, read_timeout=8)
+                worker = read_worker_progress(tmp) if progress.get('stage') == 'download' else {}
+                text = progress_text(label, progress, worker, time.monotonic() - started_at, samples)
+                if text != previous and time.monotonic() - edited_at >= spacing:
                     await edit_status(status, text)
-                    previous = text
+                    previous, edited_at = text, time.monotonic()
             except TelegramError:
                 pass
             await asyncio.sleep(4)
@@ -2653,7 +3220,7 @@ async def run_job(
             mark_state("downloading")
             await report_job_event(event_id, source, 'downloading')
             tmp = Path(tempfile.mkdtemp(prefix="vx_"))
-            progress["phase"] = f"Downloading from {platform_label(url)}"
+            progress.update(phase=f"Downloading from {label}", stage='download')
             meta = dict(known_meta or {})
             files = []
             if cached_sources and all(p.is_file() for p in cached_sources):
@@ -2677,6 +3244,7 @@ async def run_job(
                         raise
                     log.info('Keeping cached MP3 sources after refresh failed: %s', type(exc).__name__)
                     shutil.rmtree(tmp / 'soundtrack', ignore_errors=True)
+            progress.update(phase='Preparing media', stage='prepare')
             kinds = await asyncio.to_thread(lambda: [classify(p) for p in files])
             with_sound = await asyncio.to_thread(lambda: sum(
                 kind == 'video' and has_audio(path) for kind, path in zip(kinds, files)))
@@ -2685,6 +3253,7 @@ async def run_job(
                      kinds.count('animation'), kinds.count('audio'))
             await report_job_event(event_id, source, 'prepared', items=len(files))
             await report_job_event(event_id, source, 'uploading', items=len(files))
+            progress['stage'] = 'upload'
             if mode in AUDIO_PRESETS:
                 progress["phase"] = "Checking available audio tracks"
                 if selected_audio_index is not None:
@@ -2692,7 +3261,7 @@ async def run_job(
                         raise RuntimeError("Requested media item is no longer available")
                     files = [files[selected_audio_index]]
                 sources = await asyncio.to_thread(audio_sources, files, tmp / "soundtrack")
-                sent = await send_mp3_album(msg, sources, tmp, progress)
+                sent = await send_mp3_album(msg, sources, tmp, progress, meta=meta)
                 if not sent:
                     raise RuntimeError("No accessible audio track")
                 delivered = True
@@ -2704,17 +3273,19 @@ async def run_job(
                 except TelegramError:
                     await edit_status(status, "✅ MP3 delivered")
             else:
-                caption = f"⚡ Veltrix Downloader · {platform_label(url)}"
                 silent_videos = kinds.count('video') - with_sound
-                if silent_videos:
-                    caption += f"\n🔇 Audio unavailable in {silent_videos} source video(s)."
-                if mode in {AUTO_MODE, 'original'}:
+                caption = delivery_caption(url, meta, silent_videos)
+                if mode == ORIGINAL_MODE:
+                    # Exact source bytes as documents, with separate soundtracks.
                     soundtracks = await asyncio.to_thread(files_in, tmp / 'soundtrack')
                     deliveries = list(dict.fromkeys([*files, *soundtracks]))
                     sent = await send_album(msg, deliveries, caption, tmp, progress, originals=True)
+                    delivered_kinds = ['document'] * len(deliveries)
                 else:
+                    # Photos as photos, videos as playable videos with sound.
                     deliveries = files
                     sent = await send_album(msg, files, caption, tmp, progress)
+                    delivered_kinds = kinds
                 if not sent:
                     raise RuntimeError("Nothing downloadable was returned")
                 delivered = True
@@ -2751,7 +3322,7 @@ async def run_job(
                         attached = True
                     except TelegramError as exc:
                         log.info("MP3 message unavailable: %s", type(exc).__name__)
-                await edit_status(status, f"✅ {len(deliveries)} media delivered",
+                await edit_status(status, delivered_summary(delivered_kinds, sent),
                                   reply_markup=None if attached else markup)
             metric_add("jobs_succeeded", 1)
             await report_job_event(event_id, source, 'delivered', items=sent)
@@ -2774,6 +3345,7 @@ async def run_job(
         markup = None
         definitive = isinstance(exc, WorkerFailure) and exc.category in {
             'SourceUnavailable', 'PlatformBotCheck', 'AccessRequired', 'ProviderQuotaExceeded',
+            'MediaTooLong', 'LiveStream',
         }
         if mode == AUTO_MODE and not count and not uncertain and not definitive:
             try:
@@ -2853,6 +3425,12 @@ def validate_media_files(paths: list[Path]) -> list[Path]:
         probe(path)
     # Preserve intentional repeated carousel items. Source IDs define identity.
     return paths
+
+
+def canonical_media_name(path: Path) -> Path:
+    """Give CDN objects such as 'media.IRZXSOY' the extension of their bytes."""
+    from media_io import with_canonical_suffix
+    return with_canonical_suffix(path)
 
 
 _budget_checked_at = 0.0
@@ -2995,6 +3573,11 @@ async def download_in_worker(url: str, mode: str, tmp: Path, meta: dict) -> list
     files = [Path(p).resolve() for p in result.get("files", [])]
     if not files or any(not p.is_relative_to(tmp) or not p.is_file() for p in files):
         raise RuntimeError("Invalid download worker result")
+    extra = result.get('meta') if isinstance(result.get('meta'), dict) else {}
+    for key in ('title', 'uploader', 'duration'):
+        value = extra.get(key)
+        if isinstance(value, (str, int, float)) and value and (not meta.get(key) or meta.get(key) == 'Media'):
+            meta[key] = value
     return files
 
 
@@ -3078,6 +3661,11 @@ async def stop_jobs(app) -> None:
     stop_all()
     if _jobs is not None:
         await _jobs.shutdown()
+    try:
+        from telegram_mtproto import close
+        await close()
+    except Exception as exc:  # pragma: no cover - shutdown only
+        log.info('MTProto shutdown: %s', type(exc).__name__)
 
 
 async def on_error(update, context) -> None:
@@ -3097,6 +3685,7 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler('original', cmd_original))
     app.add_handler(CommandHandler('playable', cmd_playable))
+    app.add_handler(CommandHandler(['mp3', 'audio'], cmd_mp3))
     app.add_handler(CallbackQueryHandler(on_callback))
     caption_links = filters.CaptionRegex(URL_RE) | filters.CaptionEntity(MessageEntity.TEXT_LINK)
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | caption_links, on_text))

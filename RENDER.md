@@ -10,10 +10,15 @@ and a Telegram webhook, as configured in [render.yaml](render.yaml).
    For public YouTube downloads after a server block, set `VIDFETCH_API_KEY` from a
    [VidFetch account](https://www.vidfetch.dev/). `NEWISTY_YOUTUBE=1` enables the secondary
    fallback. Keep provider keys in Render's secret environment.
-4. In the startup logs, check the verified bot username and
+4. Optional, for files up to 2 GB instead of 50 MB parts: create an app at
+   [my.telegram.org](https://my.telegram.org) (*API development tools*) and set
+   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` as secrets. The startup log then shows
+   `Large uploads (MTProto, up to 2 GB): configured`. `KEEP_AWAKE=1` keeps the free
+   instance warm between requests; while a job runs it stays awake automatically.
+5. In the startup logs, check the verified bot username and
    `Render webhook registered: True`. A growing pending count or a recent
    error means Telegram delivery to the webhook needs investigation.
-5. Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot), send a
+6. Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot), send a
    public link and confirm that the media arrives. Tap **MP3** on an audible
    video to verify audio delivery too.
 

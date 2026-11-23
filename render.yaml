@@ -11,3 +11,7 @@ services:
         sync: false
       - key: TERMUX_PRIMARY
         value: '0'
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false

@@ -12,9 +12,12 @@ Use the [project map](PROJECT_MAP.md) to find the code, active service and verif
 
 Set `VIDFETCH_API_KEY` in Render Environment to use [VidFetch](https://www.vidfetch.dev/youtube-downloader-api)
 when direct extraction for a single public YouTube video hits the bot check, a missing player response or media HTTP 403.
-Use a key from the Free plan for its monthly allowance. VidFetch receives only the canonical video URL
-and requested format. By default the worker requests the best available video up to 2160p with audio,
-then validates the file and passes its bytes to the usual Telegram delivery pipeline. VidFetch may
+VidFetch bills delivered gigabytes (the Free plan includes 1 GB per month). It receives only the
+canonical video URL and requested format. A plain link requests the best H.264 MP4 up to
+`NATIVE_MAX_HEIGHT` (1080p), which Telegram plays inline; `/original` requests up to 2160p. The free
+`/info` call reports per-quality sizes, so a long video starts at the tallest tier that fits the
+delivery budget (never below 360p), which also saves quota. Jobs for long videos may wait up to 40
+minutes on the provider. The worker validates the file and passes it to the usual Telegram delivery pipeline. VidFetch may
 convert the source and serves direct MP3 requests at 128 kbps. The inline MP3 button uses the downloaded
 video's audio when available. Provider secrets are sent only to its API. The worker requests deletion of
 its temporary provider job after the transfer attempt. If VidFetch rejects job creation for insufficient
@@ -61,23 +64,27 @@ Text-only posts have no media attachment. Public community posts and short links
 
 ## Quality and Telegram behavior
 
-- Automatic YouTube mode prioritizes resolution, frame rate and HDR with no fixed resolution ceiling. For an explicit playlist, each final file must match its own entry. Instagram tries the largest rendition first and can join a separate track from the same carousel item.
+- A plain link delivers **native media**: photos with `sendPhoto`, videos with `sendVideo` as fast-start H.264/AAC MP4 with width, height, duration and a thumbnail, audio with `sendAudio`. Compatible tracks are remuxed without re-encoding. Other codecs are converted to H.264 only when the estimated encode time fits `MAX_ENCODE_SECONDS` on the container's CPU share (Render Free has 0.1 CPU); longer HEVC/VP9/AV1 sources are copied into MP4 and still sent as video. If Telegram rejects a native format, that batch is resent as documents.
+- YouTube in the default mode sorts by `vcodec:h264, res, fps, acodec:m4a`, so the delivered stream plays inline (usually up to 1080p). `/original` sorts by `res, fps, hdr` and sends the exact files as documents, e.g. 4K VP9/AV1. Both modes read the player once, reject live streams and media longer than `MAX_MEDIA_SECONDS`, and cap the rendition to the delivery budget using the published format sizes.
+- The delivery budget is the per-file limit times `MAX_VIDEO_PARTS` (20 parts of 49 MB on the hosted Bot API, 4 parts of 2 GB with MTProto uploads), bounded by `MAX_SOURCE_BYTES` and 42 % of free disk. Nothing below 360p is chosen to save parts.
 - “Highest” means the best stream the platform exposes to the extractor, not the creator's pre-upload master.
-- A plain link or `/original <link>` sends the highest available downloaded files as Telegram documents, preserving their bytes. Separate soundtracks follow the ordered media. Source audio/video tracks may be merged into one container during extraction. Large files are streamed as numbered `.partNNN` documents. Download all parts for a file and concatenate them in numbered order to recover it.
-- `/playable <link>` prepares photos and playable media for Telegram's chat player. Compatible tracks are remuxed. Other video codecs are converted to H.264/AAC without resizing, and Telegram may recompress photos. Large playable videos may be split on existing keyframes.
-- Collections use albums of at most 10 in source order. In playback mode, visual media, audio and documents use separate groups. GIF and animated WebP retain motion, and AVIF stills are sent as photos.
-- If Telegram explicitly rejects the media format of an upload, the bot resends that batch as documents in the same order. It uses the source bytes for items that fit in one file. An upload that times out or loses its response still requires checking the chat before retrying.
-- An MP3 button appears after every delivered post. The bot attaches it to the last media item or puts it on the status message if Telegram rejects the edit. The Original button carries the source link so a signed callback can fetch audio after a restart or cache write failure. When a delivered carousel has silent videos, the MP3 action checks the source again and keeps the cached tracks if the new attempt finds fewer.
-- Video variants are checked for an actual audio stream. Instagram's dedicated extractor and gallery-dl both read DASH audio for the matching carousel item. The bot can combine complementary results after comparing the affected clips' encoded video streams. A post-wide soundtrack is added to each silent video independently and offered once through MP3. Conversion preserves the video's duration and checks that audio survives. Videos without an exposed track are marked in the delivery caption.
-- Existing MP3 audio is copied without another lossy encode; other audio is converted once at 320 kbps. This cannot improve a lower-quality source or recover music that the platform does not expose. It extracts the mixed audio track, not isolated vocals/instruments.
-- Files are streamed during upload rather than read entirely into RAM.
-- Hosted Bot API: conservative 49,000,000-byte per-file ceiling. Exact delivery splits the file by bytes. Playback mode splits audio/videos by stream copy. A single request may produce multiple messages.
-- An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081`; it supports uploads up to 2,000,000,000 bytes. A server must actually be installed/configured; setting the variable alone does not create it. Switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
-- If playback cannot be split at existing keyframes, a plain link still delivers the original in numbered parts.
+- Long videos are split on existing keyframes. The split points come from the packet sizes, so each part is close to the limit (about 94 %); every part is a fast-start MP4 that plays on its own and arrives as its own message with `Part i/N`. A 12-minute 210 MB test video became five parts, a three-hour 388 MB video nine parts.
+- Collections use albums of at most 10 in source order; visual media, audio and documents use separate groups. GIF and animated WebP retain motion, and AVIF stills are sent as photos. Telegram may recompress photos.
+- `/original <link>` sends the highest available downloaded files as Telegram documents, preserving their bytes, followed by separate soundtracks. Large originals are streamed as numbered `.partNNN` documents (concatenate them in order), or as single files up to 2 GB with MTProto uploads.
+- An MP3 button appears after every delivered post (on the last media item, or as a message after an album). `/mp3 <link>` downloads only the audio. Existing MP3 audio is copied; other audio is encoded once at 320 kbps while the file fits one upload, otherwise at the highest of 256/192/160/128 kbps that does, and long audio that fits none is sent at 192 kbps in numbered parts. Files carry the post title and creator as ID3 tags and Telegram title/performer. This cannot improve a lower-quality source or recover music that the platform does not expose.
+- Video variants are checked for an actual audio stream. Instagram's dedicated extractor and gallery-dl both read DASH audio for the matching carousel item. A post-wide soundtrack is added to each silent video independently and offered once through MP3. Videos without an exposed track are marked in the delivery caption.
+- Captions carry the post title without hashtags, the platform and any missing-audio note.
+- Files are streamed during upload rather than read entirely into RAM, and the status message shows upload progress.
+
+### Large uploads (up to 2 GB)
+
+The hosted Bot API accepts 50 MB per file. With `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` from [my.telegram.org](https://my.telegram.org) (*API development tools*, any app name), files above 50 MB are uploaded by the same bot through Telethon (MTProto) with `messages.uploadMedia` and no chat, then sent through the normal Bot API call using the returned `file_id`. Captions, buttons, replies and topics are unchanged and no updates are read. The session is stored in `DATA_DIR/mtproto.session` (or `TELEGRAM_SESSION`) and the bot token signs in again after a Render restart. If an upload fails, large uploads pause for ten minutes (or Telegram's flood wait) and the file is re-split into 49 MB parts, so delivery continues. Keep both values in Render's secret environment.
+
+An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://127.0.0.1:8081` instead; it also supports 2 GB files. A server must actually be installed and configured, and switching from Telegram's cloud server requires Telegram's documented `logOut` migration first.
 
 ## Reliability
 
-- Downloads run outside Telegram update handlers, so long jobs do not occupy all command-processing slots. Progress messages show the stage/time and `/status` shows your recent jobs.
+- Downloads run outside Telegram update handlers, so long jobs do not occupy all command-processing slots. The status message shows a progress bar with percent, size, speed and time left for downloads (yt-dlp, CDN transfers, provider processing) and uploads; `/status` shows your recent jobs. Edits are spaced for group limits.
 - A SQLite journal admits at most 20 pending jobs overall and 3 per user. Links and MP3 buttons share admission and duplicate checks; Instagram tracking parameters do not create another active job.
 - Queued/downloading jobs are re-extracted after a restart, up to 3 recoveries and within 24 hours. Jobs that had started sending are marked interrupted and never replayed automatically; check received media before retrying.
 - Direct CDN transfers resume within a job using Range/If-Range when the server supplies a stable validator. If a server ignores Range, the file is restarted cleanly. Resume across a process/device restart is not byte-level: the source is extracted again.
@@ -85,8 +92,9 @@ Text-only posts have no media attachment. Public community posts and short links
 - Rate limits allow the next source-aware extractor to run; incomplete collections remain failures. MP3 mode accepts audio-only results for video links.
 - H.264 video is copied when only its audio codec needs conversion. Existing MP3 streams are not re-encoded.
 - Render can run the bot with a Telegram webhook and download media without Termux. The webhook authenticates Telegram's secret header. Termux remains available as an optional, mutually exclusive runtime when Render is configured only as a relay.
-- Per-user serialization and bounded global work concurrency.
-- Isolated download process; a 30-minute configurable deadline kills its process group, including downloader children.
+- Per-user serialization and bounded global work concurrency (`MAX_CONCURRENT_JOBS`, default 2, so one long video does not block other users; a worker uses about 60 MB of memory).
+- Isolated download process; a 60-minute configurable deadline (`JOB_TIMEOUT_SECONDS`) kills its process group, including downloader children.
+- CDN files are renamed after probing so their extension matches the bytes (Snapchat serves `.IRZXSOY` names).
 - ffprobe validates downloaded files; HTML/JSON masquerading as media is rejected.
 - Carousel order is retained; failed entries, extractor error records and item caps are reported instead of silently truncating a post.
 - Snapchat will not substitute a recommended item when the requested Spotlight ID is missing.
@@ -99,7 +107,7 @@ Text-only posts have no media attachment. Public community posts and short links
 - Conversion processes and download process groups are stopped on shutdown. A local process lock prevents two workers using the same data directory. Separate devices/services must still avoid polling the same token.
 - Dependency changes are detected during normal restart. Pending Telegram updates are preserved.
 
-Render Free sleeps after 15 minutes without inbound traffic and has a 750-hour shared monthly limit; webhook traffic wakes it, with a possible cold-start delay. Its local files, MP3 cache and SQLite job journal vanish on a restart or sleep, so admitted or unfinished work is not recoverable on that tier. A paid persistent runtime or a separately provisioned durable database is needed for strict always-on and crash recovery. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
+Render Free sleeps after 15 minutes without inbound traffic and has a 750-hour shared monthly limit; webhook traffic wakes it, with a possible cold-start delay. While a job is queued or running, `render_free.py` requests the service's own address every four minutes so a long download or upload is not cut off. `KEEP_AWAKE=1` also does this every ten minutes while idle, which removes the cold start but uses instance hours around the clock. Its local files, MP3 cache and SQLite job journal vanish on a restart or sleep, so admitted or unfinished work is not recoverable on that tier. A paid persistent runtime or a separately provisioned durable database is needed for strict always-on and crash recovery. Telegram's Bot API has no idempotency key for uploads; exactly-once delivery across ambiguous network failures cannot be guaranteed.
 
 ## Primary runtime: Render webhook
 
@@ -129,7 +137,7 @@ bash termux_setup.sh
 
 If operating in phone mode, set `TERMUX_PRIMARY=1` on Render and use Termux. Keep Termux battery optimization disabled. Normal startup installs a missing reboot script; reboot startup also requires Termux:Boot to be installed from the same source as Termux and opened once. Android can still terminate the process.
 
-`.env.example` documents normal settings. Default caps: 100 items, 4 GiB per source, 6 GiB total download workspace, 128 MiB disk reserve, one concurrent job. Remuxing/splitting also needs additional free disk space.
+`.env.example` documents normal settings. Default caps: 100 items, 4 GiB per source, 9 GiB total download workspace, 128 MiB disk reserve, two concurrent jobs, four hours per media. Remuxing/splitting also needs additional free disk space.
 
 `BOT_TOKEN` stays in `.env` on the phone and in Render's secret environment for cloud mode. Never commit tokens, cookies, sessions or proxy credentials. Existing optional authorized YouTube cookie configuration on Render is passed to the isolated worker; age restrictions remain enforced.
 
@@ -143,11 +151,11 @@ In phone mode, a relay request needs connectivity from the phone to Render and f
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py telegram_relay.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
+python -m compileall -q bot.py media_io.py media_process.py runtime_jobs.py telegram_network.py telegram_relay.py telegram_mtproto.py transfer.py source_metadata.py diagnose.py download_worker.py render_free.py tests
 bash -n termux_start.sh termux_setup.sh termux_supervisor.sh termux_process.sh
 ```
 
-The regression suite includes real generated MP4/M4A/PNG/GIF media, native animation/video conversion, MP3 extraction, stream-copy splits, mixed albums, cache ownership, exact-pin metadata, partial Instagram rejection and async delivery failures. Source-page and Telegram delivery tests use controlled fixtures; passing them is not live-platform certification.
+The regression suite includes real generated MP4/M4A/PNG/GIF media, native animation/video conversion, MP3 extraction and bitrate selection, keyframe-planned splits, numbered part delivery, MTProto file_id encoding and fallback, rendition caps for long videos, progress text, mixed albums, cache ownership, exact-pin metadata, partial Instagram rejection and async delivery failures. Source-page and Telegram delivery tests use controlled fixtures; passing them is not live-platform certification.
 
 See the [project map](PROJECT_MAP.md#version-and-evidence) for the current release and verified results. The [release audit](RELEASE_AUDIT.md) records older results.
 

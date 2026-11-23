@@ -134,16 +134,23 @@ class MediaFixtures(unittest.TestCase):
         class FakeDownloader:
             def __init__(self, opts):
                 seen.append(opts)
+                self.params = dict(opts)
             def __enter__(self):
                 return self
             def __exit__(self, *args):
                 pass
-            def extract_info(self, url, download):
+            def extract_info(self, url, download, process=True):
+                # The player is read without downloading; selection follows.
+                assert not download and not process
+                return {"id": "BaW_jenozKc", "duration": 10, "formats": []}
+            def process_ie_result(self, info, download):
+                seen.append(dict(self.params))
                 return {"filepath": str(fixture), "requested_downloads": [{"filepath": str(fixture)}]}
         with patch("bot.YoutubeDL", FakeDownloader):
             self.assertEqual(bot.download_ytdlp("https://www.youtube.com/watch?v=BaW_jenozKc", "auto", str(self.root)), [self.video])
         self.assertEqual(seen[0]["format"], "bv*+ba/b/ba")
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[1]["format_sort"][0], "vcodec:h264")
+        self.assertEqual(len(seen), 2)
 
     def test_youtube_never_delivers_video_after_declared_audio_is_lost(self):
         silent = self.root / 'silent.mp4'
@@ -156,7 +163,10 @@ class MediaFixtures(unittest.TestCase):
                 return self
             def __exit__(self, *args):
                 pass
-            def extract_info(self, url, download):
+            def extract_info(self, url, download, process=True):
+                self.params = {}
+                return {'id': 'BaW_jenozKc', 'duration': 6, 'formats': []}
+            def process_ie_result(self, info, download):
                 return {'requested_formats': [
                     {'vcodec': 'h264', 'acodec': 'none'},
                     {'vcodec': 'none', 'acodec': 'aac'}],

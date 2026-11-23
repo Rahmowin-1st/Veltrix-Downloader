@@ -1,6 +1,6 @@
 # Veltrix Downloader
 
-A Telegram bot that downloads public media from **YouTube, Instagram, Snapchat and Pinterest**. It uses the best exposed quality, keeps carousel items in order and extracts audio when the source makes a track available.
+A Telegram bot that downloads public media from **YouTube, Instagram, Snapchat and Pinterest**. Photos arrive as photos and videos as playable videos with their sound, in the best quality the source exposes. Carousels keep their order, videos up to three hours are supported and every delivery has an **MP3** button.
 
 [Open the Telegram bot](https://t.me/VeltrixDownloaderBot) · [Explore the project map](docs/PROJECT_MAP.md) · [Read the Claude continuation notes](CLAUDE.md)
 
@@ -8,9 +8,9 @@ A Telegram bot that downloads public media from **YouTube, Instagram, Snapchat a
 
 | Send to the bot | What you get |
 | --- | --- |
-| A public link or `/original <link>` | Source-quality files as Telegram documents. Large files may arrive as numbered parts |
-| `/playable <link>` | Media prepared for playback inside Telegram |
-| **MP3** button | Audio from the delivered post when exposed by the platform |
+| A public link | Photos as Telegram photos, videos as playable H.264/AAC videos with sound, in source order. A live status shows progress, speed and time left |
+| **MP3** button or `/mp3 <link>` | The audio as MP3: copied if it already is MP3, otherwise 320 kbps (long audio uses the highest bitrate that keeps few parts) |
+| `/original <link>` | The untouched source files as documents, including the highest stream such as 4K |
 | `/status` | The state of your recent requests |
 
 ## Supported media
@@ -22,11 +22,17 @@ A Telegram bot that downloads public media from **YouTube, Instagram, Snapchat a
 | Snapchat | Public Spotlight, Story and Highlight media |
 | Pinterest | Images, GIFs, videos and mixed Pin collections |
 
-Quality and availability depend on the source, the configured providers and file size. Private, expired or removed links may be unavailable. YouTube's provider can select a lower quality when a higher one is unavailable or exceeds its quota.
+## Long videos
+
+Videos up to `MAX_MEDIA_SECONDS` (4 hours by default) are accepted. The hosted Bot API takes at most 50 MB per file, so a long video arrives as numbered parts that each play on their own; parts are cut on keyframes as close to the limit as possible. For long sources the bot picks the highest rendition that still fits a reasonable number of parts, never below 360p.
+
+Set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` (from [my.telegram.org](https://my.telegram.org), *API development tools*) to raise the limit to 2 GB per file: large files are then uploaded by the same bot over MTProto and sent by the normal Bot API request. If that route fails, the bot falls back to 50 MB parts automatically.
+
+Quality and availability depend on the source, the configured providers and file size. Private, expired or removed links may be unavailable. YouTube's provider can select a lower quality when a higher one is unavailable, exceeds its quota or would need too many parts.
 
 ## Where it runs
 
-**Render** runs the production bot as a Python web service in Frankfurt. Telegram delivers updates to the webhook and Render downloads and uploads the media, including when your phone is off. The Free plan can cold-start after inactivity, and its local state is temporary.
+**Render** runs the production bot as a Python web service in Frankfurt. Telegram delivers updates to the webhook and Render downloads and uploads the media, including when your phone is off. The Free plan can cold-start after inactivity, and its local state is temporary. While a job runs, the service keeps itself awake; `KEEP_AWAKE=1` also avoids cold starts when idle.
 
 | Location | Open |
 | --- | --- |

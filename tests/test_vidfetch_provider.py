@@ -126,6 +126,10 @@ class VidFetchTests(unittest.TestCase):
                 patch('bot.download_ytdlp', side_effect=RuntimeError("Sign in to confirm you're not a bot")) as primary:
             with self.assertRaisesRegex(RuntimeError, 'confirm you'):
                 bot.grab('https://youtu.be/' + VIDEO_ID + '?si=tracking', 'auto', folder)
+            self.assertEqual(provider.call_args.args[:2], (VIDEO_ID, '1080p'))
+            provider.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, 'confirm you'):
+                bot.grab('https://youtu.be/' + VIDEO_ID, 'original', folder)
             self.assertEqual(provider.call_args.args[:2], (VIDEO_ID, '2160p'))
             provider.reset_mock()
             with self.assertRaisesRegex(RuntimeError, 'confirm you'):
@@ -146,4 +150,4 @@ class VidFetchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'any player response'):
                 bot.grab(URL, 'auto', folder)
             extractor.extract_info.assert_called_once()
-            self.assertEqual(provider.call_args.args[:2], (VIDEO_ID, '2160p'))
+            self.assertEqual(provider.call_args.args[:2], (VIDEO_ID, '1080p'))
