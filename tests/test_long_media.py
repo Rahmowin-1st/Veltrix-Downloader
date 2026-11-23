@@ -24,6 +24,10 @@ def make_video(path: Path, seconds: float, *, size='320x240', rate=25, bitrate='
     return path
 
 
+async def bot_module_send(chat, source: Path, folder: Path) -> int:
+    return await bot.send_album(chat, [source], '', folder, {})
+
+
 def moov_before_mdat(path: Path) -> bool:
     head = path.read_bytes()[:1 << 20]
     return 0 <= head.find(b'moov') < head.find(b'mdat')
@@ -171,6 +175,41 @@ class LongVideoDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.sent[0]['caption'].startswith('caption'))
         self.assertAlmostEqual(sum(item['duration'] for item in self.sent), 16, delta=sent)
         self.assertEqual(progress['sent'], sent)
+
+    async def test_single_video_request_matches_the_bot_api_layout(self):
+        from telegram import Bot
+        from telegram.request import BaseRequest
+
+        source = make_video(self.root / 'single.mp4', 4, bitrate='900k')
+        captured = {}
+
+        class Recorder(BaseRequest):
+            async def initialize(self):
+                pass
+
+            async def shutdown(self):
+                pass
+
+            async def do_request(self, url, method, request_data=None, **kwargs):
+                captured['method'] = url.rsplit('/', 1)[-1]
+                captured['json'] = request_data.json_parameters
+                captured['files'] = {name: len(field[1].read()) if hasattr(field[1], 'read') else len(field[1])
+                                     for name, field in (request_data.multipart_data or {}).items()}
+                body = ('{"ok":true,"result":{"message_id":1,"date":0,"chat":{"id":42,"type":"private"}}}')
+                return 200, body.encode()
+
+        bot = Bot('123456:test-token', request=Recorder(), get_updates_request=Recorder())
+        bot._initialized = True
+        chat = SimpleNamespace(reply_video=lambda **kw: bot.send_video(42, **kw))
+        self.assertEqual(await bot_module_send(chat, source, self.root / 'job'), 1)
+        self.assertEqual(captured['method'], 'sendVideo')
+        params = captured['json']
+        self.assertEqual((params['width'], params['height'], params['duration']), ('320', '240', '4'))
+        self.assertEqual(params['supports_streaming'], 'true')
+        self.assertTrue(params['thumbnail'].startswith('attach://'))
+        attach = params['thumbnail'].removeprefix('attach://')
+        self.assertGreater(captured['files'][attach], 0)
+        self.assertEqual(captured['files']['video'], source.stat().st_size)
 
     async def test_large_route_sends_big_parts_by_file_id(self):
         source = make_video(self.root / 'big.mp4', 6, bitrate='900k')
