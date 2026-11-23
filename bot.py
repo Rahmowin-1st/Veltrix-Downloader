@@ -45,12 +45,12 @@ from yt_dlp import YoutubeDL
 from runtime_jobs import ChatTarget, JobManager, mark_state
 from cobalt_provider import ProviderError
 from newisty_provider import ProviderRateLimit
-from source_metadata import IncompletePost, media_quality
+from source_metadata import IncompletePost, PublicMediaUnavailable, media_quality
 from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "9.17.1"
+VERSION = "9.17.2"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -527,6 +527,7 @@ def request_headers(url: str | None = None) -> dict[str, str]:
         headers["Upgrade-Insecure-Requests"] = "1"
     elif platform == "pinterest":
         headers["Referer"] = "https://www.pinterest.com/"
+        headers["Accept-Encoding"] = "identity"
     return headers
 
 
@@ -959,6 +960,7 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
         return cached
     candidates = extractor_candidates(url)[:3]
     snap_id = _snap_requested_id(candidates[0], {})
+    unavailable = False
     if snap_id:
         candidates.append(f"https://www.snapchat.com/spotlight/{snap_id}/embed")
     for candidate in dict.fromkeys(candidates):
@@ -987,7 +989,15 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
             if info:
                 info["entries"] = [{"url": info["url"], "kind": "video"}]
             elif _snap_page_owns_spotlight(response.text, page_url):
-                info = _snap_info_from_exact_page(response.text, page_url) or snapchat_preload(response.text)
+                unavailable_page = any(
+                    re.search(r'''\bdata-testid=["']spotlight-scaffold["']''', tag, re.I)
+                    and re.search(r'''\bdata-resolved=["']unavailable["']''', tag, re.I)
+                    for tag in re.findall(r'<section\b[^>]*>', response.text, re.I)
+                )
+                if unavailable_page:
+                    unavailable = True
+                else:
+                    info = _snap_info_from_exact_page(response.text, page_url) or snapchat_preload(response.text)
         else:
             profile = SNAP_PROFILE_RE.fullmatch(urlparse(candidate).path)
             redirected_profile = SNAP_PROFILE_RE.fullmatch(urlparse(page_url).path)
@@ -1003,6 +1013,8 @@ def extract_snapchat_public(url: str) -> dict[str, Any]:
         if info:
             metadata_cache_put(f"snapchat:{url}", info)
             return info
+    if unavailable:
+        raise PublicMediaUnavailable('Snapchat Spotlight unavailable on the public page')
     return {}
 
 
@@ -1608,6 +1620,9 @@ def friendly_error(platform: str, exc: Exception) -> str:
         return str(exc)
     if isinstance(exc, VidFetchQuotaExceeded):
         return 'YouTube: the download quota is too low for this video. Try again when quota is available.'
+    if isinstance(exc, PublicMediaUnavailable):
+        label = PLATFORMS.get(platform, {}).get('label', 'Media')
+        return f'{label}: this media is unavailable on the public site.'
     if isinstance(exc, BadRequest):
         return "Telegram rejected this media. The rejected album was not delivered; try again."
     if connection_failed_before_send(exc):
@@ -1784,7 +1799,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 engines.append(lambda folder, extract_mode: download_newisty(url, extract_mode, folder, errors))
             engines.append(lambda folder, extract_mode: download_youtube_public(url, extract_mode, folder))
     elif platform == "instagram":
-        dedicated = lambda folder, _: download_instagram_dedicated(url, folder, (prefetched or {}).get("_instagram_info"))[0]
+        dedicated = lambda folder, _: download_instagram_dedicated(url, folder, (prefetched or {}).get("_instagram_info"))
         gallery = lambda folder, _: download_gallery(url, folder)
         cookie = os.getenv('INSTAGRAM_COOKIE_FILE', '')
         # The dedicated public parser cannot receive a login session. An
@@ -1792,7 +1807,7 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
         engines = ([gallery, dedicated] if cookie and Path(cookie).is_file()
                    else [dedicated, gallery])
         if INSTAGRAM_POST_RE.fullmatch(urlparse(url).path):
-            engines.append(lambda folder, _: download_instagram_dedicated(url, folder, graphql=True)[0])
+            engines.append(lambda folder, _: download_instagram_dedicated(url, folder, graphql=True))
         engines.append(lambda folder, extract_mode: download_ytdlp(url, extract_mode, folder))
     elif platform == "pinterest":
         url = resolve_public_redirect(url)
@@ -1818,7 +1833,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
         try:
             has_collection = len(candidate) > 1 or any(len(layout) > 1 for layout in required_layouts)
             extract_mode = AUTO_MODE if audio_mode and has_collection else mode
-            files = engine(str(attempt), extract_mode)
+            result = engine(str(attempt), extract_mode)
+            files, post_type = result if isinstance(result, tuple) else (result, '')
             if not files:
                 shutil.rmtree(attempt, ignore_errors=True)
                 continue
@@ -1829,9 +1845,12 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 raise RuntimeError("Source file exceeds configured storage limit")
             files = validate_media_files(files)
             kinds = [classify(p) for p in files]
-            if not audio_mode and is_video_post_url(url) and any(kind != 'video' for kind in kinds):
-                raise RuntimeError("Video post returned a poster instead of video")
             layout = tuple('image' if kind == 'animation' else kind for kind in kinds)
+            reel_carousel = platform == 'instagram' and len(layout) > 1 and (
+                post_type == 'carousel' or kinds == candidate_kinds or layout in required_layouts
+            )
+            if not audio_mode and is_video_post_url(url) and not reel_carousel and any(kind != 'video' for kind in kinds):
+                raise RuntimeError("Video post returned a poster instead of video")
             if required_layouts and required_layouts != {layout}:
                 shutil.rmtree(attempt, ignore_errors=True)
                 continue
@@ -1886,7 +1905,8 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 path.rename(soundtrack / f'{index:05d}{path.suffix}')
         return candidate
     if errors:
-        error = next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit, VidFetchQuotaExceeded))),
+        error = next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit,
+                                                                VidFetchQuotaExceeded, PublicMediaUnavailable))),
                      errors[-1])
         for diagnostic in provider_diagnostics:
             error.add_note(diagnostic)

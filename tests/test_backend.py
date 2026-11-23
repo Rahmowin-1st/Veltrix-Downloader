@@ -288,6 +288,35 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(bot.fetch_public_page(url).text, 'page')
         self.assertEqual(seen, ['identity'])
 
+    def test_pinterest_page_avoids_invalid_brotli_response(self):
+        url = 'https://www.pinterest.com/pin/42/'
+        client_class = httpx.Client
+
+        def handle(request):
+            if request.headers.get('accept-encoding') == 'identity':
+                return httpx.Response(200, text='<html>Pin</html>')
+            return httpx.Response(200, headers={'Content-Encoding': 'br'}, stream=httpx.ByteStream(b'<html>Pin</html>'))
+
+        with patch('bot.PROXY', ''), patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.httpx.Client', side_effect=lambda **kw: client_class(transport=httpx.MockTransport(handle), **kw)):
+            self.assertEqual(bot.fetch_public_page(url).text, '<html>Pin</html>')
+
+    def test_snapchat_keeps_exact_unavailability_and_ignores_the_recommended_preload(self):
+        from download_worker import failure_category
+
+        url = 'https://www.snapchat.com/spotlight/wanted_unavailable'
+        page = (f'<link rel="canonical" href="{url}">'
+                '<section data-resolved="unavailable" data-testid="spotlight-scaffold"></section>'
+                '<link rel="preload" as="video" href="https://cf-st.sc-cdn.net/d/recommended">')
+        response = httpx.Response(200, text=page, request=httpx.Request('GET', url))
+        with tempfile.TemporaryDirectory() as folder, patch('bot.safe_remote_url', return_value=True), \
+             patch('bot.fetch_public_page', return_value=response), patch('bot.snapchat_lookup', return_value={}), \
+             patch('bot.download_ytdlp', side_effect=RuntimeError('Next.js data is missing')), \
+             patch.dict(os.environ, {'COBALT_API_URL': ''}):
+            with self.assertRaises(bot.PublicMediaUnavailable) as failure:
+                bot.grab(url, 'auto', folder)
+        self.assertEqual(failure_category(failure.exception), 'SourceUnavailable')
+
     def test_application_json_content_url(self):
         page = '<script type="application/json">{"props":{"pageProps":{"videoMetadata":{"contentUrl":"https://cf-st.sc-cdn.net/d/abc","thumbnailUrl":"https://cf-st.sc-cdn.net/d/thumb"}}}}</script>'
         candidates = bot.page_media_candidates(page, include_images=False)

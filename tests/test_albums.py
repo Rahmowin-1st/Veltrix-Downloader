@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 import bot
-from source_metadata import (instagram_audio_urls, instagram_extractor,
+from source_metadata import (PublicMediaUnavailable, instagram_audio_urls, instagram_extractor,
                              pinterest_entries, pinterest_post_audio_urls, find_pinterest_pin, pinterest_relay_pin)
 from telegram.error import TimedOut, BadRequest
 
@@ -45,6 +46,14 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(pinterest_relay_pin(related, '42'), {})
         carousel = {'entityId': '42', **image, 'carouselData': {'carouselSlots': [image]}}
         self.assertEqual(pinterest_relay_pin(embedded(carousel), '42'), {})
+
+    def test_pinterest_relay_only_reports_missing_for_the_requested_pin(self):
+        query = quote(json.dumps({'variables': {'pinId': '42'}}))
+        response = json.dumps({'data': {'v3GetPinQueryv2': {'__typename': 'PinNotFound'}}})
+        page = f'<script>window.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__("{query}", {response})</script>'
+        self.assertEqual(pinterest_relay_pin(page, '51'), {})
+        with self.assertRaises(PublicMediaUnavailable):
+            pinterest_relay_pin(page, '42')
 
     def test_pinterest_missing_video_is_not_a_photo(self):
         with self.assertRaisesRegex(RuntimeError, "poster rejected"):

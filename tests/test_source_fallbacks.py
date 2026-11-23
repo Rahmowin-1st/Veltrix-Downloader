@@ -263,6 +263,22 @@ class RealMediaFallbackTests(unittest.TestCase):
             self.assertTrue(dedicated.call_args.kwargs['graphql'])
             fallback.assert_not_called()
 
+    def test_reel_accepts_a_verified_mixed_carousel_but_rejects_its_standalone_poster(self):
+        from PIL import Image
+
+        url = 'https://www.instagram.com/reel/album/'
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / 'photo.jpg'
+            Image.new('RGB', (64, 64)).save(image)
+            with patch.dict(os.environ, {'COBALT_API_URL': '', 'INSTAGRAM_COOKIE_FILE': ''}), \
+                 patch('bot.safe_remote_url', return_value=True), patch('bot.download_gallery', return_value=[]), \
+                 patch('bot.download_ytdlp', return_value=[]), patch('bot.download_instagram_dedicated') as dedicated:
+                dedicated.return_value = ([image, self.audible], 'carousel')
+                self.assertEqual(bot.grab(url, 'auto', folder), [image, self.audible])
+                dedicated.return_value = ([image], 'image')
+                with self.assertRaisesRegex(RuntimeError, 'poster instead of video'):
+                    bot.grab(url, 'auto', folder)
+
     def test_unmatched_video_does_not_replace_another_carousel_child(self):
         original = [self.audible, self.second_silent]
         with tempfile.TemporaryDirectory() as job, patch.dict(os.environ, {'COBALT_API_URL': ''}), \

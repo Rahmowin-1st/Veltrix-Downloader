@@ -5,7 +5,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from fractions import Fraction
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 
 class IncompletePost(RuntimeError):
@@ -14,6 +14,10 @@ class IncompletePost(RuntimeError):
     def __init__(self, message: str, expected_kinds: tuple[str, ...]):
         super().__init__(message)
         self.expected_kinds = expected_kinds
+
+
+class PublicMediaUnavailable(RuntimeError):
+    """The exact post's public page explicitly marked the media unavailable."""
 
 
 def media_quality(fmt: dict) -> tuple[float, float, float]:
@@ -400,6 +404,7 @@ def pinterest_relay_pin(page: str, pin_id: str) -> dict:
     decoder = json.JSONDecoder()
     comma = re.compile(r'\s*,\s*')
     exact = {}
+    missing = False
     for match in re.finditer(r'\bwindow\.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__\(\s*', page):
         try:
             query, end = decoder.raw_decode(page, match.end())
@@ -407,8 +412,13 @@ def pinterest_relay_pin(page: str, pin_id: str) -> dict:
             if not isinstance(query, str) or not separator:
                 continue
             response, _ = decoder.raw_decode(page, separator.end())
-            pin = response['data']['v3GetPinQueryv2']['data']
-        except (ValueError, TypeError, KeyError):
+            result = response['data']['v3GetPinQueryv2']
+            if result.get('__typename') == 'PinNotFound':
+                variables = json.loads(unquote(query))['variables']
+                missing |= str(variables.get('pinId')) == pin_id
+                continue
+            pin = result['data']
+        except (ValueError, TypeError, KeyError, AttributeError):
             continue
         if (not isinstance(pin, dict) or str(pin.get('entityId')) != pin_id
                 or pin.get('__typename') != 'Pin'):
@@ -421,6 +431,8 @@ def pinterest_relay_pin(page: str, pin_id: str) -> dict:
                 exact[key] = value
 
     if not exact:
+        if missing:
+            raise PublicMediaUnavailable('Pinterest Pin not found on the public page')
         return {}
     result = {'id': pin_id, **media(exact), 'is_video': bool(exact.get('videoStatus'))}
     if story := exact.get('storyPinData'):

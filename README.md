@@ -1,4 +1,4 @@
-# Veltrix Downloader 9.17.1
+# Veltrix Downloader 9.17.2
 
 One public media link → automatic extraction → highest exposed quality → Telegram delivery.
 Quality selection is automatic. Direct downloads require no provider account.
