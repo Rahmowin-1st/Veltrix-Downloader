@@ -2842,8 +2842,10 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                             thumb = meta.get('thumb')
                             extra = {}
                             if thumb is not None and not item.remote and thumb.is_file():
+                                # Telegram documents thumbnails as an attach:// reference.
                                 extra['thumbnail'] = InputFile(stack.enter_context(thumb.open('rb')),
-                                                               filename='thumb.jpg', read_file_handle=False)
+                                                               filename='thumb.jpg', attach=True,
+                                                               read_file_handle=False)
                             return await msg.reply_video(video=upload, caption=item_caption, supports_streaming=True,
                                                          **video_fields, **extra)
                         if kind == "animation":
