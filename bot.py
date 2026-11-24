@@ -25,7 +25,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
@@ -50,7 +50,7 @@ from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "10.0.0"
+VERSION = "10.1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -108,6 +108,12 @@ URL_RE = re.compile(r"(https?://[^\s<>\"']+)|(www\.[^\s<>\"']+)", re.I)
 YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 YT_POST_RE = re.compile(r'^/(?:(?:@|%40)[^/]+/)?post/([A-Za-z0-9_-]+)/?$', re.I)
 YT_PLAYER_MISSING = 'failed to extract any player response'
+YT_BOT_CHECK_RE = re.compile(r"confirm you[’']re not a bot", re.I)
+# YouTube's account/session limit (yt-dlp adds "rate-limited by YouTube").
+YT_SESSION_LIMIT_RE = re.compile(r"rate-limited by youtube|content isn[’']t available, try again later", re.I)
+# Refusals of this server that a separate provider can still serve.
+YT_BLOCKED_RE = re.compile(rf"{YT_BOT_CHECK_RE.pattern}|{YT_SESSION_LIMIT_RE.pattern}|"
+                           r"unable to download video data: HTTP Error 403", re.I)
 INSTAGRAM_POST_RE = re.compile(
     r'^/(?:(?!share/|direct/|stories/)[\w.]+/)?(reels?|p|tv)/([A-Za-z0-9_-]+)(?:/embed(?:/captioned)?)?/?$', re.I)
 PINTEREST_PIN_RE = re.compile(r"^/pin/(?:[^/]+--)?(\d+)/?$", re.I)
@@ -1289,7 +1295,34 @@ def youtube_height_cap(raw: dict, mode: str, budget: int) -> int:
     return min(tier(f) for f in (watchable or video))
 
 
+@contextmanager
+def job_cookies(platform: str, folder: str | Path):
+    """A private cookie copy for one extractor run, or None without cookies.
+
+    Extractors rewrite their cookie file when they finish; concurrent jobs must
+    never read a file another job is rewriting. Refreshed cookies are saved back
+    atomically only when none of the owner's cookies were lost.
+    """
+    from source_auth import job_cookie_copy, keep_job_cookies
+
+    copy = job_cookie_copy(platform, Path(folder) / 'cookies') if platform else None
+    try:
+        yield copy
+    finally:
+        if copy is not None:
+            keep_job_cookies(platform, copy)
+            copy.unlink(missing_ok=True)
+            with suppress(OSError):
+                copy.parent.rmdir()
+
+
 def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = None) -> list[Path]:
+    with job_cookies(platform_of(url) or '', tmpdir) as cookie_file:
+        return _download_ytdlp(url, mode, tmpdir, manifest=manifest, cookie_file=cookie_file)
+
+
+def _download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None,
+                    cookie_file: Path | None) -> list[Path]:
     base = base_ydl_opts(tmpdir)
     base['noplaylist'] = not youtube_playlist_url(url)
     platform = platform_of(url)
@@ -1298,9 +1331,8 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
         if mode != ORIGINAL_MODE:
             # H.264 and AAC merge straight into a playable MP4.
             base['merge_output_format'] = 'mp4/mkv'
-    cookie_file = os.getenv(f"{(platform or '').upper()}_COOKIE_FILE", "")
-    if cookie_file and Path(cookie_file).is_file():
-        base["cookiefile"] = cookie_file
+    if cookie_file is not None:
+        base["cookiefile"] = str(cookie_file)
     attempts: list[tuple[str, dict[str, Any]]] = []
     if mode in {AUTO_MODE, "original", "playable"}:
         # yt-dlp ranks all exposed formats; no hidden resolution ceiling.
@@ -1376,7 +1408,9 @@ def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = 
                         and YT_PLAYER_MISSING in str(exc).lower()):
                     # Switching format selectors cannot repair a missing player response.
                     raise
-                if re.search(r"confirm you[’']re not a bot|login required|sign in to (?:confirm|view|watch)|private video", str(exc), re.I):
+                if (re.search(r"confirm you[’']re not a bot|login required|sign in to (?:confirm|view|watch)|private video", str(exc), re.I)
+                        or YT_SESSION_LIMIT_RE.search(str(exc))):
+                    # Another format selector repeats the same refused request.
                     raise
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), type(exc).__name__)
@@ -1506,10 +1540,10 @@ def download_gallery(url: str, tmpdir: str) -> list[Path]:
         cmd[3:3] = ["-o", "output.private=true", "-o", "extractor.instagram.audio=merged"]
     if PROXY:
         cmd[3:3] = ["--proxy", PROXY]
-    cookie_file = os.getenv(f"{platform.upper()}_COOKIE_FILE", "")
-    if cookie_file and Path(cookie_file).is_file():
-        cmd[3:3] = ["--cookies", cookie_file]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    with job_cookies(platform, tmpdir) as cookie_file:
+        if cookie_file is not None:
+            cmd[3:3] = ["--cookies", str(cookie_file)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode:
         raise RuntimeError("Gallery metadata unavailable")
     manifest = json.loads(proc.stdout)
@@ -1872,6 +1906,24 @@ def fatal_download_error(exc: Exception) -> bool:
                                         "configured item limit", "configured storage limit", "job storage limit"))
 
 
+def youtube_bot_check_message() -> str:
+    """Explain YouTube's bot check by the state of the owner's sign-in.
+
+    Users are never asked for cookies: account files must not be sent in chat.
+    """
+    from source_auth import youtube_cookie_state
+
+    state = youtube_cookie_state()
+    if state == 'signed-in':
+        return ('YouTube: this server was stopped by YouTube’s automated-traffic check because YouTube no longer '
+                'accepts the bot’s sign-in. The bot owner needs to renew it; other platforms still work.')
+    if state == 'signed-out':
+        return ('YouTube: this server was stopped by YouTube’s automated-traffic check because the bot’s YouTube '
+                'sign-in is incomplete. The bot owner needs to set it up again; other platforms still work.')
+    return ('YouTube: this server was stopped by YouTube’s automated-traffic check, so the video was not '
+            'downloaded. Instagram, Snapchat and Pinterest links still work.')
+
+
 def friendly_error(platform: str, exc: Exception) -> str:
     """User-safe errors only. Full extractor details stay in logs."""
     if isinstance(exc, WorkerFailure):
@@ -1904,6 +1956,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
         return f'{label}: this live stream has not finished yet. Send the link again after it ends.'
     if 'original file exceeds the telegram upload limit' in low:
         return 'This original file exceeds Telegram’s upload limit. Send the link on its own to try playable parts.'
+    if platform == 'youtube' and YT_SESSION_LIMIT_RE.search(text):
+        return 'YouTube: YouTube is temporarily limiting the bot’s requests. Please try again in about an hour.'
     if "429" in low or "too many requests" in low or "rate-limit" in low or "rate limit" in low:
         return f"{label}: temporarily rate-limited. Please wait before trying again."
     if "storage" in low or "no space left" in low:
@@ -1913,6 +1967,8 @@ def friendly_error(platform: str, exc: Exception) -> str:
     if "incomplete" in low or "truncated" in low:
         return f"{label}: some media could not be retrieved. The incomplete post was not sent."
     if "confirm you’re not a bot" in low or "confirm you're not a bot" in low:
+        if platform == 'youtube':
+            return youtube_bot_check_message()
         return f"{label}: this server was stopped by the platform's automated-traffic check. The media was not downloaded."
     if re.search(r"\bage(?:\b|_)", low) and any(s in low for s in ("restricted", "limit", "confirm", "verify")):
         return "This age-restricted media is not supported."
@@ -2008,9 +2064,7 @@ def download_vidfetch(url: str, mode: str, tmpdir: str, errors: list) -> list[Pa
     from vidfetch_provider import fetch
 
     direct_error = str(errors[0]) if errors else ''
-    if (YT_PLAYER_MISSING not in direct_error.lower()
-            and not re.search(r"confirm you[’']re not a bot|unable to download video data: HTTP Error 403",
-                              direct_error, re.I)):
+    if YT_PLAYER_MISSING not in direct_error.lower() and not YT_BLOCKED_RE.search(direct_error):
         return []
     canonical = extract_url(url) or ''
     match = re.fullmatch(r'https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})', canonical)
@@ -2047,7 +2101,7 @@ def download_vidfetch(url: str, mode: str, tmpdir: str, errors: list) -> list[Pa
 def download_newisty(url: str, mode: str, tmpdir: str, errors: list) -> list[Path]:
     from newisty_provider import fetch
 
-    if not errors or not re.search(r"confirm you[’']re not a bot", str(errors[0]), re.I):
+    if not errors or not YT_BLOCKED_RE.search(str(errors[0])):
         return []
     canonical = extract_url(url)
     if not canonical or not canonical.startswith('https://www.youtube.com/watch?v='):
@@ -2205,9 +2259,17 @@ def grab(url: str, mode: str, tmpdir: str, prefetched: dict[str, Any] | None = N
                 path.rename(soundtrack / f'{index:05d}{path.suffix}')
         return candidate
     if errors:
-        error = next((exc for exc in errors if isinstance(exc, (IncompletePost, ProviderRateLimit,
-                                                                VidFetchQuotaExceeded, PublicMediaUnavailable))),
-                     errors[-1])
+        sign_in = None
+        if platform == 'youtube':
+            from source_auth import youtube_cookie_state
+            if youtube_cookie_state() != 'missing':
+                # A configured sign-in that YouTube refused is the cause the
+                # owner can fix, even when a backup provider also failed.
+                sign_in = next((exc for exc in errors if YT_BOT_CHECK_RE.search(str(exc))), None)
+        error = (next((exc for exc in errors if isinstance(exc, IncompletePost)), None) or sign_in
+                 or next((exc for exc in errors if isinstance(exc, (ProviderRateLimit, VidFetchQuotaExceeded,
+                                                                    PublicMediaUnavailable))),
+                         errors[-1]))
         for diagnostic in provider_diagnostics:
             error.add_note(diagnostic)
         raise error

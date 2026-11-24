@@ -12,19 +12,24 @@ and a Telegram webhook, as configured in [render.yaml](render.yaml).
    fallback. Keep provider keys in Render's secret environment.
 4. Optional, for files up to 2 GB instead of 50 MB parts: create an app at
    [my.telegram.org](https://my.telegram.org) (*API development tools*) and set
-   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` as secrets.
-   YouTube blocks cloud servers, so YouTube needs VidFetch quota or cookies:
-   add a Secret File `youtube_cookies.txt` (Netscape format, exported from a
-   secondary Google account in a private window) under Environment → Secret
-   Files. VidFetch stays the fallback when the cookies expire. The startup log then shows
+   `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` as secrets. The startup log then shows
    `Large uploads (MTProto, up to 2 GB): configured`. `KEEP_AWAKE=1` keeps the free
    instance warm between requests; while a job runs it stays awake automatically.
-5. In the startup logs, check the verified bot username and
+5. YouTube asks cloud servers to sign in. Add a Secret File `youtube_cookies.txt`
+   under Environment → Secret Files: cookies exported in Netscape format from a
+   secondary Google account in a private window that you close right away
+   ([step by step](docs/OPERATIONS.md#youtube-sign-in)). The startup log then shows
+   `youtube=signed-in`. VidFetch quota stays the fallback when the sign-in expires.
+6. In the startup logs, check the verified bot username and
    `Render webhook registered: True`. A growing pending count or a recent
    error means Telegram delivery to the webhook needs investigation.
-6. Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot), send a
+7. Open [@VeltrixDownloaderBot](https://t.me/VeltrixDownloaderBot), send a
    public link and confirm that the media arrives. Tap **MP3** on an audible
    video to verify audio delivery too.
+
+The [Refresh extractors](.github/workflows/refresh-extractors.yml) workflow keeps
+yt-dlp and gallery-dl current: it raises their minimum versions after each new
+stable release, tests them and commits to `main`, which Render deploys.
 
 Render Free can sleep and its filesystem is temporary. Run a single webhook
 or polling instance per token. See the [operations guide](docs/OPERATIONS.md#primary-runtime-render-webhook)

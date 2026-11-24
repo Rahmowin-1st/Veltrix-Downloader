@@ -36,7 +36,8 @@ flowchart LR
 | YouTube and providers | [`vidfetch_provider.py`](../vidfetch_provider.py), [`newisty_provider.py`](../newisty_provider.py), [`youtube_public.py`](../youtube_public.py), [`cobalt_provider.py`](../cobalt_provider.py) | Provider integrations and public player fallback. `grab()` in `bot.py` defines the actual fallback order |
 | Media processing | [`media_io.py`](../media_io.py), [`media_process.py`](../media_process.py) | ffprobe validation, extension repair, audio muxing, keyframe-planned splitting, CPU-aware playback preparation, thumbnails, MP3 bitrate choice and subprocess limits |
 | State and upload | [`runtime_jobs.py`](../runtime_jobs.py), [`telegram_network.py`](../telegram_network.py), [`telegram_relay.py`](../telegram_relay.py), [`telegram_mtproto.py`](../telegram_mtproto.py) | SQLite queue and recovery, Telegram timeouts, optional Termux relay and optional 2 GB MTProto uploads (sent by Bot API file_id) |
-| Render and secrets | [`render_free.py`](../render_free.py), [`render.yaml`](../render.yaml), [`source_auth.py`](../source_auth.py), [`.env.example`](../.env.example) | Cloud entry point, declared service, owner-authorized source sessions and config reference |
+| Render and secrets | [`render_free.py`](../render_free.py), [`render.yaml`](../render.yaml), [`source_auth.py`](../source_auth.py), [`.env.example`](../.env.example) | Cloud entry point, declared service, owner-authorized source sessions (sign-in state, per-job cookie copies) and config reference |
+| Extractor updates | [`refresh_extractors.py`](../refresh_extractors.py), [Refresh extractors](../.github/workflows/refresh-extractors.yml) | Nightly check that raises the yt-dlp and gallery-dl minimum versions after a stable release, tests them and commits to `main` |
 | Diagnostics | [`diagnose.py`](../diagnose.py), [`source_diagnostics.py`](../source_diagnostics.py) | Device checks and time-bounded, explicit public-source probes on Render |
 | Optional Termux mode | [`termux_setup.sh`](../termux_setup.sh), [`termux_start.sh`](../termux_start.sh), [`termux_supervisor.sh`](../termux_supervisor.sh), [`termux_process.sh`](../termux_process.sh) | Phone install, start and process supervision |
 | Verification | [`tests/`](../tests/), [Backend Gates](../.github/workflows/backend-gates.yml) | Unit and regression tests, dependency checks and CI on Python 3.12 and 3.13 |
@@ -55,7 +56,17 @@ Render Free uses a temporary filesystem. Jobs or cached files can be lost when t
 
 ## Version and evidence
 
-**v10.0.0** (this branch) changes the default delivery to native photos and playable videos, adds long-video support, live progress, `/mp3`, adaptive MP3 bitrates and optional 2 GB uploads. It was verified on 23 November 2026 in a cloud container, not yet on Render:
+**v10.1.0** makes YouTube's owner sign-in route dependable on Render and keeps the extractors current. It was verified on 24 November 2026 in a cloud container:
+
+| Check | Verified result |
+| --- | --- |
+| Automated suite | 306 tests passed on Python 3.12 and 3.13 with yt-dlp 2026.11.23 and gallery-dl 1.32.21 |
+| Cookie isolation | Each yt-dlp and gallery-dl run gets a private 0600 copy; refreshed cookies replace the shared copy atomically (new inode) and never when a cookie was lost; Render Secret Files stay untouched |
+| Sign-in state | Startup logs `youtube=missing`, `signed-out` or `signed-in` from cookie names only; bot-check messages follow that state and never ask users for cookies |
+| Extractor refresh | `refresh_extractors.py` against live PyPI raised `yt-dlp` 2026.10.26 → 2026.11.23 (YouTube STS workaround, `web` removed from default clients) and `gallery-dl` 1.32.20 → 1.32.21 |
+| YouTube with cookies | Not verified live: no owner cookies here, and this container's IP is itself blocked by Google ("unusual traffic") |
+
+**v10.0.0** changes the default delivery to native photos and playable videos, adds long-video support, live progress, `/mp3`, adaptive MP3 bitrates and optional 2 GB uploads. It was verified on 23 November 2026 in a cloud container, not yet on Render:
 
 | Check | Verified result |
 | --- | --- |

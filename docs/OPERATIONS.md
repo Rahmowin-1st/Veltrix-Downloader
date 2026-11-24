@@ -159,6 +159,27 @@ The regression suite includes real generated MP4/M4A/PNG/GIF media, native anima
 
 See the [project map](PROJECT_MAP.md#version-and-evidence) for the current release and verified results. The [release audit](RELEASE_AUDIT.md) records older results.
 
+### YouTube sign-in
+
+YouTube asks cloud servers such as Render to sign in ("confirm you're not a bot"). A server bot then needs one of: the cookies of a signed-in YouTube session (free, recommended), VidFetch quota, or a residential connection (the Termux phone runtime). With a signed-in session yt-dlp uses its `tv_samsung`/`web_embedded` clients, which need no PO token, and Deno solves the player challenges.
+
+Set it up once:
+
+1. Use a **secondary** Google account, never your main one: YouTube can restrict accounts used by downloaders.
+2. Install a cookie exporter that writes the Netscape format: on Android, Firefox with the add-on [cookies.txt](https://addons.mozilla.org/android/addon/cookies-txt/) (allow it in private browsing); on a computer, Firefox or Chrome with *cookies.txt* / *Get cookies.txt LOCALLY*.
+3. Open a **private window**, sign in at youtube.com, then open `https://www.youtube.com/robots.txt` as the only private tab and export the cookies for youtube.com.
+4. Close the private window immediately. YouTube rotates the cookies of sessions that stay open in a browser, which would invalidate the exported copy.
+5. In Render, open the service → **Environment → Secret Files → Add Secret File**, name it `youtube_cookies.txt`, paste the file's text and save. Render redeploys.
+6. The startup log line `source access: youtube=signed-in` confirms the session. `youtube=signed-out` means the file has no signed-in session (`LOGIN_INFO` and a `SAPISID` cookie are missing or expired); export again while signed in. Only cookie names are inspected and logged, never values.
+
+When YouTube stops accepting the session, users see "YouTube no longer accepts the bot’s sign-in" and the owner repeats steps 3–5. Bot messages never ask users for cookies: account files must never be sent in chat. VidFetch and Newisty, when configured, still back up a refused sign-in or a session that YouTube rate-limits ("try again later"); a limited session is not retried with other format selectors.
+
+Each download works on a private copy of the cookie file, because yt-dlp and gallery-dl rewrite their cookie file when they finish and concurrent jobs could otherwise read a half-written file. Refreshed cookies replace the shared copy atomically, and only when none of the owner's unexpired cookies were lost. A read-only Render Secret File is never modified.
+
+### Extractor updates
+
+YouTube and Instagram changes are fixed by new yt-dlp and gallery-dl releases, but Render installs requirements only when it builds. The [Refresh extractors](../.github/workflows/refresh-extractors.yml) workflow checks PyPI every night (21:41 UTC). When a newer stable release exists, it raises the minimum version in `requirements.txt`, runs the tests with it and commits to `main`, and Render redeploys with the fix. Nightly and pre-release builds are never adopted. After a sudden YouTube failure, run it at once from **Actions → Refresh extractors → Run workflow**.
+
 For a temporary Render source check, set `SOURCE_PROBE_UNTIL` to a short future UTC ISO 8601 time and `SOURCE_PROBE_URLS` to a JSON object such as `{"version":"9.17.2","urls":["https://www.youtube.com/watch?v=PUBLIC_VIDEO_ID"]}`. Use the target build's version and a real public test URL. On startup, `source_diagnostics.py` checks the worker output and logs media counts, dimensions and audio. It expires automatically. Use one relevant URL when possible to limit provider usage. For Telegram delivery, check the result and MP3 button in an authorized test chat.
 
 ## Runtime diagnosis
@@ -171,7 +192,7 @@ To check a device's YouTube download before changing the active Telegram receive
 
 Restarting Termux waits for the previous supervisor to finish, identifies its direct `python bot.py` child and signals that child if graceful shutdown stalls. After a further bounded wait it terminates only that verified child. Restart never starts a second bot while the previous supervisor remains active. An upload interrupted by restart may need manual inspection before retrying; check `/status` rather than resending the same link blindly. `python diagnose.py` can be run on its own even when startup reports a shutdown delay.
 
-Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, `PINTEREST_COOKIE_FILE`, and `SNAPCHAT_COOKIE_FILE`. On Render the simplest way is a **Secret File** named `youtube_cookies.txt` (or `instagram_cookies.txt`, …) under Environment → Secret Files: the bot copies `/etc/secrets/<platform>_cookies.txt` to a private writable file at startup, so no base64 step is needed. For YouTube, export the cookies of a secondary account from a private browser window (then close it), because YouTube rotates cookies of open sessions. With YouTube cookies the configured providers (VidFetch, Newisty) remain a fallback for public videos when the session expires. On Render, the corresponding `INSTAGRAM_COOKIES_B64`, `YOUTUBE_COOKIES_B64`, `PINTEREST_COOKIES_B64`, `SNAPCHAT_COOKIES_B64` secret environment variables create permission-restricted temporary cookie files for supported extractors. Base64 is encoding, **not encryption**: set these directly as Render secrets, never in chat or GitHub. Instagram's authenticated gallery route runs first when a cookie file exists. Cookies may help with content the signed-in owner is authorized to view; a link or cookies alone do not guarantee extraction, and private Snapchat/Friends media may have no extractable web URL. Worker failures include a URL/token-redacted diagnostic in `logs/termux.log`.
+Optional owner-supplied Netscape cookie files are `INSTAGRAM_COOKIE_FILE`, `YOUTUBE_COOKIE_FILE`, `PINTEREST_COOKIE_FILE`, and `SNAPCHAT_COOKIE_FILE`. On Render the simplest way is a **Secret File** named `youtube_cookies.txt` (or `instagram_cookies.txt`, …) under Environment → Secret Files: the bot copies `/etc/secrets/<platform>_cookies.txt` to a private writable file at startup, so no base64 step is needed. For YouTube, follow [YouTube sign-in](#youtube-sign-in). With YouTube cookies the configured providers (VidFetch, Newisty) remain a fallback for public videos when the session expires. On Render, the corresponding `INSTAGRAM_COOKIES_B64`, `YOUTUBE_COOKIES_B64`, `PINTEREST_COOKIES_B64`, `SNAPCHAT_COOKIES_B64` secret environment variables create permission-restricted temporary cookie files for supported extractors. Base64 is encoding, **not encryption**: set these directly as Render secrets, never in chat or GitHub. Instagram's authenticated gallery route runs first when a cookie file exists. Cookies may help with content the signed-in owner is authorized to view; a link or cookies alone do not guarantee extraction, and private Snapchat/Friends media may have no extractable web URL. Worker failures include a URL/token-redacted diagnostic in `logs/termux.log`.
 
 ## Upstream references reviewed
 

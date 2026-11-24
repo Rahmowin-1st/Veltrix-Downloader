@@ -136,12 +136,15 @@ def probe_youtube(ids: str) -> None:
             }
             if client != 'default':
                 opts['extractor_args'] = {'youtube': {'player_client': [client]}}
-            cookie_file = os.getenv('YOUTUBE_COOKIE_FILE', '')
-            if cookie_file and os.path.isfile(cookie_file):
-                opts['cookiefile'] = cookie_file
             try:
-                with YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                # A private copy: a probe must not rewrite the shared cookies
+                # while a real download reads them.
+                with tempfile.TemporaryDirectory(prefix='veltrix-probe-') as folder, \
+                        bot.job_cookies('youtube', folder) as cookie_file:
+                    if cookie_file is not None:
+                        opts['cookiefile'] = str(cookie_file)
+                    with YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=False)
                 log.info('YouTube probe #%s %s: formats=%s', index,
                          client, len(info.get('formats') or []) if info else 0)
             except Exception as exc:

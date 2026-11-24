@@ -167,7 +167,8 @@ class BackendTests(unittest.TestCase):
         from download_worker import failure_category
         error = RuntimeError("Sign in to confirm you’re not a bot. Use cookies.")
         self.assertEqual(failure_category(error), "PlatformBotCheck")
-        message = bot.friendly_error("youtube", error)
+        with patch.dict('os.environ', {'YOUTUBE_COOKIE_FILE': ''}):
+            message = bot.friendly_error("youtube", error)
         self.assertIn("automated-traffic check", message)
         self.assertNotIn("cookies", message)
 
