@@ -2522,32 +2522,69 @@ def media_file_title(msg, name: str) -> str:
     return stem[:120] or 'Audio'
 
 
-async def on_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# File conversions run in the background so slow work never holds one of the
+# bot's update-processing slots; these bound how many may wait.
+FILE_JOBS_PER_USER = 3
+FILE_JOBS_TOTAL = 20
+_file_jobs: dict[int, int] = {}
+_file_tasks: set[asyncio.Task] = set()
+
+
+async def on_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> asyncio.Task | None:
     """Turn a video or audio sent to the bot into MP3.
 
     Some media can be watched only inside an app (for example a Snapchat Spotlight
     that Snapchat keeps off the web). A screen recording of it still gets an MP3.
+    The conversion is admitted here and runs as a background task.
     """
     msg = update.effective_message
     found = incoming_media(msg)
     if not found:
-        return
+        return None
     item, name = found
     limit = 2_000 * 1024 * 1024 if TELEGRAM_API_BASE else BOT_FILE_LIMIT
     if int(getattr(item, 'file_size', 0) or 0) > limit:
         await msg.reply_text('Telegram lets bots receive files up to 20 MB. Send the recording as a video '
                              '(Telegram compresses it) or trim it, and the bot will make the MP3.')
-        return
+        return None
     uid = update.effective_user.id
+    if _file_jobs.get(uid, 0) >= FILE_JOBS_PER_USER:
+        await msg.reply_text(f'You already have {FILE_JOBS_PER_USER} files being converted. '
+                             'Please wait for one to finish.')
+        return None
+    if len(_file_tasks) >= FILE_JOBS_TOTAL:
+        await msg.reply_text('The conversion queue is full. Please try again shortly.')
+        return None
+    _file_jobs[uid] = _file_jobs.get(uid, 0) + 1
+    task = asyncio.create_task(convert_media_file(msg, context, uid, item, name), name=f'mp3-file-{uid}')
+    _file_tasks.add(task)
+
+    def finished(done: asyncio.Task) -> None:
+        _file_tasks.discard(done)
+        left = _file_jobs.get(uid, 1) - 1
+        if left > 0:
+            _file_jobs[uid] = left
+        else:
+            _file_jobs.pop(uid, None)
+        if not done.cancelled() and done.exception() is not None:
+            log.error('Media file to MP3 task failed: %s', type(done.exception()).__name__)
+
+    task.add_done_callback(finished)
+    return task
+
+
+async def convert_media_file(msg, context, uid: int, item, name: str) -> None:
     status = DeferredStatus(msg)
     tmp = Path(tempfile.mkdtemp(prefix='vx_file_'))
     progress = {'sent': 0, 'phase': 'Making the MP3', 'stage': 'prepare'}
+    received = False
     try:
         await edit_status(status, '🎵 Making the MP3…')
         async with job_lock(uid), global_sem():
             source = tmp / f"source{Path(name).suffix.lower() if Path(name).suffix else '.bin'}"
             telegram_file = await context.bot.get_file(item.file_id)
             await telegram_file.download_to_drive(custom_path=source)
+            received = True
             sent = await send_mp3_album(msg, [source], tmp, progress,
                                         meta={'title': media_file_title(msg, name), 'uploader': ''})
         await edit_status(status, f"✅ MP3 sent{f' ({sent} parts)' if sent > 1 else ''}.")
@@ -2558,7 +2595,16 @@ async def on_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await edit_status(status, text)
     except TelegramError as exc:
         log.info('Media file to MP3 failed: %s', type(exc).__name__)
-        await edit_status(status, '❌ Telegram did not deliver this file to the bot. Please send it again.')
+        if not received:
+            text = '❌ Telegram did not deliver this file to the bot. Please send it again.'
+        elif progress['sent'] or (progress.get('attempted') and not isinstance(exc, BadRequest)
+                                  and not connection_failed_before_send(exc)):
+            # Parts may have arrived, or an upload succeeded before its reply was lost.
+            text = ('⚠️ Telegram did not confirm the MP3 delivery. Check this chat before sending the file '
+                    'again to avoid duplicates.')
+        else:
+            text = '❌ The MP3 could not be sent. Please send the file again.'
+        await edit_status(status, text)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

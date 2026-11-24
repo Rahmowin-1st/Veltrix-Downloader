@@ -71,8 +71,13 @@ class MediaFileTests(unittest.TestCase):
                 sent.append((path.name, probe.stdout.split()))
             return len(files)
 
+        async def handle():
+            task = await bot.on_media_file(update, context)
+            if task is not None:
+                await task
+
         with patch('bot.send_album', side_effect=send_album):
-            asyncio.run(bot.on_media_file(update, context))
+            asyncio.run(handle())
         return context, downloaded, sent
 
     def test_a_screen_recording_becomes_an_mp3_named_after_its_caption(self):
@@ -110,6 +115,62 @@ class MediaFileTests(unittest.TestCase):
         context.bot.get_file.assert_not_awaited()
         self.assertEqual(downloaded, [])
         self.assertIn('20 MB', msg.replies[0])
+
+    def test_conversion_runs_in_the_background_with_per_user_limits(self):
+        release = asyncio.Event()
+        started = []
+
+        async def convert(msg, context, uid, item, name):
+            started.append(name)
+            await release.wait()
+
+        async def scenario():
+            update = SimpleNamespace(effective_user=SimpleNamespace(id=9))
+            messages, tasks = [], []
+            for index in range(bot.FILE_JOBS_PER_USER + 1):
+                msg = FakeMessage(video=SimpleNamespace(file_id=str(index), file_size=10, file_name=f'{index}.mp4'))
+                update.effective_message = msg
+                messages.append(msg)
+                # The handler returns at once instead of holding an update slot.
+                tasks.append(await asyncio.wait_for(bot.on_media_file(update, SimpleNamespace()), 1))
+            await asyncio.sleep(0)
+            self.assertEqual(len(started), bot.FILE_JOBS_PER_USER)
+            self.assertIsNone(tasks[-1])
+            self.assertIn('Please wait', messages[-1].replies[0])
+            release.set()
+            await asyncio.gather(*filter(None, tasks))
+            self.assertEqual(bot._file_jobs, {})
+            self.assertEqual(bot._file_tasks, set())
+
+        with patch('bot.convert_media_file', side_effect=convert):
+            asyncio.run(scenario())
+
+    def test_a_lost_upload_reply_is_not_reported_as_a_missing_file(self):
+        source = sample(self.folder / 'clip.mp4')
+        video = SimpleNamespace(file_id='f4', file_size=source.stat().st_size, file_name=source.name)
+
+        async def lost(msg, sources, tmp, progress, *, meta):
+            progress['attempted'] = True
+            raise bot.TimedOut('reply lost')
+
+        msg = FakeMessage(video=video)
+        with patch('bot.send_mp3_album', side_effect=lost):
+            self.run_handler(msg, source)
+        self.assertIn('Check this chat before sending the file again', msg.status.texts[-1])
+
+        class Broken:
+            async def download_to_drive(self, custom_path):
+                raise bot.NetworkError('download failed')
+
+        msg = FakeMessage(video=video)
+        context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(return_value=Broken())))
+        update = SimpleNamespace(effective_message=msg, effective_user=SimpleNamespace(id=43))
+
+        async def handle():
+            await (await bot.on_media_file(update, context))
+
+        asyncio.run(handle())
+        self.assertIn('did not deliver this file to the bot', msg.status.texts[-1])
 
     def test_only_video_and_audio_documents_count(self):
         pdf = SimpleNamespace(mime_type='application/pdf', file_name='a.pdf')
