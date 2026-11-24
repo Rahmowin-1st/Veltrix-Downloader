@@ -177,6 +177,22 @@ When YouTube stops accepting the session, users see "YouTube no longer accepts t
 
 Each download works on a private copy of the cookie file, because yt-dlp and gallery-dl rewrite their cookie file when they finish and concurrent jobs could otherwise read a half-written file. Refreshed cookies replace the shared copy atomically, and only when none of the owner's unexpired cookies were lost. A read-only Render Secret File is never modified.
 
+### Owner accounts on every platform
+
+The same sign-in route works for Instagram and Pinterest. Each platform takes the cookies of one **secondary** account as a Render Secret File:
+
+| Secret File | What the account adds | How the bot uses it |
+| --- | --- | --- |
+| `youtube_cookies.txt` | Passes YouTube's server check. Unlisted videos, and private videos shared with that account | yt-dlp |
+| `instagram_cookies.txt` | Posts, Reels, carousels, Stories and Highlights of private accounts that this account follows | gallery-dl first, then yt-dlp |
+| `pinterest_cookies.txt` | Pins and secret boards that this account owns or collaborates on | gallery-dl and yt-dlp after the public Pin route |
+
+A Snapchat account adds nothing on a server. Snapchat plays private and friends-only Snaps, and Spotlights it keeps off the web, only in its app.
+
+Export each file as for YouTube: private window, sign in, export the site's cookies in Netscape format, then close the window without logging out (logging out ends the session). Instagram may ask to confirm a sign-in used from another country, because Render runs in Frankfurt. If possible, sign in and export through a connection located in Germany, then approve "This was me" in the Instagram app if asked.
+
+The startup log reports each file as `missing`, `signed-out`, `signed-in` or `present` (Snapchat, state unknown). The check looks only at cookie names and Pinterest's non-secret `_auth` flag. Signed-in jobs on one platform start at least `ACCOUNT_SPACING_SECONDS` apart (default 5, at most 60), across worker processes, like a person opening links in turn; fallback routes of the same job do not wait again. When a post needs an account, the reply says whether the bot has a sign-in for that platform. It never asks users for cookies.
+
 ### Extractor updates
 
 YouTube and Instagram changes are fixed by new yt-dlp and gallery-dl releases, but Render installs requirements only when it builds. The [Refresh extractors](../.github/workflows/refresh-extractors.yml) workflow checks PyPI every night (21:41 UTC). When a newer stable release exists, it raises the minimum version in `requirements.txt`, runs the tests with it and commits to `main`, and Render redeploys with the fix. Nightly and pre-release builds are never adopted. After a sudden YouTube failure, run it at once from **Actions → Refresh extractors → Run workflow**.

@@ -31,7 +31,7 @@ Set `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` (from [my.telegram.org](https://my
 
 Quality and availability depend on the source, the configured providers and file size. Private, expired or removed links may be unavailable. YouTube's provider can select a lower quality when a higher one is unavailable, exceeds its quota or would need too many parts.
 
-YouTube asks cloud servers to sign in. On Render, add the cookies of a secondary YouTube account as the Secret File `youtube_cookies.txt` ([step by step](docs/OPERATIONS.md#youtube-sign-in)); VidFetch quota remains the fallback. A nightly workflow keeps yt-dlp and gallery-dl on their newest stable releases.
+YouTube asks cloud servers to sign in. On Render, add the cookies of a secondary YouTube account as the Secret File `youtube_cookies.txt` ([step by step](docs/OPERATIONS.md#youtube-sign-in)); VidFetch quota remains the fallback. `instagram_cookies.txt` and `pinterest_cookies.txt` let the bot also open what those accounts may see, such as private accounts they follow and secret boards ([owner accounts](docs/OPERATIONS.md#owner-accounts-on-every-platform)). A nightly workflow keeps yt-dlp and gallery-dl on their newest stable releases.
 
 ## Where it runs
 

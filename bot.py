@@ -50,7 +50,7 @@ from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "10.2.0"
+VERSION = "10.3.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -75,6 +75,9 @@ MAX_MEDIA_SECONDS = max(60, int(os.getenv("MAX_MEDIA_SECONDS", str(4 * 3600))))
 # and provider renditions above this height are requested only by /original.
 NATIVE_MAX_HEIGHT = max(144, int(os.getenv("NATIVE_MAX_HEIGHT", "1080")))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+# Seconds between new jobs that use the owner's account on one platform
+# (YouTube, Instagram, Pinterest cookies), like a person opening links in turn.
+ACCOUNT_SPACING_SECONDS = max(0.0, min(float(os.getenv("ACCOUNT_SPACING_SECONDS", "5") or 0), 60.0))
 USERS_FILE = DATA_DIR / "users.json"
 ACTIONS_FILE = DATA_DIR / "actions.json"
 CACHE_DIR = DATA_DIR / "cache"
@@ -1303,10 +1306,16 @@ def job_cookies(platform: str, folder: str | Path):
     never read a file another job is rewriting. Refreshed cookies are saved back
     atomically only when none of the owner's cookies were lost.
     """
-    from source_auth import job_cookie_copy, keep_job_cookies
+    from source_auth import job_cookie_copy, keep_job_cookies, pace_account
 
     copy = job_cookie_copy(platform, Path(folder) / 'cookies') if platform else None
     try:
+        if copy is not None:
+            # The marker lives in the job's folder: its fallback extractors
+            # keep the slot even when other jobs were admitted meanwhile.
+            job_root = Path(os.getenv('VELTRIX_JOB_ROOT') or folder)
+            pace_account(platform, job_root / f'.account-paced-{platform.lower()}',
+                         ACCOUNT_SPACING_SECONDS, DATA_DIR / 'account_pace')
         yield copy
     finally:
         if copy is not None:
@@ -1924,6 +1933,23 @@ def youtube_bot_check_message() -> str:
             'downloaded. Instagram, Snapchat and Pinterest links still work.')
 
 
+def access_required_message(platform: str, label: str) -> str:
+    """A post needs an account: say whether the bot has the owner's sign-in.
+
+    Users are never asked for cookies: account files must not be sent in chat.
+    """
+    from source_auth import cookie_state
+
+    state = cookie_state(platform) if platform in {'youtube', 'instagram', 'pinterest'} else 'missing'
+    if state == 'signed-in':
+        return (f"{label}: the bot's {label} account cannot see this post (it may be private and not shared "
+                "with that account, or its sign-in expired).")
+    if state == 'signed-out':
+        return (f"{label}: this post needs a signed-in account, and the bot's {label} sign-in is incomplete. "
+                "The bot owner needs to set it up again.")
+    return f"{label}: this post currently requires access the bot does not have."
+
+
 def friendly_error(platform: str, exc: Exception) -> str:
     """User-safe errors only. Full extractor details stay in logs."""
     if isinstance(exc, WorkerFailure):
@@ -1976,7 +2002,7 @@ def friendly_error(platform: str, exc: Exception) -> str:
     if "limit" in low:
         return "This media exceeds the current file size or item limit."
     if any(x in low for x in ("login", "sign in", "cookies", "private", "empty media response")):
-        return f"{label}: this post currently requires access the bot does not have."
+        return access_required_message(platform, label)
     if "404" in low or "not found" in low:
         if platform == "snapchat":
             return "Snapchat: this clip's public web page returned 404 to the bot. The link may still open inside the Snapchat app."

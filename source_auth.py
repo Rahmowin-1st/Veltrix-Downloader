@@ -47,9 +47,41 @@ def youtube_signed_in(data: bytes, *, now: float | None = None) -> bool:
     return 'LOGIN_INFO' in names and bool(names & _YOUTUBE_SID)
 
 
-def youtube_cookie_state(path: str | None = None) -> str:
-    """'missing', 'signed-out' or 'signed-in' for the configured YouTube cookies."""
-    raw = os.getenv('YOUTUBE_COOKIE_FILE', '').strip() if path is None else path
+def _flag_values(data: bytes, domains: set[str], names: set[str]) -> dict[str, str]:
+    """Values of non-secret flag cookies only (e.g. Pinterest's _auth=0/1)."""
+    values = {}
+    for raw in data.decode('utf-8', 'replace').splitlines():
+        fields = raw.removeprefix('#HttpOnly_').split('\t')
+        if len(fields) == 7 and fields[0].strip().lower().lstrip('.') in domains and fields[5] in names:
+            values[fields[5]] = fields[6].strip()
+    return values
+
+
+def signed_in(platform: str, data: bytes, *, now: float | None = None) -> bool | None:
+    """Whether a cookie file holds a signed-in session; None when it cannot be told."""
+    platform = platform.upper()
+    now = time.time() if now is None else now
+    if platform == 'YOUTUBE':
+        return youtube_signed_in(data, now=now)
+
+    def names(domains: set[str]) -> set[str]:
+        return {name for domain, name, expiry in _cookie_rows(data)
+                if domain in domains and (not expiry or expiry > now)}
+
+    if platform == 'INSTAGRAM':
+        # sessionid exists only for a signed-in Instagram session.
+        return 'sessionid' in names({'instagram.com', 'www.instagram.com'})
+    if platform == 'PINTEREST':
+        domains = {'pinterest.com', 'www.pinterest.com'}
+        # Visitors also get _pinterest_sess; _auth is 1 only when signed in.
+        return ('_pinterest_sess' in names(domains)
+                and _flag_values(data, domains, {'_auth'}).get('_auth') == '1')
+    return None
+
+
+def cookie_state(platform: str, path: str | None = None) -> str:
+    """'missing', 'signed-out', 'signed-in' or 'present' (state unknown) for a platform."""
+    raw = os.getenv(f'{platform.upper()}_COOKIE_FILE', '').strip() if path is None else path
     if not raw:
         return 'missing'
     try:
@@ -59,7 +91,57 @@ def youtube_cookie_state(path: str | None = None) -> str:
         data = source.read_bytes()
     except OSError:
         return 'missing'
-    return 'signed-in' if youtube_signed_in(data) else 'signed-out'
+    state = signed_in(platform, data)
+    return 'present' if state is None else 'signed-in' if state else 'signed-out'
+
+
+def youtube_cookie_state(path: str | None = None) -> str:
+    """'missing', 'signed-out' or 'signed-in' for the configured YouTube cookies."""
+    return cookie_state('YOUTUBE', path)
+
+
+def pace_account(platform: str, admitted: Path, spacing: float, directory: Path, *,
+                 clock=time.time, sleep=time.sleep) -> float:
+    """Space extractions that use the owner's account, across worker processes.
+
+    A platform sees at most one new signed-in job every ``spacing`` seconds, like
+    a person opening links one after another. ``admitted`` is a marker file in
+    the job's own folder: once it exists, later extractors of that job (fallback
+    routes) do not wait again, whatever other jobs ran meanwhile. Returns the
+    seconds waited.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX hosts run one job at a time
+        return 0.0
+    import json
+
+    if spacing <= 0 or admitted.exists():
+        return 0.0
+    directory.mkdir(parents=True, exist_ok=True)
+    with open(directory / f'{platform.lower()}.json', 'a+', encoding='utf-8') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0)
+        try:
+            last = json.loads(handle.read() or '{}')
+        except ValueError:
+            last = {}
+        try:
+            waited = max(0.0, min(spacing, spacing - (clock() - float(last.get('at') or 0))))
+        except (TypeError, ValueError):
+            waited = 0.0
+        if waited:
+            sleep(waited)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({'at': clock()}))
+        handle.flush()
+    try:
+        admitted.parent.mkdir(parents=True, exist_ok=True)
+        admitted.touch()
+    except OSError:
+        pass
+    return waited
 
 
 def job_cookie_copy(platform: str, folder: str | Path) -> Path | None:
@@ -202,10 +284,12 @@ def materialize_source_cookies(directory: Path = Path('/tmp')) -> dict[str, Path
             raise
         os.environ[f'{name}_COOKIE_FILE'] = str(path)
         paths[name] = path
-    state = youtube_cookie_state()
-    if state == 'signed-in':
-        log.info('YouTube cookies: signed-in session found')
-    elif state == 'signed-out':
-        log.warning('YouTube cookies contain no signed-in session (LOGIN_INFO/SAPISID missing or expired). '
-                    'Export them while signed in on youtube.com.')
+    for name in PLATFORMS:
+        state = cookie_state(name)
+        label = name.capitalize().replace('Youtube', 'YouTube')
+        if state == 'signed-in':
+            log.info('%s cookies: signed-in session found', label)
+        elif state == 'signed-out':
+            log.warning('%s cookies contain no signed-in session (missing or expired session cookies). '
+                        'Export them while signed in.', label)
     return paths

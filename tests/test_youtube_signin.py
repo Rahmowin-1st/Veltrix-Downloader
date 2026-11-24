@@ -78,6 +78,12 @@ class SignInInspectionTests(unittest.TestCase):
 
 
 class JobCookieTests(unittest.TestCase):
+    def setUp(self):
+        # Account pacing has its own tests; keep these fast and off the repo's data/.
+        patcher = patch('bot.ACCOUNT_SPACING_SECONDS', 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def shared(self, folder: str, data: bytes = SIGNED_IN) -> Path:
         path = Path(folder) / 'shared.cookies'
         path.write_bytes(data)
