@@ -51,16 +51,19 @@ class AccountPacingTests(unittest.TestCase):
             now[0] += seconds
 
         with tempfile.TemporaryDirectory() as folder:
-            pace = lambda platform, job: pace_account(platform, job, 5, Path(folder),
-                                                      clock=lambda: now[0], sleep=sleep)
-            self.assertEqual(pace('instagram', 'job1'), 0)
+            root = Path(folder)
+
+            def pace(platform, job):
+                return pace_account(platform, root / job / f'.paced-{platform}', 5, root / 'pace',
+                                    clock=lambda: now[0], sleep=sleep)
+
+            self.assertEqual(pace('instagram', 'A'), 0)
             now[0] += 1
-            self.assertEqual(pace('instagram', 'job1'), 0)  # same job: a fallback route
-            now[0] += 1
-            self.assertEqual(pace('instagram', 'job2'), 4)  # 5 s after the previous use
-            self.assertEqual(pace('youtube', 'job3'), 0)    # another platform has its own pace
+            self.assertEqual(pace('instagram', 'B'), 4)  # a new job waits 5 s after A
+            self.assertEqual(pace('instagram', 'A'), 0)  # A's fallback keeps its slot after B
+            self.assertEqual(pace('youtube', 'C'), 0)    # another platform has its own pace
             now[0] += 10
-            self.assertEqual(pace('instagram', 'job4'), 0)
+            self.assertEqual(pace('instagram', 'D'), 0)
         self.assertEqual(waits, [4])
 
     def test_job_cookies_paces_only_when_an_account_is_used(self):

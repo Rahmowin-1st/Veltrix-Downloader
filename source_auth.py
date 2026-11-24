@@ -100,13 +100,15 @@ def youtube_cookie_state(path: str | None = None) -> str:
     return cookie_state('YOUTUBE', path)
 
 
-def pace_account(platform: str, job: str, spacing: float, directory: Path, *,
+def pace_account(platform: str, admitted: Path, spacing: float, directory: Path, *,
                  clock=time.time, sleep=time.sleep) -> float:
     """Space extractions that use the owner's account, across worker processes.
 
     A platform sees at most one new signed-in job every ``spacing`` seconds, like
-    a person opening links one after another. Later extractors of the same job
-    (fallback routes) do not wait again. Returns the seconds waited.
+    a person opening links one after another. ``admitted`` is a marker file in
+    the job's own folder: once it exists, later extractors of that job (fallback
+    routes) do not wait again, whatever other jobs ran meanwhile. Returns the
+    seconds waited.
     """
     try:
         import fcntl
@@ -114,9 +116,8 @@ def pace_account(platform: str, job: str, spacing: float, directory: Path, *,
         return 0.0
     import json
 
-    if spacing <= 0:
+    if spacing <= 0 or admitted.exists():
         return 0.0
-
     directory.mkdir(parents=True, exist_ok=True)
     with open(directory / f'{platform.lower()}.json', 'a+', encoding='utf-8') as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
@@ -125,19 +126,22 @@ def pace_account(platform: str, job: str, spacing: float, directory: Path, *,
             last = json.loads(handle.read() or '{}')
         except ValueError:
             last = {}
-        waited = 0.0
-        if last.get('job') != job:
-            try:
-                waited = max(0.0, min(spacing, spacing - (clock() - float(last.get('at') or 0))))
-            except (TypeError, ValueError):
-                waited = 0.0
-            if waited:
-                sleep(waited)
+        try:
+            waited = max(0.0, min(spacing, spacing - (clock() - float(last.get('at') or 0))))
+        except (TypeError, ValueError):
+            waited = 0.0
+        if waited:
+            sleep(waited)
         handle.seek(0)
         handle.truncate()
-        handle.write(json.dumps({'at': clock(), 'job': job}))
+        handle.write(json.dumps({'at': clock()}))
         handle.flush()
-        return waited
+    try:
+        admitted.parent.mkdir(parents=True, exist_ok=True)
+        admitted.touch()
+    except OSError:
+        pass
+    return waited
 
 
 def job_cookie_copy(platform: str, folder: str | Path) -> Path | None:

@@ -1311,8 +1311,10 @@ def job_cookies(platform: str, folder: str | Path):
     copy = job_cookie_copy(platform, Path(folder) / 'cookies') if platform else None
     try:
         if copy is not None:
-            # Fallback extractors of the same job share one slot.
-            pace_account(platform, os.getenv('VELTRIX_JOB_ROOT') or str(folder),
+            # The marker lives in the job's folder: its fallback extractors
+            # keep the slot even when other jobs were admitted meanwhile.
+            job_root = Path(os.getenv('VELTRIX_JOB_ROOT') or folder)
+            pace_account(platform, job_root / f'.account-paced-{platform.lower()}',
                          ACCOUNT_SPACING_SECONDS, DATA_DIR / 'account_pace')
         yield copy
     finally:
