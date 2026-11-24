@@ -50,7 +50,7 @@ from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "10.1.0"
+VERSION = "10.2.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1933,8 +1933,9 @@ def friendly_error(platform: str, exc: Exception) -> str:
                 'Pinterest links still work; YouTube will work again once the allowance is renewed.')
     if isinstance(exc, PublicMediaUnavailable):
         if platform == 'snapchat':
-            return ('Snapchat: Snapchat does not show this Spotlight on its public website (it may be visible '
-                    'only in the app, restricted or removed), so it cannot be downloaded.')
+            return ('Snapchat: Snapchat shows this Snap only in the app, not on the web (or it was restricted '
+                    'or removed), so it cannot be downloaded. Tip: screen-record it in the Snapchat app and '
+                    'send the recording here to get its MP3.')
         if platform == 'pinterest':
             return 'Pinterest: this Pin is not available on the public site (it may be private or removed).'
         label = PLATFORMS.get(platform, {}).get('label', 'Media')
@@ -2422,6 +2423,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎬 Videos play directly in Telegram with their audio; photos arrive as photos.\n"
         f"⏱ Videos up to {MAX_MEDIA_SECONDS // 3600} hours. {large_delivery_note()}\n"
         "🎵 MP3: tap the MP3 button after a delivery, or send /mp3 <link>.\n"
+        "🎙 Send a video or audio file (up to 20 MB, e.g. a screen recording) to get it as MP3.\n"
         "📎 /original <link>: exact source files (highest stream, e.g. 4K) as documents.\n"
         "📊 /status: your recent requests."
         + ("\nIf YouTube blocks the server, the bot can send the video ID to Newisty’s public download API."
@@ -2494,6 +2496,71 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     patch_user(uid, last_url=url)
 
     await dispatch_job(msg, context, uid, url, AUTO_MODE)
+
+
+# api.telegram.org lets a bot fetch files up to 20 MB; a local Bot API server, 2 GB.
+BOT_FILE_LIMIT = 20 * 1024 * 1024
+
+
+def incoming_media(msg) -> tuple[Any, str] | None:
+    """The video or audio a user sent (e.g. a screen recording) and a name for it."""
+    for field in ('video', 'audio', 'voice', 'video_note'):
+        item = getattr(msg, field, None)
+        if item:
+            return item, str(getattr(item, 'title', None) or getattr(item, 'file_name', None) or '')
+    document = getattr(msg, 'document', None)
+    if document and str(document.mime_type or '').startswith(('video/', 'audio/')):
+        return document, str(document.file_name or '')
+    return None
+
+
+def media_file_title(msg, name: str) -> str:
+    caption = re.sub(r'\s+', ' ', str(getattr(msg, 'caption', None) or '')).strip()
+    if caption:
+        return caption[:120]
+    stem = re.sub(r'[_\s]+', ' ', Path(name).stem).strip() if name else ''
+    return stem[:120] or 'Audio'
+
+
+async def on_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Turn a video or audio sent to the bot into MP3.
+
+    Some media can be watched only inside an app (for example a Snapchat Spotlight
+    that Snapchat keeps off the web). A screen recording of it still gets an MP3.
+    """
+    msg = update.effective_message
+    found = incoming_media(msg)
+    if not found:
+        return
+    item, name = found
+    limit = 2_000 * 1024 * 1024 if TELEGRAM_API_BASE else BOT_FILE_LIMIT
+    if int(getattr(item, 'file_size', 0) or 0) > limit:
+        await msg.reply_text('Telegram lets bots receive files up to 20 MB. Send the recording as a video '
+                             '(Telegram compresses it) or trim it, and the bot will make the MP3.')
+        return
+    uid = update.effective_user.id
+    status = DeferredStatus(msg)
+    tmp = Path(tempfile.mkdtemp(prefix='vx_file_'))
+    progress = {'sent': 0, 'phase': 'Making the MP3', 'stage': 'prepare'}
+    try:
+        await edit_status(status, '🎵 Making the MP3…')
+        async with job_lock(uid), global_sem():
+            source = tmp / f"source{Path(name).suffix.lower() if Path(name).suffix else '.bin'}"
+            telegram_file = await context.bot.get_file(item.file_id)
+            await telegram_file.download_to_drive(custom_path=source)
+            sent = await send_mp3_album(msg, [source], tmp, progress,
+                                        meta={'title': media_file_title(msg, name), 'uploader': ''})
+        await edit_status(status, f"✅ MP3 sent{f' ({sent} parts)' if sent > 1 else ''}.")
+    except RuntimeError as exc:
+        text = ('❌ This file has no sound, so there is no MP3 to make.'
+                if 'no accessible audio' in str(exc).lower() else '❌ Could not make an MP3 from this file.')
+        log.info('Media file to MP3 failed: %s', type(exc).__name__)
+        await edit_status(status, text)
+    except TelegramError as exc:
+        log.info('Media file to MP3 failed: %s', type(exc).__name__)
+        await edit_status(status, '❌ Telegram did not deliver this file to the bot. Please send it again.')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def job_manager() -> JobManager:
@@ -3782,6 +3849,11 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
     caption_links = filters.CaptionRegex(URL_RE) | filters.CaptionEntity(MessageEntity.TEXT_LINK)
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | caption_links, on_text))
+    # A video or audio sent in a private chat (e.g. a screen recording of an
+    # app-only Snap) becomes MP3; a link in its caption is handled above.
+    media = (filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
+             | filters.Document.VIDEO | filters.Document.AUDIO)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & media & ~caption_links, on_media_file))
     app.add_error_handler(on_error)
 
 

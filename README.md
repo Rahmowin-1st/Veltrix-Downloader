@@ -10,6 +10,7 @@ A Telegram bot that downloads public media from **YouTube, Instagram, Snapchat a
 | --- | --- |
 | A public link | Photos as Telegram photos, videos as playable H.264/AAC videos with sound, in source order. A live status shows progress, speed and time left |
 | **MP3** button or `/mp3 <link>` | The audio as MP3: copied if it already is MP3, otherwise 320 kbps (long audio uses the highest bitrate that keeps few parts) |
+| A video or audio file (up to 20 MB) | Its sound as MP3, e.g. from a screen recording of a Snap that Snapchat shows only in its app |
 | `/original <link>` | The untouched source files as documents, including the highest stream such as 4K |
 | `/status` | The state of your recent requests |
 
