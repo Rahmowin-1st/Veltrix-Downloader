@@ -18,7 +18,7 @@ def failure_category(exc: Exception) -> str:
         return 'LiveStream'
     if "confirm you’re not a bot" in message or "confirm you're not a bot" in message:
         return 'PlatformBotCheck'
-    if any(word in message for word in ('429', 'rate limit', 'too many requests')):
+    if any(word in message for word in ('429', 'rate limit', 'rate-limited', 'too many requests')):
         return 'RateLimited'
     if any(word in message for word in ('login', 'sign in', 'private', 'cookies')):
         return 'AccessRequired'

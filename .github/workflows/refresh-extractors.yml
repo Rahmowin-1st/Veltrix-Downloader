@@ -1,0 +1,56 @@
+name: Refresh extractors
+
+# YouTube and Instagram change often; yt-dlp and gallery-dl publish fixes within
+# days. Render installs requirements only when it builds, so this job raises the
+# minimum versions once a newer stable release exists, runs the tests with it and
+# commits the change to main. Render then redeploys with the fixed extractor.
+on:
+  schedule:
+    - cron: '41 21 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-extractors
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Raise extractor minimum versions
+        id: bump
+        run: python refresh_extractors.py >> "$GITHUB_OUTPUT"
+
+      - name: Install media tools
+        if: steps.bump.outputs.changed == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+
+      - name: Test with the new releases
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip check
+          python -m unittest discover -s tests
+
+      - name: Commit to main
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          MESSAGE: ${{ steps.bump.outputs.message }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "$MESSAGE"
+          git push origin HEAD:main
