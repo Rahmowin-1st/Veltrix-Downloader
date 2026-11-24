@@ -172,6 +172,40 @@ class MediaFileTests(unittest.TestCase):
         asyncio.run(handle())
         self.assertIn('did not deliver this file to the bot', msg.status.texts[-1])
 
+    def test_the_configured_length_limit_applies_to_files(self):
+        source = sample(self.folder / 'long.mp4')
+        video = SimpleNamespace(file_id='f5', file_size=source.stat().st_size, file_name=source.name)
+        msg = FakeMessage(video=video)
+        with patch('bot.MAX_MEDIA_SECONDS', 1):
+            _, _, sent = self.run_handler(msg, source)
+        self.assertEqual(sent, [])
+        self.assertIn('longer than', msg.status.texts[-1])
+
+    def test_shutdown_cancels_conversions_and_removes_their_files(self):
+        folders = []
+        entered = asyncio.Event()
+
+        async def slow_download(custom_path):
+            folders.append(Path(custom_path).parent)
+            entered.set()
+            await asyncio.sleep(3600)
+
+        async def scenario():
+            msg = FakeMessage(video=SimpleNamespace(file_id='f6', file_size=10, file_name='a.mp4'))
+            context = SimpleNamespace(bot=SimpleNamespace(get_file=AsyncMock(
+                return_value=SimpleNamespace(download_to_drive=slow_download))))
+            update = SimpleNamespace(effective_message=msg, effective_user=SimpleNamespace(id=44))
+            task = await bot.on_media_file(update, context)
+            await asyncio.wait_for(entered.wait(), 5)
+            # stop_all() would also block every later subprocess in this test run.
+            with patch('media_process.stop_all'):
+                await bot.stop_jobs(SimpleNamespace())
+            self.assertTrue(task.cancelled())
+            self.assertEqual(bot._file_tasks, set())
+
+        asyncio.run(scenario())
+        self.assertFalse(folders[0].exists())
+
     def test_only_video_and_audio_documents_count(self):
         pdf = SimpleNamespace(mime_type='application/pdf', file_name='a.pdf')
         movie = SimpleNamespace(mime_type='video/mp4', file_name='a.mp4')

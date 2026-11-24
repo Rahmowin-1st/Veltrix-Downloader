@@ -2585,9 +2585,19 @@ async def convert_media_file(msg, context, uid: int, item, name: str) -> None:
             telegram_file = await context.bot.get_file(item.file_id)
             await telegram_file.download_to_drive(custom_path=source)
             received = True
+            from media_io import duration_of, probe
+            try:
+                info = await asyncio.to_thread(probe, source)
+            except Exception as exc:
+                raise RuntimeError('Unreadable media file') from exc
+            # The same length limit as downloaded links, before any conversion.
+            check_duration(duration_of(info))
             sent = await send_mp3_album(msg, [source], tmp, progress,
                                         meta={'title': media_file_title(msg, name), 'uploader': ''})
         await edit_status(status, f"✅ MP3 sent{f' ({sent} parts)' if sent > 1 else ''}.")
+    except MediaTooLong:
+        await edit_status(status, f'❌ This file is longer than {MAX_MEDIA_SECONDS // 3600} hours, '
+                                  'the bot’s maximum length.')
     except RuntimeError as exc:
         text = ('❌ This file has no sound, so there is no MP3 to make.'
                 if 'no accessible audio' in str(exc).lower() else '❌ Could not make an MP3 from this file.')
@@ -3867,6 +3877,12 @@ async def stop_jobs(app) -> None:
     stop_all()
     if _jobs is not None:
         await _jobs.shutdown()
+    # File-to-MP3 tasks are not JobManager jobs: stop them before the Telegram
+    # client closes so their temporary files are still cleaned up.
+    pending = list(_file_tasks)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     try:
         from telegram_mtproto import close
         await close()
