@@ -50,7 +50,7 @@ from transfer import TransferLimit
 from vidfetch_provider import VidFetchQuotaExceeded
 
 load_dotenv()
-VERSION = "10.1.0"
+VERSION = "10.2.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TELEGRAM_RELAY_BASE = os.getenv('TELEGRAM_RELAY_BASE', '').strip().rstrip('/')
 if TELEGRAM_RELAY_BASE == '0':
@@ -1933,8 +1933,9 @@ def friendly_error(platform: str, exc: Exception) -> str:
                 'Pinterest links still work; YouTube will work again once the allowance is renewed.')
     if isinstance(exc, PublicMediaUnavailable):
         if platform == 'snapchat':
-            return ('Snapchat: Snapchat does not show this Spotlight on its public website (it may be visible '
-                    'only in the app, restricted or removed), so it cannot be downloaded.')
+            return ('Snapchat: Snapchat shows this Snap only in the app, not on the web (or it was restricted '
+                    'or removed), so it cannot be downloaded. Tip: screen-record it in the Snapchat app and '
+                    'send the recording here to get its MP3.')
         if platform == 'pinterest':
             return 'Pinterest: this Pin is not available on the public site (it may be private or removed).'
         label = PLATFORMS.get(platform, {}).get('label', 'Media')
@@ -2422,6 +2423,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎬 Videos play directly in Telegram with their audio; photos arrive as photos.\n"
         f"⏱ Videos up to {MAX_MEDIA_SECONDS // 3600} hours. {large_delivery_note()}\n"
         "🎵 MP3: tap the MP3 button after a delivery, or send /mp3 <link>.\n"
+        "🎙 Send a video or audio file (up to 20 MB, e.g. a screen recording) to get it as MP3.\n"
         "📎 /original <link>: exact source files (highest stream, e.g. 4K) as documents.\n"
         "📊 /status: your recent requests."
         + ("\nIf YouTube blocks the server, the bot can send the video ID to Newisty’s public download API."
@@ -2494,6 +2496,127 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     patch_user(uid, last_url=url)
 
     await dispatch_job(msg, context, uid, url, AUTO_MODE)
+
+
+# api.telegram.org lets a bot fetch files up to 20 MB; a local Bot API server, 2 GB.
+BOT_FILE_LIMIT = 20 * 1024 * 1024
+
+
+def incoming_media(msg) -> tuple[Any, str] | None:
+    """The video or audio a user sent (e.g. a screen recording) and a name for it."""
+    for field in ('video', 'audio', 'voice', 'video_note'):
+        item = getattr(msg, field, None)
+        if item:
+            return item, str(getattr(item, 'title', None) or getattr(item, 'file_name', None) or '')
+    document = getattr(msg, 'document', None)
+    if document and str(document.mime_type or '').startswith(('video/', 'audio/')):
+        return document, str(document.file_name or '')
+    return None
+
+
+def media_file_title(msg, name: str) -> str:
+    caption = re.sub(r'\s+', ' ', str(getattr(msg, 'caption', None) or '')).strip()
+    if caption:
+        return caption[:120]
+    stem = re.sub(r'[_\s]+', ' ', Path(name).stem).strip() if name else ''
+    return stem[:120] or 'Audio'
+
+
+# File conversions run in the background so slow work never holds one of the
+# bot's update-processing slots; these bound how many may wait.
+FILE_JOBS_PER_USER = 3
+FILE_JOBS_TOTAL = 20
+_file_jobs: dict[int, int] = {}
+_file_tasks: set[asyncio.Task] = set()
+
+
+async def on_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> asyncio.Task | None:
+    """Turn a video or audio sent to the bot into MP3.
+
+    Some media can be watched only inside an app (for example a Snapchat Spotlight
+    that Snapchat keeps off the web). A screen recording of it still gets an MP3.
+    The conversion is admitted here and runs as a background task.
+    """
+    msg = update.effective_message
+    found = incoming_media(msg)
+    if not found:
+        return None
+    item, name = found
+    limit = 2_000 * 1024 * 1024 if TELEGRAM_API_BASE else BOT_FILE_LIMIT
+    if int(getattr(item, 'file_size', 0) or 0) > limit:
+        await msg.reply_text('Telegram lets bots receive files up to 20 MB. Send the recording as a video '
+                             '(Telegram compresses it) or trim it, and the bot will make the MP3.')
+        return None
+    uid = update.effective_user.id
+    if _file_jobs.get(uid, 0) >= FILE_JOBS_PER_USER:
+        await msg.reply_text(f'You already have {FILE_JOBS_PER_USER} files being converted. '
+                             'Please wait for one to finish.')
+        return None
+    if len(_file_tasks) >= FILE_JOBS_TOTAL:
+        await msg.reply_text('The conversion queue is full. Please try again shortly.')
+        return None
+    _file_jobs[uid] = _file_jobs.get(uid, 0) + 1
+    task = asyncio.create_task(convert_media_file(msg, context, uid, item, name), name=f'mp3-file-{uid}')
+    _file_tasks.add(task)
+
+    def finished(done: asyncio.Task) -> None:
+        _file_tasks.discard(done)
+        left = _file_jobs.get(uid, 1) - 1
+        if left > 0:
+            _file_jobs[uid] = left
+        else:
+            _file_jobs.pop(uid, None)
+        if not done.cancelled() and done.exception() is not None:
+            log.error('Media file to MP3 task failed: %s', type(done.exception()).__name__)
+
+    task.add_done_callback(finished)
+    return task
+
+
+async def convert_media_file(msg, context, uid: int, item, name: str) -> None:
+    status = DeferredStatus(msg)
+    tmp = Path(tempfile.mkdtemp(prefix='vx_file_'))
+    progress = {'sent': 0, 'phase': 'Making the MP3', 'stage': 'prepare'}
+    received = False
+    try:
+        await edit_status(status, '🎵 Making the MP3…')
+        async with job_lock(uid), global_sem():
+            source = tmp / f"source{Path(name).suffix.lower() if Path(name).suffix else '.bin'}"
+            telegram_file = await context.bot.get_file(item.file_id)
+            await telegram_file.download_to_drive(custom_path=source)
+            received = True
+            from media_io import duration_of, probe
+            try:
+                info = await asyncio.to_thread(probe, source)
+            except Exception as exc:
+                raise RuntimeError('Unreadable media file') from exc
+            # The same length limit as downloaded links, before any conversion.
+            check_duration(duration_of(info))
+            sent = await send_mp3_album(msg, [source], tmp, progress,
+                                        meta={'title': media_file_title(msg, name), 'uploader': ''})
+        await edit_status(status, f"✅ MP3 sent{f' ({sent} parts)' if sent > 1 else ''}.")
+    except MediaTooLong:
+        await edit_status(status, f'❌ This file is longer than {MAX_MEDIA_SECONDS // 3600} hours, '
+                                  'the bot’s maximum length.')
+    except RuntimeError as exc:
+        text = ('❌ This file has no sound, so there is no MP3 to make.'
+                if 'no accessible audio' in str(exc).lower() else '❌ Could not make an MP3 from this file.')
+        log.info('Media file to MP3 failed: %s', type(exc).__name__)
+        await edit_status(status, text)
+    except TelegramError as exc:
+        log.info('Media file to MP3 failed: %s', type(exc).__name__)
+        if not received:
+            text = '❌ Telegram did not deliver this file to the bot. Please send it again.'
+        elif progress['sent'] or (progress.get('attempted') and not isinstance(exc, BadRequest)
+                                  and not connection_failed_before_send(exc)):
+            # Parts may have arrived, or an upload succeeded before its reply was lost.
+            text = ('⚠️ Telegram did not confirm the MP3 delivery. Check this chat before sending the file '
+                    'again to avoid duplicates.')
+        else:
+            text = '❌ The MP3 could not be sent. Please send the file again.'
+        await edit_status(status, text)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def job_manager() -> JobManager:
@@ -3754,6 +3877,12 @@ async def stop_jobs(app) -> None:
     stop_all()
     if _jobs is not None:
         await _jobs.shutdown()
+    # File-to-MP3 tasks are not JobManager jobs: stop them before the Telegram
+    # client closes so their temporary files are still cleaned up.
+    pending = list(_file_tasks)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
     try:
         from telegram_mtproto import close
         await close()
@@ -3782,6 +3911,11 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
     caption_links = filters.CaptionRegex(URL_RE) | filters.CaptionEntity(MessageEntity.TEXT_LINK)
     app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | caption_links, on_text))
+    # A video or audio sent in a private chat (e.g. a screen recording of an
+    # app-only Snap) becomes MP3; a link in its caption is handled above.
+    media = (filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE
+             | filters.Document.VIDEO | filters.Document.AUDIO)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & media & ~caption_links, on_media_file))
     app.add_error_handler(on_error)
 
 
