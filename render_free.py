@@ -34,7 +34,7 @@ def ensure_ffmpeg() -> None:
 
 
 ensure_ffmpeg()
-from source_auth import materialize_source_cookies, youtube_cookie_state  # noqa: E402
+from source_auth import cookie_state, materialize_source_cookies  # noqa: E402
 SOURCE_COOKIE_FILES = materialize_source_cookies()
 
 import bot  # noqa: E402
@@ -56,10 +56,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("veltrix.render")
 log.info('Veltrix %s source access: youtube=%s instagram=%s pinterest=%s snapchat=%s proxy=%s cobalt=%s newisty=%s vidfetch=%s',
-         # youtube= missing | signed-out | signed-in (cookie names only, never values)
-         bot.VERSION, youtube_cookie_state(),
-         *(bool(os.getenv(f'{name}_COOKIE_FILE')) for name in
-           ('INSTAGRAM', 'PINTEREST', 'SNAPCHAT')),
+         # missing | signed-out | signed-in | present (cookie names only, never secret values)
+         bot.VERSION, *(cookie_state(name) for name in ('YOUTUBE', 'INSTAGRAM', 'PINTEREST', 'SNAPCHAT')),
          bool(bot.PROXY), bool(os.getenv('COBALT_API_URL', '').strip()), bot.newisty_enabled(), bot.vidfetch_enabled())
 
 
