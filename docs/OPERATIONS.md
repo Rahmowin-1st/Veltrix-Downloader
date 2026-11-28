@@ -178,6 +178,15 @@ When YouTube stops accepting the session, users see "YouTube no longer accepts t
 
 Each download works on a private copy of the cookie file, because yt-dlp and gallery-dl rewrite their cookie file when they finish and concurrent jobs could otherwise read a half-written file. Refreshed cookies replace the shared copy atomically, and only when none of the owner's unexpired cookies were lost. A read-only Render Secret File is never modified.
 
+### YouTube on a 512 MB host
+
+With a signed-in session, yt-dlp uses YouTube clients whose stream URLs must be unlocked by solving challenges in the player's JavaScript, which Deno runs. Deno peaks near 280 MB doing this. Together with the bot (about 90 MB with MTProto) and its worker (about 100 MB), that exceeds Render Free's 512 MB, so the kernel killed Deno. yt-dlp then reported only "Requested format is not available", and users saw "couldn't download this media right now". The bot now:
+
+- runs Deno through a launcher in `data/bin/deno` that sets `DENO_V8_FLAGS=--max-semi-space-size=1` (about 215–230 MB, same formats) unless `DENO_V8_FLAGS` is set, and holds a lock so only one solver runs at a time;
+- runs one job at a time on hosts with at most 768 MB of memory unless `MAX_CONCURRENT_JOBS` is set;
+- does not retry another format selector after a solver failure, tells the user to try again in a minute, and adds the solver's own warning to the `worker youtube:` log line (`YouTube JS challenge: …`);
+- logs `Resources: memory limit=…, concurrent jobs=…, YouTube JS runtime=deno …` at startup.
+
 ### Owner accounts on every platform
 
 The same sign-in route works for Instagram and Pinterest. Each platform takes the cookies of one **secondary** account as a Render Secret File:

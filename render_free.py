@@ -61,6 +61,26 @@ log.info('Veltrix %s source access: youtube=%s instagram=%s pinterest=%s snapcha
          bool(bot.PROXY), bool(os.getenv('COBALT_API_URL', '').strip()), bot.newisty_enabled(), bot.vidfetch_enabled())
 
 
+def log_resources() -> None:
+    """Memory, job slots and a check that the Deno launcher runs (YouTube needs it)."""
+    import subprocess
+    from media_io import memory_limit_bytes
+
+    limit = memory_limit_bytes()
+    deno = 'missing'
+    if bot.DENO_LAUNCHER:
+        try:
+            done = subprocess.run([bot.DENO_LAUNCHER, '--version'], capture_output=True, text=True, timeout=30)
+            first = (done.stdout or '').splitlines()[:1]
+            deno = first[0] if done.returncode == 0 and first else f'failed (exit {done.returncode})'
+        except (OSError, subprocess.SubprocessError) as exc:
+            deno = f'failed ({type(exc).__name__})'
+    log.info('Resources: memory limit=%s, concurrent jobs=%s, YouTube JS runtime=%s, launcher=%s, V8 flags=%s',
+             f'{limit // 1048576} MB' if limit else 'none', bot.MAX_CONCURRENT_JOBS, deno,
+             'on' if bot.DENO_LAUNCHER and bot.DENO_LAUNCHER != bot.DENO_BIN else 'off',
+             os.getenv('DENO_V8_FLAGS') or bot.DENO_V8_FLAGS_DEFAULT)
+
+
 def probe_telegram_egress(token: str) -> None:
     """Read-only connectivity check; never logs the token or a request URL."""
     async def check():
@@ -167,7 +187,8 @@ def main() -> None:
     bot.DATA_DIR.mkdir(parents=True, exist_ok=True)
     log.info('Media tools: ffmpeg=%s ffprobe=%s deno=%s source_proxy=%s',
              bool(shutil.which('ffmpeg')), bool(shutil.which('ffprobe')),
-             bool(shutil.which('deno')), bool(bot.PROXY))
+             bool(bot.DENO_BIN), bool(bot.PROXY))
+    log_resources()
 
     # Termux remains the only worker. This service is a credential-protected
     # transport bridge and never starts polling or sets a webhook.

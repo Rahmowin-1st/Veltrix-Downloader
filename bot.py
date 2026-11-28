@@ -68,7 +68,24 @@ MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(4 * 1024 * 1024 * 1024)
 MAX_JOB_BYTES = int(os.getenv("MAX_JOB_BYTES", str(9 * 1024 * 1024 * 1024)))
 MAX_PHOTO_BYTES = int(os.getenv("MAX_PHOTO_BYTES", str(9 * 1024 * 1024)))
 MAX_GALLERY_ITEMS = max(1, min(int(os.getenv("MAX_GALLERY_ITEMS", "100")), 1000))
-MAX_CONCURRENT_JOBS = max(1, min(int(os.getenv("MAX_CONCURRENT_JOBS", "2")), 4))
+def default_concurrency() -> int:
+    """Jobs at once: MAX_CONCURRENT_JOBS, else 1 on small-memory hosts, else 2.
+
+    One YouTube job needs the bot (~90 MB), its worker (~100 MB) and Deno
+    (~215 MB) at the same time, which nearly fills Render Free's 512 MB.
+    """
+    raw = os.getenv("MAX_CONCURRENT_JOBS", "").strip()
+    if raw:
+        try:
+            return max(1, min(int(raw), 4))
+        except ValueError:
+            pass
+    from media_io import memory_limit_bytes
+    limit = memory_limit_bytes()
+    return 1 if limit is not None and limit <= 768 * 1024 * 1024 else 2
+
+
+MAX_CONCURRENT_JOBS = default_concurrency()
 # Videos up to three hours are supported; four leaves room for long uploads.
 MAX_MEDIA_SECONDS = max(60, int(os.getenv("MAX_MEDIA_SECONDS", str(4 * 3600))))
 # Playable delivery stays within Telegram's chat player: H.264 is preferred
@@ -314,6 +331,53 @@ def deno_runtime() -> str | None:
 
 ensure_ffmpeg()
 DENO_BIN = deno_runtime()
+# Deno peaks near 280 MB while it solves YouTube's player challenges. With the
+# bot and its worker that exceeds a 512 MB host, the kernel kills Deno and the
+# video's streams stay locked. A 1 MB V8 semi-space keeps it near 215 MB with
+# the same result. DENO_V8_FLAGS, when set, replaces this value.
+DENO_V8_FLAGS_DEFAULT = '--max-semi-space-size=1'
+
+
+def deno_launcher(real: str | None) -> str | None:
+    """A Deno wrapper: one challenge solver at a time, with a smaller V8 heap.
+
+    The wrapper holds a lock for the whole Deno run (the lock file descriptor
+    survives exec), so concurrent jobs never run two solvers at once. Version
+    checks skip the lock.
+    """
+    if not real or os.name != 'posix':
+        return real
+    target = (DATA_DIR / 'bin' / 'deno').resolve()
+    lock = (DATA_DIR / 'deno.lock').resolve()
+    script = (
+        f'#!{sys.executable} -S\n'
+        'import fcntl, os, sys\n'
+        f'real = {real!r}\n'
+        'args = sys.argv[1:]\n'
+        'env = dict(os.environ)\n'
+        "if not env.get('DENO_V8_FLAGS'):\n"
+        f'    env["DENO_V8_FLAGS"] = {DENO_V8_FLAGS_DEFAULT!r}\n'
+        "if args[:1] not in (['--version'], ['-V']):\n"
+        f'    fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT, 0o600)\n'
+        '    fcntl.flock(fd, fcntl.LOCK_EX)\n'
+        '    os.set_inheritable(fd, True)\n'
+        'os.execve(real, [real, *args], env)\n'
+    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_file() or target.read_text() != script:
+            fd, name = tempfile.mkstemp(dir=target.parent, prefix='.deno.')
+            with os.fdopen(fd, 'w') as stream:
+                stream.write(script)
+            os.chmod(name, 0o755)
+            os.replace(name, target)
+        return str(target)
+    except OSError as exc:
+        log.warning("Deno launcher unavailable: %s", type(exc).__name__)
+        return real
+
+
+DENO_LAUNCHER = deno_launcher(DENO_BIN)
 
 
 def global_sem() -> asyncio.Semaphore:
@@ -827,8 +891,8 @@ def base_ydl_opts(tmpdir: str) -> dict[str, Any]:
     }
     if PROXY:
         opts["proxy"] = PROXY
-    if DENO_BIN:
-        opts["js_runtimes"] = {"deno": {"path": DENO_BIN}}
+    if DENO_LAUNCHER:
+        opts["js_runtimes"] = {"deno": {"path": DENO_LAUNCHER}}
     return opts
 
 
@@ -1325,14 +1389,47 @@ def job_cookies(platform: str, folder: str | Path):
                 copy.parent.rmdir()
 
 
+class ChallengeLog:
+    """yt-dlp logger that keeps YouTube's JS challenge warnings for diagnosis.
+
+    When Deno fails (for example killed for lack of memory) yt-dlp only reports
+    "Requested format is not available"; the kept warning says why.
+    """
+
+    def __init__(self):
+        self.lines: list[str] = []
+
+    def debug(self, msg):
+        pass
+
+    info = debug
+
+    def warning(self, msg):
+        text = str(msg)
+        if len(self.lines) < 3 and re.search(r'challenge|deno|javascript runtime', text, re.I):
+            self.lines.append(re.sub(r'https?://\S+', '[url]', text)[:220])
+
+    def error(self, msg):
+        pass
+
+
 def download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None = None) -> list[Path]:
+    challenge = ChallengeLog() if platform_of(url) == 'youtube' else None
     with job_cookies(platform_of(url) or '', tmpdir) as cookie_file:
-        return _download_ytdlp(url, mode, tmpdir, manifest=manifest, cookie_file=cookie_file)
+        try:
+            return _download_ytdlp(url, mode, tmpdir, manifest=manifest, cookie_file=cookie_file,
+                                   logger=challenge)
+        except Exception as exc:
+            if challenge is not None and challenge.lines:
+                exc.add_note('YouTube JS challenge: ' + challenge.lines[0])
+            raise
 
 
 def _download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None,
-                    cookie_file: Path | None) -> list[Path]:
+                    cookie_file: Path | None, logger: ChallengeLog | None = None) -> list[Path]:
     base = base_ydl_opts(tmpdir)
+    if logger is not None:
+        base['logger'] = logger
     base['noplaylist'] = not youtube_playlist_url(url)
     platform = platform_of(url)
     if platform == 'youtube' and mode not in AUDIO_PRESETS:
@@ -1418,8 +1515,9 @@ def _download_ytdlp(url: str, mode: str, tmpdir: str, *, manifest: dict | None,
                     # Switching format selectors cannot repair a missing player response.
                     raise
                 if (re.search(r"confirm you[’']re not a bot|login required|sign in to (?:confirm|view|watch)|private video", str(exc), re.I)
-                        or YT_SESSION_LIMIT_RE.search(str(exc))):
-                    # Another format selector repeats the same refused request.
+                        or YT_SESSION_LIMIT_RE.search(str(exc)) or (logger is not None and logger.lines)):
+                    # Another format selector repeats the same refused request,
+                    # or runs the failed challenge solver (Deno) once more.
                     raise
                 last = exc
                 log.warning("yt-dlp %s on %s failed: %s", fmt, platform_label(candidate), type(exc).__name__)
@@ -1985,6 +2083,9 @@ def friendly_error(platform: str, exc: Exception) -> str:
         return 'This original file exceeds Telegram’s upload limit. Send the link on its own to try playable parts.'
     if platform == 'youtube' and YT_SESSION_LIMIT_RE.search(text):
         return 'YouTube: YouTube is temporarily limiting the bot’s requests. Please try again in about an hour.'
+    if platform == 'youtube' and ('requested format is not available' in low or 'challenge solving failed' in low):
+        return ('YouTube: the server could not unlock this video’s streams this time. '
+                'Please try again in a minute.')
     if "429" in low or "too many requests" in low or "rate-limit" in low or "rate limit" in low:
         return f"{label}: temporarily rate-limited. Please wait before trying again."
     if "storage" in low or "no space left" in low:

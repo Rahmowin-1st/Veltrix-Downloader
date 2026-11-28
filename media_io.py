@@ -127,6 +127,25 @@ def available_cpus() -> float:
     return float(os.cpu_count() or 1)
 
 
+def memory_limit_bytes() -> int | None:
+    """Memory granted to the container (512 MiB on Render Free), or None if unlimited."""
+    for path in ('/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'):
+        try:
+            raw = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if raw == 'max':
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        # cgroup v1 reports "no limit" as a huge number.
+        if 0 < value < 1 << 50:
+            return value
+    return None
+
+
 def _visual_stream(info: dict) -> dict:
     return next((s for s in info['streams'] if s.get('codec_type') == 'video'
                  and not s.get('disposition', {}).get('attached_pic')), {})
