@@ -84,7 +84,8 @@ An existing local Bot API server can be selected with `TELEGRAM_API_BASE=http://
 
 ## Reliability
 
-- Downloads run outside Telegram update handlers, so long jobs do not occupy all command-processing slots. The status message shows a progress bar with percent, size, speed and time left for downloads (yt-dlp, CDN transfers, provider processing) and uploads; `/status` shows your recent jobs. Edits are spaced for group limits.
+- Downloads and file-to-MP3 conversions run outside Telegram update handlers. One status message shows elapsed time, the current phase, and transfer progress when measured. Edits start at most once a second in a private chat and every four seconds in a group, shared by all jobs in that chat. Telegram's retry delay takes priority. The same card keeps the final receipt or error. `/status` shows recent requests.
+- Status cards use animated Telegram custom emoji from `STATUS_EMOJI_PACK` (`LoadingEmoji` by default) when Telegram permits them for the bot. The bot owner's Premium subscription can grant this access. The bot renders regular emoji if the pack is unavailable or Telegram rejects custom emoji. An empty value disables the pack lookup.
 - A SQLite journal admits at most 20 pending jobs overall and 3 per user. Links and MP3 buttons share admission and duplicate checks; Instagram tracking parameters do not create another active job.
 - Queued/downloading jobs are re-extracted after a restart, up to 3 recoveries and within 24 hours. Jobs that had started sending are marked interrupted and never replayed automatically; check received media before retrying.
 - Direct CDN transfers resume within a job using Range/If-Range when the server supplies a stable validator. If a server ignores Range, the file is restarted cleanly. Resume across a process/device restart is not byte-level: the source is extracted again.

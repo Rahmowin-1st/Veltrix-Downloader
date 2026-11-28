@@ -2,6 +2,7 @@ import asyncio
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,78 @@ from unittest.mock import AsyncMock, patch
 
 import bot
 import media_io
-from telegram.error import TimedOut, BadRequest
+from telegram.error import TimedOut, BadRequest, RetryAfter
+
+
+class StatusUpdateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_private_card_changes_every_second_then_stops_on_receipt(self):
+        edits = []
+        two_edits = asyncio.Event()
+
+        async def edit(text, **kwargs):
+            edits.append((time.monotonic(), text))
+            if len(edits) == 2:
+                two_edits.set()
+
+        msg = SimpleNamespace(chat_id=42, reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=edit)))
+        status = bot.JobStatus(msg, 'YouTube')
+        self.assertEqual(status.rate.interval, 1.0)
+        status.start({'stage': 'download'}, lambda: {'phase': 'download', 'done': 50, 'total': 100})
+        try:
+            await asyncio.wait_for(two_edits.wait(), 3.5)
+            await status.complete('✅', 'Media delivered', '1 video')
+        finally:
+            await status.stop()
+        msg.reply_text.assert_awaited_once()
+        self.assertIn('50%', edits[0][1])
+        self.assertNotEqual(edits[0][1], edits[1][1])
+        self.assertGreaterEqual(edits[1][0] - edits[0][0], 0.98)
+        self.assertIn('Media delivered', edits[-1][1])
+        self.assertIsNone(status.task)
+
+    async def test_inflight_edit_finishes_before_the_receipt(self):
+        editing, release = asyncio.Event(), asyncio.Event()
+        edits = []
+
+        async def edit(text, **kwargs):
+            if 'Working' in text:
+                editing.set()
+                await release.wait()
+            edits.append(text)
+
+        status = bot.JobStatus(SimpleNamespace(chat_id=42), 'YouTube', SimpleNamespace(edit_text=edit))
+        status.start({})
+        await asyncio.wait_for(editing.wait(), 1)
+        receipt = asyncio.create_task(status.complete('✅', 'Media delivered'))
+        await asyncio.sleep(0)
+        self.assertFalse(receipt.done())
+        release.set()
+        await asyncio.wait_for(receipt, 2.5)
+        self.assertIn('Working', edits[0])
+        self.assertIn('Media delivered', edits[1])
+
+    async def test_telegram_flood_wait_is_shared_with_other_jobs_in_the_chat(self):
+        msg = SimpleNamespace(chat_id=-42)
+        first = bot.JobStatus(msg, 'YouTube', SimpleNamespace(edit_text=AsyncMock(side_effect=RetryAfter(30))))
+        second = bot.JobStatus(msg, 'Pinterest', SimpleNamespace(edit_text=AsyncMock()))
+        await first._update(lambda: 'Working')
+        self.assertIs(first.rate, second.rate)
+        self.assertEqual(second.rate.interval, 4.0)
+        self.assertGreater(second.rate.next_edit - time.monotonic(), 29)
+        await second._update(lambda: 'Working')
+        second.message.edit_text.assert_not_awaited()
+
+    async def test_premium_rejection_retries_the_same_status_with_standard_emoji(self):
+        msg = SimpleNamespace(chat_id=42)
+        edit = AsyncMock(side_effect=[BadRequest('Custom emoji forbidden'), None])
+        status = bot.JobStatus(msg, 'YouTube', SimpleNamespace(edit_text=edit))
+        with patch('bot._status_emojis', {'✅': ('✅', '1234')}), patch('bot._status_emoji_enabled', True):
+            await status.complete('✅', 'Media delivered', 'Video <1>')
+            self.assertFalse(bot._status_emoji_enabled)
+        first, second = (call.args[0] for call in edit.await_args_list)
+        self.assertIn('<tg-emoji emoji-id="1234">✅</tg-emoji>', first)
+        self.assertIn('✅ <b>Media delivered</b>', second)
+        self.assertIn('Video &lt;1&gt;', second)
 
 
 class ExtractorFlowTests(unittest.TestCase):
@@ -198,7 +270,8 @@ class JobFlowTests(unittest.IsolatedAsyncioTestCase):
                                           cached_sources=[cached], refresh_audio=True)
                     worker.assert_awaited_once()
                     upload.assert_awaited_once()
-                    status.delete.assert_awaited_once()
+                    self.assertIn('MP3 delivered', status.edit_text.call_args.args[0])
+                    status.delete.assert_not_called()
 
 
 class VideoTrackTests(unittest.TestCase):

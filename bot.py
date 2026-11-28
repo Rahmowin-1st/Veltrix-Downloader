@@ -33,12 +33,12 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from weakref import WeakValueDictionary
 
 import httpx
 from dotenv import load_dotenv
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMediaPhoto, InputMediaVideo,
-                      InputMediaAudio, InputMediaDocument, MessageEntity, Update)
-from telegram.constants import ChatAction
+                      InputMediaAudio, InputMediaDocument, Message, MessageEntity, Update)
 from telegram.error import BadRequest, Conflict, InvalidToken, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from yt_dlp import YoutubeDL
@@ -2587,22 +2587,6 @@ async def media_command(update: Update, context: ContextTypes.DEFAULT_TYPE, mode
     await dispatch_job(msg, context, update.effective_user.id, url, mode)
 
 
-async def edit_status(status, text: str, reply_markup=None) -> bool:
-    try:
-        captionable = any(
-            getattr(status, field, None)
-            for field in ("photo", "video", "audio", "document", "animation")
-        )
-        if captionable:
-            await status.edit_caption(caption=text, reply_markup=reply_markup, connect_timeout=8, read_timeout=8)
-        else:
-            await status.edit_text(text, reply_markup=reply_markup, connect_timeout=8, read_timeout=8)
-        return True
-    except TelegramError as exc:
-        log.info("Status update failed: %s", type(exc).__name__)
-        return False
-
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     uid = update.effective_user.id
@@ -2701,17 +2685,19 @@ async def on_media_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> a
 
 
 async def convert_media_file(msg, context, uid: int, item, name: str) -> None:
-    status = DeferredStatus(msg)
     tmp = Path(tempfile.mkdtemp(prefix='vx_file_'))
-    progress = {'sent': 0, 'phase': 'Making the MP3', 'stage': 'prepare'}
+    progress = {'sent': 0, 'phase': 'Waiting for a free conversion slot', 'stage': 'queue'}
+    status = JobStatus(msg, 'File to MP3')
+    status.start(progress)
     received = False
     try:
-        await edit_status(status, '🎵 Making the MP3…')
         async with job_lock(uid), global_sem():
+            progress.update(stage='receive', phase='Receiving your file from Telegram')
             source = tmp / f"source{Path(name).suffix.lower() if Path(name).suffix else '.bin'}"
             telegram_file = await context.bot.get_file(item.file_id)
             await telegram_file.download_to_drive(custom_path=source)
             received = True
+            progress.update(stage='prepare', phase='Checking the audio track')
             from media_io import duration_of, probe
             try:
                 info = await asyncio.to_thread(probe, source)
@@ -2721,28 +2707,27 @@ async def convert_media_file(msg, context, uid: int, item, name: str) -> None:
             check_duration(duration_of(info))
             sent = await send_mp3_album(msg, [source], tmp, progress,
                                         meta={'title': media_file_title(msg, name), 'uploader': ''})
-        await edit_status(status, f"✅ MP3 sent{f' ({sent} parts)' if sent > 1 else ''}.")
+        await status.complete('✅', 'MP3 delivered', delivery_details(progress, f'{sent} parts' if sent > 1 else '1 audio file'))
     except MediaTooLong:
-        await edit_status(status, f'❌ This file is longer than {MAX_MEDIA_SECONDS // 3600} hours, '
-                                  'the bot’s maximum length.')
+        await status.complete('❌', 'Conversion stopped', f'This file is longer than {MAX_MEDIA_SECONDS // 3600} hours, '
+                                                       'the bot’s maximum length.')
     except RuntimeError as exc:
-        text = ('❌ This file has no sound, so there is no MP3 to make.'
-                if 'no accessible audio' in str(exc).lower() else '❌ Could not make an MP3 from this file.')
+        text = ('This file has no sound, so there is no MP3 to make.'
+                if 'no accessible audio' in str(exc).lower() else 'Could not make an MP3 from this file.')
         log.info('Media file to MP3 failed: %s', type(exc).__name__)
-        await edit_status(status, text)
-    except TelegramError as exc:
+        await status.complete('❌', 'Conversion stopped', text)
+    except (TelegramError, OSError) as exc:
         log.info('Media file to MP3 failed: %s', type(exc).__name__)
         if not received:
-            text = '❌ Telegram did not deliver this file to the bot. Please send it again.'
+            await status.complete('❌', 'File unavailable', 'Telegram did not deliver this file to the bot. Please send it again.')
         elif progress['sent'] or (progress.get('attempted') and not isinstance(exc, BadRequest)
                                   and not connection_failed_before_send(exc)):
-            # Parts may have arrived, or an upload succeeded before its reply was lost.
-            text = ('⚠️ Telegram did not confirm the MP3 delivery. Check this chat before sending the file '
-                    'again to avoid duplicates.')
+            await status.complete('⚠️', 'Delivery unconfirmed', 'Telegram did not confirm the MP3 delivery. '
+                                  'Check this chat before sending the file again to avoid duplicates.')
         else:
-            text = '❌ The MP3 could not be sent. Please send the file again.'
-        await edit_status(status, text)
+            await status.complete('❌', 'Delivery failed', 'The MP3 could not be sent. Please send the file again.')
     finally:
+        await status.stop()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -2758,19 +2743,12 @@ class DeferredStatus:
     """A lost acknowledgement must not lose an admitted download."""
     def __init__(self, msg):
         self.msg, self.message = msg, None
-        self._lock = asyncio.Lock()
 
     async def edit_text(self, text, **kwargs):
-        async with self._lock:
-            if self.message is None:
-                self.message = await self.msg.reply_text(text, **kwargs)
-            else:
-                await self.message.edit_text(text, **kwargs)
-
-    async def delete(self):
-        async with self._lock:
-            if self.message is not None:
-                await self.message.delete()
+        if self.message is None:
+            self.message = await self.msg.reply_text(text, **kwargs)
+            return self.message
+        return await self.message.edit_text(text, **kwargs)
 
 
 async def dispatch_job(msg, context, uid: int, url: str, mode: str, action=None) -> None:
@@ -2792,8 +2770,6 @@ async def dispatch_job(msg, context, uid: int, url: str, mode: str, action=None)
         return
 
     async def execute(_):
-        status = DeferredStatus(msg)
-        await edit_status(status, f"⏳ {platform_label(url)} · queued")
         sources = []
         if action:
             rows = [resolve_action_data(uid, child) for child in action.get("children", [])] if action.get("post") else [action]
@@ -2804,7 +2780,7 @@ async def dispatch_job(msg, context, uid: int, url: str, mode: str, action=None)
         # from cached files is still named after the post.
         known = {"title": str((action or {}).get("title") or "Media"),
                  "uploader": str((action or {}).get("uploader") or "")}
-        await run_job(msg, context, uid, url, mode, status,
+        await run_job(msg, context, uid, url, mode,
                       cached_sources=sources or None, known_meta=known,
                       refresh_audio=bool(action and action.get('refresh_audio')))
     manager.launch(row, execute)
@@ -3059,7 +3035,8 @@ async def upload_large_items(items: list[PreparedMedia], progress: dict | None) 
             continue
         if progress is not None:
             progress.update(up_done=0, up_total=size, up_started=time.monotonic(),
-                            phase='Uploading large file' + (f' · part {item.part[0]}/{item.part[1]}' if item.part else ''))
+                            stage='upload', phase='Uploading large file' +
+                            (f' · part {item.part[0]}/{item.part[1]}' if item.part else ''))
 
         def counted(done: int, total: int) -> None:
             if progress is not None:
@@ -3103,8 +3080,7 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
     prepared: list[PreparedMedia] = []
     for index, path in enumerate(files):
         if progress is not None:
-            progress["phase"] = f"Preparing media {index + 1}/{len(files)}"
-            progress['up_total'] = 0
+            progress.update(stage='prepare', phase=f'Preparing media {index + 1}/{len(files)}', up_total=0)
         folder = tmp / "delivery" / str(index)
         items = await prepare_delivery(path, index, len(files), folder, limit, originals=originals)
         if large and any((item.byte_range[1] if item.byte_range else item.path.stat().st_size) > MAX_BYTES
@@ -3115,6 +3091,8 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
                 # Nothing was sent yet. Split this source for the Bot API limit.
                 log.warning('Large upload unavailable; using %s-byte parts', MAX_BYTES)
                 large, limit = False, MAX_BYTES
+                if progress is not None:
+                    progress.update(stage='prepare', phase='Preparing smaller Telegram parts')
                 shutil.rmtree(folder, ignore_errors=True)
                 items = await prepare_delivery(path, index, len(files), folder, limit, originals=originals)
         prepared.extend(items)
@@ -3137,8 +3115,10 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
             number, total = batch[0].part
             label = f"{label}\n🎞 Part {number}/{total}".strip()
         if progress is not None:
-            progress["phase"] = (f"Sending part {batch[0].part[0]}/{batch[0].part[1]}" if batch[0].part
-                                 else f"Sending {sent + 1}-{sent + len(batch)}/{len(prepared)}")
+            progress['stage'] = 'upload'
+            progress['phase'] = (f'Sending part {batch[0].part[0]}/{batch[0].part[1]}' if batch[0].part
+                                 else f'Sending {sent + 1}/{len(prepared)}' if len(batch) == 1
+                                 else f'Sending items {sent + 1}–{sent + len(batch)} of {len(prepared)}')
             progress['up_done'] = 0
             progress['up_total'] = sum(0 if item.remote else (item.byte_range[1] if item.byte_range
                                                                else item.path.stat().st_size) for item in batch)
@@ -3201,6 +3181,13 @@ async def send_album(msg, files: list[Path], caption: str, tmp: Path, progress: 
         sent += len(batch)
         if progress is not None:
             progress["sent"] = sent
+            progress.setdefault('delivered_kinds', []).extend(
+                item.kind for item in batch if item.part is None or item.part[0] == 1)
+            for item in batch:
+                if item.kind == 'video' and item.meta and item.meta.get('width') and item.meta.get('height'):
+                    progress.setdefault('video_sizes', set()).add((item.meta['width'], item.meta['height']))
+            progress['delivered_bytes'] = progress.get('delivered_bytes', 0) + sum(
+                item.byte_range[1] if item.byte_range else item.path.stat().st_size for item in batch)
     return sent
 
 
@@ -3350,7 +3337,7 @@ async def send_mp3_album(msg, sources: list[Path], tmp: Path, progress: dict | N
     performer = re.sub(r'\s+', ' ', str(meta.get('uploader') or '')).strip()
     for index, source in enumerate(audible):
         if progress is not None:
-            progress["phase"] = f"Converting to MP3 {index + 1}/{len(audible)}"
+            progress.update(stage='prepare', phase=f'Converting to MP3 {index + 1}/{len(audible)}')
         folder = tmp / "mp3" / str(index)
         folder.mkdir(parents=True, exist_ok=True)
         info = await asyncio.to_thread(probe, source)
@@ -3426,7 +3413,7 @@ def human_time(seconds: float) -> str:
 
 
 def progress_bar(fraction: float) -> str:
-    filled = max(0, min(10, int(round(fraction * 10))))
+    filled = max(0, min(10, int(fraction * 10)))
     return '▰' * filled + '▱' * (10 - filled)
 
 
@@ -3440,40 +3427,212 @@ def read_worker_progress(tmp: Path | None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def status_panel(label: str, icon: str, heading: str, elapsed: float, *details: str) -> str:
+    seconds = max(0, int(elapsed))
+    clock = human_time(seconds).zfill(5)
+    lines = '\n'.join(html.escape(line, quote=False) for line in details if line)
+    body = f'\n{lines}' if lines else ''
+    return (f'⚡ <b>Veltrix Downloader</b> · {html.escape(label)}\n\n'
+            f'{icon} <b>{html.escape(heading)}</b>{body}\n\n'
+            f'⏱ <code>{clock}</code> elapsed')
+
+
 def progress_text(label: str, progress: dict, worker: dict, elapsed: float, samples: list) -> str:
-    """One compact status line: what is happening, how far, how fast."""
+    """Render the current phase with measured transfer data and a wall clock."""
     stage = progress.get('stage')
-    clock = f' · {human_time(elapsed)}'
+    heading = progress.get('phase') or 'Working'
+    icon = {'queue': '⏳', 'receive': '⬇️', 'download': '⏳',
+            'prepare': '⚙️', 'upload': '📤'}.get(stage, '⏳')
+    details = []
+    done = total = speed = 0
     if progress.get('up_total') and stage == 'upload':
         done, total = min(progress.get('up_done', 0), progress['up_total']), progress['up_total']
         speed = done / max(0.5, time.monotonic() - progress.get('up_started', time.monotonic()))
-        fraction = done / total if total else 0
-        return (f"📤 {progress.get('phase')}\n{progress_bar(fraction)} {int(fraction * 100)}% · "
-                f"{human_bytes(done)} / {human_bytes(total)} · {human_bytes(speed)}/s{clock}")
+        if done == total:
+            heading = 'Waiting for Telegram to confirm'
     if stage == 'download':
         phase = worker.get('phase')
         if phase == 'download':
             done, total = worker.get('done', 0), worker.get('total', 0)
             speed = worker.get('speed') or 0
-            samples.append((worker.get('at') or time.time(), done))
-            del samples[:-6]
+            sample = (worker.get('at') or time.time(), done)
+            if samples and (done < samples[-1][1] or worker.get('label') != samples[-1][2]):
+                samples.clear()
+            if not samples or sample != samples[-1][:2]:
+                samples.append((*sample, worker.get('label')))
+                del samples[:-6]
             if not speed and len(samples) > 1 and samples[-1][0] > samples[0][0]:
                 speed = max(0, (samples[-1][1] - samples[0][1]) / (samples[-1][0] - samples[0][0]))
-            part = f" ({worker['label']})" if worker.get('label') in {'video', 'audio'} else ''
-            if total:
-                fraction = min(1, done / total)
-                rate = f' · {human_bytes(speed)}/s' if speed > 0 else ''
-                eta = f' · ~{human_time((total - done) / speed)} left' if speed > 0 else ''
-                return (f"⬇️ Downloading from {label}{part}\n{progress_bar(fraction)} {int(fraction * 100)}% · "
-                        f"{human_bytes(done)} / {human_bytes(total)}{rate}{eta}")
-            return f"⬇️ Downloading from {label}{part} · {human_bytes(done)}" + (
-                f" · {human_bytes(speed)}/s" if speed else '') + clock
-        if phase == 'provider':
-            percent = f" · {int(worker['done'])}%" if worker.get('total') == 100 and worker.get('done') else ''
-            return f"⏳ {label}: the download service is preparing the video{percent}{clock}"
-        if phase == 'extract':
-            return f"🔎 Reading the {label} link{clock}"
-    return f"⏳ {progress.get('phase') or 'Working'}{clock}"
+            if worker.get('at') and time.time() - worker['at'] > 5:
+                speed = 0
+            part = worker['label'] if worker.get('label') in {'video', 'audio'} else 'media'
+            icon, heading = '⬇️', f'Downloading {part}'
+        elif phase == 'provider':
+            heading = 'Waiting while the download service is preparing the video'
+            if worker.get('total') == 100:
+                percent = max(0, min(100, int(worker.get('done', 0))))
+                details.append(f'{progress_bar(percent / 100)}  {percent}%')
+        elif phase == 'extract':
+            icon, heading = '🔎', 'Reading your link'
+    if total > 0:
+        fraction = max(0, min(1, done / total))
+        details.append(f'{progress_bar(fraction)}  {int(fraction * 100)}%')
+    if done > 0 or total > 0:
+        transfer = [f'{human_bytes(done)} / {human_bytes(total)}' if total > 0 else human_bytes(done)]
+        if speed > 0:
+            transfer.append(f'{human_bytes(speed)}/s')
+            if total > done:
+                transfer.append(f'~{human_time((total - done) / speed)} left')
+        details.append(' · '.join(transfer))
+    return status_panel(label, icon, heading, elapsed, *details)
+
+
+_status_emojis: dict[str, tuple[str, str]] = {}
+_status_emoji_enabled = True
+_status_icon_pattern = re.compile(r'(?m)^(⚡|⏳|⬇️|⚙️|📤|🔎|✅|❌|⚠️) (?=<b>)')
+
+
+async def load_status_emojis(bot) -> None:
+    """Cache only animated custom stickers from the public status pack."""
+    pack = os.getenv('STATUS_EMOJI_PACK', 'LoadingEmoji').strip()
+    get_set = getattr(bot, 'get_sticker_set', None)
+    if not pack or not get_set:
+        return
+    try:
+        stickers = (await get_set(pack, connect_timeout=3, read_timeout=4, pool_timeout=3)).stickers
+    except TelegramError as exc:
+        log.info('Animated status emoji pack unavailable: %s', type(exc).__name__)
+        return
+    for sticker in stickers:
+        emoji, emoji_id = sticker.emoji, sticker.custom_emoji_id
+        if emoji and emoji_id and emoji_id.isdecimal() and (sticker.is_animated or sticker.is_video):
+            _status_emojis.setdefault(emoji.rstrip('\ufe0f'), (emoji, emoji_id))
+    log.info('Animated status emoji pack loaded: %s', bool(_status_emojis))
+
+
+def animated_status(text: str) -> str:
+    def use_emoji(match):
+        icon = match[1].rstrip('\ufe0f')
+        aliases = {'⬇': '⏳', '📤': '✈', '🔎': '🕐'}
+        item = _status_emojis.get(icon) or _status_emojis.get(aliases.get(icon, ''))
+        return f'<tg-emoji emoji-id="{item[1]}">{html.escape(item[0])}</tg-emoji> ' if item else match[0]
+    return _status_icon_pattern.sub(use_emoji, text) if _status_emoji_enabled and _status_emojis else text
+
+
+class ChatStatusRate:
+    def __init__(self, chat_id: int):
+        self.interval = 1.0 if chat_id >= 0 else 4.0
+        self.next_edit = 0.0
+        self.lock = asyncio.Lock()
+
+
+_chat_status_rates: WeakValueDictionary[tuple[asyncio.AbstractEventLoop, int], ChatStatusRate] = WeakValueDictionary()
+
+
+class JobStatus:
+    """Edit one status message, sharing Telegram's allowance per chat."""
+
+    def __init__(self, msg, label: str, message=None):
+        self.message = message if message is not None else DeferredStatus(msg)
+        self.label = label
+        self.started = time.monotonic()
+        self.task: asyncio.Task | None = None
+        self.stopping = asyncio.Event()
+        self.uneditable = False
+        chat_id = int(getattr(msg, 'chat_id', 0) or 0)
+        rate_key = (asyncio.get_running_loop(), chat_id)
+        self.rate = _chat_status_rates.get(rate_key) or ChatStatusRate(chat_id)
+        _chat_status_rates[rate_key] = self.rate
+
+    async def _edit(self, plain: str, reply_markup):
+        global _status_emoji_enabled
+        text = animated_status(plain)
+        kwargs = dict(reply_markup=reply_markup, parse_mode='HTML', connect_timeout=4, read_timeout=4,
+                      write_timeout=4, pool_timeout=4)
+        captionable = any(getattr(self.message, field, None)
+                          for field in ('photo', 'video', 'audio', 'document', 'animation'))
+        edit = self.message.edit_caption if captionable else self.message.edit_text
+        try:
+            result = await edit(text, **kwargs)
+        except BadRequest as exc:
+            if text == plain or 'not modified' in str(exc).lower():
+                raise
+            result = await edit(plain, **kwargs)
+            _status_emoji_enabled = False
+            log.info('Animated status emoji rejected; using standard emoji')
+        if text != plain and _status_emoji_enabled and isinstance(result, Message):
+            entities = result.caption_entities if captionable else result.entities
+            if not any(e.type == MessageEntity.CUSTOM_EMOJI for e in entities):
+                _status_emoji_enabled = False
+                log.info('Animated status emoji not returned by Telegram; using standard emoji')
+
+    async def _update(self, render, reply_markup=None, *, final=False) -> None:
+        for _ in range(2 if final else 1):
+            async with self.rate.lock:
+                wait = self.rate.next_edit - time.monotonic()
+                if wait > 8:
+                    return
+                while wait > 0:
+                    if final:
+                        await asyncio.sleep(wait)
+                    else:
+                        try:
+                            await asyncio.wait_for(self.stopping.wait(), wait)
+                            return
+                        except TimeoutError:
+                            pass
+                    # Event-loop timers can wake slightly before their deadline.
+                    wait = self.rate.next_edit - time.monotonic()
+                if not final and self.stopping.is_set():
+                    return
+                self.rate.next_edit = time.monotonic() + self.rate.interval
+                try:
+                    await self._edit(render(), reply_markup)
+                    return
+                except RetryAfter as exc:
+                    retry_at = time.monotonic() + telegram_retry_delay(exc, 0)
+                    self.rate.next_edit = max(self.rate.next_edit, retry_at)
+                except BadRequest as exc:
+                    reason = str(exc).lower()
+                    if 'not modified' not in reason:
+                        self.uneditable = True
+                        log.info('Status update rejected: %s', type(exc).__name__)
+                    return
+                except TelegramError as exc:
+                    if (isinstance(self.message, DeferredStatus) and self.message.message is None
+                            and isinstance(exc, NetworkError) and not connection_failed_before_send(exc)):
+                        self.uneditable = True
+                    log.info('Status update failed: %s', type(exc).__name__)
+                    return
+
+    def start(self, progress: dict, worker=lambda: {}):
+        async def refresh():
+            samples: list = []
+            while not self.uneditable and not self.stopping.is_set():
+                await self._update(lambda: progress_text(self.label, progress, worker(),
+                                                         time.monotonic() - self.started, samples))
+                # The shared chat rate controls edit start times. Yield even if
+                # the API accepted a request without suspending the task.
+                wait = self.rate.next_edit - time.monotonic()
+                if wait > 8:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self.stopping.wait(), wait)
+                else:
+                    await asyncio.sleep(0)
+        self.task = asyncio.create_task(refresh(), name='veltrix-status')
+
+    async def stop(self) -> None:
+        if self.task is not None:
+            task, self.task = self.task, None
+            # Let an in-flight Telegram edit settle before writing the receipt.
+            self.stopping.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def complete(self, icon: str, heading: str, *details: str, reply_markup=None) -> None:
+        elapsed = time.monotonic() - self.started
+        await self.stop()
+        await self._update(lambda: status_panel(self.label, icon, heading, elapsed, *details),
+                           reply_markup, final=True)
 
 
 def mp3_meta(meta: dict[str, Any], label: str) -> dict[str, Any]:
@@ -3509,6 +3668,18 @@ def delivered_summary(kinds: list[str], sent: int) -> str:
     return f"✅ Delivered · {text}{extra}"
 
 
+def delivery_details(progress: dict, summary: str) -> str:
+    parts = [summary]
+    sizes = progress.get('video_sizes', ())
+    if len(sizes) == 1:
+        width, height = next(iter(sizes))
+        parts.append(f'{width}×{height}')
+    size = progress.get('delivered_bytes', 0)
+    if size:
+        parts.append(human_bytes(size))
+    return ' · '.join(parts)
+
+
 async def run_job(
     msg, context, uid: int, url: str, mode: str, status=None,
     selected_audio_index: int | None = None,
@@ -3521,8 +3692,9 @@ async def run_job(
     event_id = secrets.token_hex(6)
     source = platform_of(url) or 'unknown'
     label = platform_label(url)
-    status = status if status is not None else DeferredStatus(msg)
-    started_at = time.monotonic()
+    mode_label = 'MP3' if mode in AUDIO_PRESETS else 'Original files' if mode == ORIGINAL_MODE else ''
+    surface_label = ' · '.join(part for part in (label if url else '', mode_label) if part)
+    updates = JobStatus(msg, surface_label or 'Media', status)
     tmp = None
     active = False
     delivered = False
@@ -3531,27 +3703,7 @@ async def run_job(
     if queued:
         metric_add("queued_jobs", 1)
 
-    async def typing():
-        previous = ""
-        samples: list = []
-        edited_at = 0.0
-        # Groups allow fewer edits per minute than private chats.
-        spacing = 4 if int(getattr(msg, 'chat_id', 0) or 0) >= 0 else 9
-        while True:
-            try:
-                action = ChatAction.UPLOAD_VOICE if mode in AUDIO_PRESETS else (
-                    ChatAction.UPLOAD_VIDEO if progress.get('stage') == 'upload' else ChatAction.TYPING)
-                await context.bot.send_chat_action(msg.chat_id, action, connect_timeout=8, read_timeout=8)
-                worker = read_worker_progress(tmp) if progress.get('stage') == 'download' else {}
-                text = progress_text(label, progress, worker, time.monotonic() - started_at, samples)
-                if text != previous and time.monotonic() - edited_at >= spacing:
-                    await edit_status(status, text)
-                    previous, edited_at = text, time.monotonic()
-            except TelegramError:
-                pass
-            await asyncio.sleep(4)
-
-    ticker = asyncio.create_task(typing())
+    updates.start(progress, lambda: read_worker_progress(tmp) if progress['stage'] == 'download' else {})
     try:
         async with lock, global_sem():
             if queued:
@@ -3562,10 +3714,11 @@ async def run_job(
             mark_state("downloading")
             await report_job_event(event_id, source, 'downloading')
             tmp = Path(tempfile.mkdtemp(prefix="vx_"))
-            progress.update(phase=f"Downloading from {label}", stage='download')
+            progress.update(phase='Reading your link', stage='download')
             meta = dict(known_meta or {})
             files = []
             if cached_sources and all(p.is_file() for p in cached_sources):
+                progress.update(phase='Preparing saved audio', stage='prepare')
                 for i, path in enumerate(cached_sources):
                     local = tmp / f"cached_{i}{path.suffix}"
                     try:
@@ -3576,6 +3729,7 @@ async def run_job(
                     files.append(local)
             if not files or refresh_audio:
                 try:
+                    progress.update(phase='Reading your link', stage='download')
                     fresh = await download_in_worker(url, mode, tmp, meta)
                     if not files or len(await asyncio.to_thread(audio_sources, fresh, tmp / 'soundtrack')) > len(files):
                         files = fresh
@@ -3595,7 +3749,6 @@ async def run_job(
                      kinds.count('animation'), kinds.count('audio'))
             await report_job_event(event_id, source, 'prepared', items=len(files))
             await report_job_event(event_id, source, 'uploading', items=len(files))
-            progress['stage'] = 'upload'
             if mode in AUDIO_PRESETS:
                 progress["phase"] = "Checking available audio tracks"
                 if selected_audio_index is not None:
@@ -3608,12 +3761,8 @@ async def run_job(
                     raise RuntimeError("No accessible audio track")
                 delivered = True
                 mark_state("done")
-                ticker.cancel()
-                await asyncio.gather(ticker, return_exceptions=True)
-                try:
-                    await status.delete()
-                except TelegramError:
-                    await edit_status(status, "✅ MP3 delivered")
+                summary = f'{sent} audio files or parts' if sent > 1 else '1 audio file'
+                await updates.complete('✅', 'MP3 delivered', delivery_details(progress, summary))
             else:
                 silent_videos = kinds.count('video') - with_sound
                 caption = delivery_caption(url, meta, silent_videos)
@@ -3633,6 +3782,7 @@ async def run_job(
                 delivered = True
                 # Persist delivery before optional cache/status operations.
                 mark_state("done")
+                await updates.stop()
                 sources = await asyncio.to_thread(audio_sources, files, tmp / "soundtrack")
                 # Offer one MP3 action for every delivered post. A silent
                 # rendition can be rechecked through the other extractors
@@ -3644,8 +3794,6 @@ async def run_job(
                                                      uploader=str(meta.get('uploader') or ''))
                 except OSError:
                     log.warning("Media delivered; MP3 action could not be saved")
-                ticker.cancel()
-                await asyncio.gather(ticker, return_exceptions=True)
                 attached = False
                 last_message = progress.get("last_message")
                 if (markup is not None and last_message is not None
@@ -3665,19 +3813,20 @@ async def run_job(
                         attached = True
                     except TelegramError as exc:
                         log.info("MP3 message unavailable: %s", type(exc).__name__)
-                await edit_status(status, delivered_summary(delivered_kinds, sent),
-                                  reply_markup=None if attached else markup)
+                summary = delivered_summary(progress.get('delivered_kinds', delivered_kinds), sent)
+                await updates.complete('✅', 'Media delivered',
+                                       delivery_details(progress, summary.removeprefix('✅ Delivered · ')),
+                                       reply_markup=None if attached else markup)
             metric_add("jobs_succeeded", 1)
             await report_job_event(event_id, source, 'delivered', items=sent)
     except Exception as exc:
-        ticker.cancel()
-        await asyncio.gather(ticker, return_exceptions=True)
+        await updates.stop()
         count = progress["sent"]
         if delivered:
             metric_add("jobs_succeeded", 1)
             log.warning("Job %s media delivered; follow-up failed: %s", event_id, type(exc).__name__)
             await report_job_event(event_id, source, 'delivered', items=progress['sent'], error=type(exc).__name__)
-            await edit_status(status, "✅ Media delivered. Send the link again if the MP3 action is unavailable.")
+            await updates.complete('✅', 'Media delivered', 'Send the link again if the MP3 action is unavailable.')
             return
         metric_add("jobs_failed", 1)
         uncertain = bool(progress.get("attempted")) and not isinstance(exc, BadRequest) and not connection_failed_before_send(exc)
@@ -3696,11 +3845,14 @@ async def run_job(
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("Try again", callback_data=f"retry|{token}")]])
             except OSError:
                 pass
-        detail = f" {count} media parts already delivered." if count else ""
-        await edit_status(status, "❌ " + friendly_error(platform_of(url) or "", exc) + detail, reply_markup=markup)
+        if count or uncertain:
+            detail = f'{count} media items or parts already delivered.' if count else ''
+            await updates.complete('⚠️', 'Delivery interrupted', detail,
+                                   'Check this chat before retrying to avoid duplicates.')
+        else:
+            await updates.complete('❌', 'Request stopped', friendly_error(source, exc), reply_markup=markup)
     finally:
-        ticker.cancel()
-        await asyncio.gather(ticker, return_exceptions=True)
+        await updates.stop()
         if active:
             metric_add("active_jobs", -1)
         if queued:
@@ -3980,6 +4132,7 @@ def application_builder(token: str):
 
 async def resume_jobs(app) -> None:
     log.info("Telegram identity verified: @%s", app.bot.username)
+    await load_status_emojis(app.bot)
     manager = job_manager()
     ready, uncertain = manager.recover()
     async def execute(row):
