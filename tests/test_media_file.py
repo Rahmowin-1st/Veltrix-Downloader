@@ -92,8 +92,10 @@ class MediaFileTests(unittest.TestCase):
         name, details = sent[0]
         self.assertEqual(name, 'Snap from Akbar.mp3')
         self.assertIn('mp3', details)
-        self.assertEqual(msg.status.texts[0], '🎵 Making the MP3…')
-        self.assertEqual(msg.status.texts[-1], '✅ MP3 sent.')
+        self.assertIn('File to MP3', msg.status.texts[0])
+        self.assertIn('elapsed', msg.status.texts[0])
+        self.assertIn('MP3 delivered', msg.status.texts[-1])
+        self.assertEqual(len(msg.replies), 1)
 
     def test_title_comes_from_the_file_name_without_a_caption(self):
         self.assertEqual(bot.media_file_title(FakeMessage(), 'Screen_Recording_2026.mp4'), 'Screen Recording 2026')
