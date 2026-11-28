@@ -3470,12 +3470,17 @@ class JobStatus:
                 wait = self.rate.next_edit - time.monotonic()
                 if wait > 8:
                     return
-                if wait > 0:
+                while wait > 0:
                     if final:
                         await asyncio.sleep(wait)
                     else:
-                        with suppress(TimeoutError):
+                        try:
                             await asyncio.wait_for(self.stopping.wait(), wait)
+                            return
+                        except TimeoutError:
+                            pass
+                    # Event-loop timers can wake slightly before their deadline.
+                    wait = self.rate.next_edit - time.monotonic()
                 if not final and self.stopping.is_set():
                     return
                 self.rate.next_edit = time.monotonic() + self.rate.interval
