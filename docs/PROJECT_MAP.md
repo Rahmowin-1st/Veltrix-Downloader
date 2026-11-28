@@ -56,6 +56,8 @@ Render Free uses a temporary filesystem. Jobs or cached files can be lost when t
 
 ## Version and evidence
 
+**v10.4.0** fixes YouTube on Render Free after the owner sign-in was added. On 28 November 2026 the owner's Shorts link failed in production with "couldn't download this media right now". In a cloud container, the same link and the same cookies downloaded at 1080×1920 60 fps with AAC audio. Deno peaked at 275–295 MB, the worker at about 100 MB and the bot at about 90 MB, which together exceed 512 MB. When Deno fails, yt-dlp reports only "Requested format is not available", which matches the production reply. With the launcher's V8 flag Deno peaked at 211–231 MB, with the same result. 329 tests pass on Python 3.12 and 3.13. Confirmation on Render is pending.
+
 **v10.3.0** extends the owner sign-in route to Instagram and Pinterest: the startup log reports each platform's sign-in state, signed-in jobs on one platform start at least `ACCOUNT_SPACING_SECONDS` apart across workers, and access errors say whether the bot has that platform's sign-in. 322 tests pass on Python 3.12 and 3.13. Not verified live: no owner accounts are available in the test container.
 
 **v10.2.0** turns a video or audio file sent to the bot into MP3 and points app-only Snapchat Spotlights to that route. Verified on 24 November 2026 in a cloud container: six current public Spotlights (540×960, AAC audio, about 2 s each) and a public story (two videos and a 1242×2208 photo) downloaded; the Spotlight `…AAAAAw` from @akbarshoh.2004 still shows "This Snap isn't available on web"; the new file-to-MP3 handler has unit tests with real ffmpeg output.

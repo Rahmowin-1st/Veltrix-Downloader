@@ -131,7 +131,7 @@ def probe_youtube(ids: str) -> None:
                 'noplaylist': True, 'socket_timeout': 10,
                 'retries': 0, 'extractor_retries': 0,
                 'http_headers': bot.request_headers(url),
-                'js_runtimes': {'deno': {'path': bot.DENO_BIN}} if bot.DENO_BIN else {},
+                'js_runtimes': {'deno': {'path': bot.DENO_LAUNCHER}} if bot.DENO_LAUNCHER else {},
                 'logger': QuietYDL(),
             }
             if client != 'default':
