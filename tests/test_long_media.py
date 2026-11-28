@@ -2,6 +2,7 @@ import asyncio
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -343,12 +344,13 @@ class ProgressTests(unittest.TestCase):
 
     def test_status_text_shows_percent_speed_and_eta(self):
         worker = {'phase': 'download', 'done': 25 * 1024 ** 2, 'total': 100 * 1024 ** 2, 'speed': 5 * 1024 ** 2,
-                  'label': 'video', 'at': 1}
+                  'label': 'video', 'at': time.time()}
         text = bot.progress_text('YouTube', {'stage': 'download'}, worker, 12, [])
         self.assertIn('25%', text)
         self.assertIn('25.0 MB / 100.0 MB', text)
         self.assertIn('5.0 MB/s', text)
         self.assertIn('~0:15 left', text)
+        self.assertIn('<code>00:12</code> elapsed', text)
         upload = bot.progress_text('YouTube', {'stage': 'upload', 'phase': 'Sending part 1/3', 'up_done': 50,
                                                'up_total': 100, 'up_started': 0}, {}, 5, [])
         self.assertIn('50%', upload)
