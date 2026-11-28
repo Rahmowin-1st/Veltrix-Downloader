@@ -3425,7 +3425,7 @@ class ChatStatusRate:
         self.lock = asyncio.Lock()
 
 
-_chat_status_rates: WeakValueDictionary[int, ChatStatusRate] = WeakValueDictionary()
+_chat_status_rates: WeakValueDictionary[tuple[asyncio.AbstractEventLoop, int], ChatStatusRate] = WeakValueDictionary()
 
 
 class JobStatus:
@@ -3439,8 +3439,9 @@ class JobStatus:
         self.stopping = asyncio.Event()
         self.uneditable = False
         chat_id = int(getattr(msg, 'chat_id', 0) or 0)
-        self.rate = _chat_status_rates.get(chat_id) or ChatStatusRate(chat_id)
-        _chat_status_rates[chat_id] = self.rate
+        rate_key = (asyncio.get_running_loop(), chat_id)
+        self.rate = _chat_status_rates.get(rate_key) or ChatStatusRate(chat_id)
+        _chat_status_rates[rate_key] = self.rate
 
     async def _edit(self, plain: str, reply_markup):
         global _status_emoji_enabled

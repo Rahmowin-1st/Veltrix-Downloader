@@ -25,6 +25,7 @@ class StatusUpdateTests(unittest.IsolatedAsyncioTestCase):
 
         msg = SimpleNamespace(chat_id=42, reply_text=AsyncMock(return_value=SimpleNamespace(edit_text=edit)))
         status = bot.JobStatus(msg, 'YouTube')
+        self.assertEqual(status.rate.interval, 1.0)
         status.start({'stage': 'download'}, lambda: {'phase': 'download', 'done': 50, 'total': 100})
         try:
             await asyncio.wait_for(two_edits.wait(), 3.5)
@@ -49,14 +50,13 @@ class StatusUpdateTests(unittest.IsolatedAsyncioTestCase):
             edits.append(text)
 
         status = bot.JobStatus(SimpleNamespace(chat_id=42), 'YouTube', SimpleNamespace(edit_text=edit))
-        status.rate.interval = 0.01
         status.start({})
         await asyncio.wait_for(editing.wait(), 1)
         receipt = asyncio.create_task(status.complete('✅', 'Media delivered'))
         await asyncio.sleep(0)
         self.assertFalse(receipt.done())
         release.set()
-        await asyncio.wait_for(receipt, 1)
+        await asyncio.wait_for(receipt, 2.5)
         self.assertIn('Working', edits[0])
         self.assertIn('Media delivered', edits[1])
 
